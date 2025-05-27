@@ -10033,6 +10033,7 @@ dependencies = [
  "dashmap",
  "dir-diff",
  "ed25519-dalek",
+ "env_logger",
  "flate2",
  "fnv",
  "im",

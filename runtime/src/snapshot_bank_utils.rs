@@ -2802,4 +2802,17 @@ mod tests {
             get_highest_loadable_bank_snapshot(&load_only_snapshot_config).unwrap();
         assert_eq!(bank_snapshot2, bank_snapshot);
     }
+
+    #[test]
+    fn test_bank_fields_from_snapshot_archives() {
+        let _ = env_logger::try_init();
+        let all_snapshots_dir: PathBuf = "../test-ledger".parse().unwrap();
+        let _bank_fields = bank_fields_from_snapshot_archives(
+            &all_snapshots_dir,
+            &all_snapshots_dir,
+            StorageAccess::File,
+        )
+        .unwrap();
+
+    }
 }
