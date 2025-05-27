@@ -96,8 +96,8 @@ pub fn bank_fields_from_snapshot_archives(
         full_snapshot_archive_info.slot(),
     );
 
-    let temp_unpack_dir = TempDir::new()?;
-    let temp_accounts_dir = TempDir::new()?;
+    let temp_unpack_dir = TempDir::with_prefix_in("unpack-", &full_snapshot_archives_dir)?;
+    let temp_accounts_dir = TempDir::with_prefix_in("accounts-", &full_snapshot_archives_dir)?;
 
     let account_paths = vec![temp_accounts_dir.path().to_path_buf()];
 
