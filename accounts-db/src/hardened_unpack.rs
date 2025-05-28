@@ -330,6 +330,7 @@ pub fn streaming_unpack_snapshot<A: Read>(
     account_paths: &[PathBuf],
     parallel_selector: Option<ParallelSelector>,
     sender: &crossbeam_channel::Sender<PathBuf>,
+    _rx: crossbeam_channel::Receiver<solana_perf::packet::bytes::Bytes>
 ) -> Result<()> {
     unpack_snapshot_with_processors(
         archive,

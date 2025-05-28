@@ -1638,6 +1638,7 @@ fn spawn_unpack_snapshot_thread(
     parallel_selector: Option<ParallelSelector>,
     thread_index: usize,
 ) -> JoinHandle<()> {
+    let (_tx, rx) = crossbeam_channel::bounded::<solana_perf::packet::bytes::Bytes>(10);
     Builder::new()
         .name(format!("solUnpkSnpsht{thread_index:02}"))
         .spawn(move || {
@@ -1647,6 +1648,7 @@ fn spawn_unpack_snapshot_thread(
                 &account_paths,
                 parallel_selector,
                 &file_sender,
+                rx,
             )
             .unwrap();
         })
@@ -1654,6 +1656,7 @@ fn spawn_unpack_snapshot_thread(
 }
 
 /// Streams unpacked files across channel
+#[allow(unused)]
 fn streaming_unarchive_snapshot(
     file_sender: Sender<PathBuf>,
     account_paths: Vec<PathBuf>,
@@ -1693,6 +1696,78 @@ fn streaming_unarchive_snapshot(
             )
         })
         .collect()
+}
+
+fn streaming_unarchive_snapshot_ks(
+    _file_sender: Sender<PathBuf>,
+    _account_paths: Vec<PathBuf>,
+    _ledger_dir: PathBuf,
+    snapshot_archive_path: PathBuf,
+    _archive_format: ArchiveFormat,
+    _num_threads: usize,
+) -> Vec<JoinHandle<()>> {
+    // let account_paths = Arc::new(account_paths);
+    // let ledger_dir = Arc::new(ledger_dir);
+
+    // let shared_buffer = untar_snapshot_create_shared_buffer(&snapshot_archive_path, archive_format);
+    let decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
+        1 << 20,
+        fs::File::open(&snapshot_archive_path).unwrap(),
+    ))
+    .unwrap();
+
+    let mut arch = Archive::new(decoder);
+    for entry in arch.entries().unwrap() {
+        let entry = entry.unwrap();
+        info!("entry {:?} {}", entry.path().unwrap(), entry.size());
+    }
+    //const TAR_HEADER_SIZE: usize = 512;
+    // let mut buf = [0u8; TAR_HEADER_SIZE];
+    // while decoder.read_exact(&mut buf).is_ok() {
+    //     let header = tar::Header::from_byte_slice(&buf);
+    //     let mut size = header.entry_size().unwrap() as usize;
+    //     info!("header {:?} {}", header.path().unwrap(), size);
+    //     while size > 0 {
+    //         decoder.read_exact(&mut buf[..size]).unwrap();
+    //         size = size.saturating_sub(TAR_HEADER_SIZE);
+    //     }
+    // }
+    vec![]
+    // let mut arch = Archive::new(decoder);
+    // for entry in arch.entries().unwrap() {
+    //     let entry = entry.unwrap();
+    //     tar::entry::EntryFields;
+    //     entry.raw_header_position();
+    //     entry.header().size()
+    // }
+
+    // // All shared buffer readers need to be created before the threads are spawned
+    // let archives: Vec<_> = (0..num_threads)
+    //     .map(|_| {
+    //         let reader = SharedBufferReader::new(&shared_buffer);
+    //         Archive::new(reader)
+    //     })
+    //     .collect();
+
+    // archives
+    //     .into_iter()
+    //     .enumerate()
+    //     .map(|(thread_index, archive)| {
+    //         let parallel_selector = Some(ParallelSelector {
+    //             index: thread_index,
+    //             divisions: num_threads,
+    //         });
+
+    //         spawn_unpack_snapshot_thread(
+    //             file_sender.clone(),
+    //             account_paths.clone(),
+    //             ledger_dir.clone(),
+    //             archive,
+    //             parallel_selector,
+    //             thread_index,
+    //         )
+    //     })
+    //     .collect()
 }
 
 /// BankSnapshotInfo::new_from_dir() requires a few meta files to accept a snapshot dir
@@ -1747,7 +1822,7 @@ fn unarchive_snapshot(
     let unpacked_snapshots_dir = unpack_dir.path().join("snapshots");
 
     let (file_sender, file_receiver) = crossbeam_channel::unbounded();
-    streaming_unarchive_snapshot(
+    streaming_unarchive_snapshot_ks(
         file_sender,
         account_paths.to_vec(),
         unpack_dir.path().to_path_buf(),
@@ -2330,12 +2405,10 @@ fn untar_snapshot_create_shared_buffer(
     match archive_format {
         ArchiveFormat::TarBzip2 => SharedBuffer::new(BzDecoder::new(BufReader::new(open_file()))),
         ArchiveFormat::TarGzip => SharedBuffer::new(GzDecoder::new(open_file())),
-        ArchiveFormat::TarZstd { .. } => SharedBuffer::new(
-            zstd::stream::read::Decoder::new(open_file()).unwrap(),
-        ),
-        ArchiveFormat::TarLz4 => {
-            SharedBuffer::new(lz4::Decoder::new(open_file()).unwrap())
+        ArchiveFormat::TarZstd { .. } => {
+            SharedBuffer::new(zstd::stream::read::Decoder::new(open_file()).unwrap())
         }
+        ArchiveFormat::TarLz4 => SharedBuffer::new(lz4::Decoder::new(open_file()).unwrap()),
         ArchiveFormat::Tar => SharedBuffer::new(BufReader::new(open_file())),
     }
 }
