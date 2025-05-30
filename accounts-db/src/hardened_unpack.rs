@@ -3,6 +3,7 @@ use {
     log::*,
     rand::{thread_rng, Rng},
     solana_genesis_config::{GenesisConfig, DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE},
+    solana_perf::packet::bytes::Buf,
     std::{
         collections::HashMap,
         fs::{self, File},
@@ -44,6 +45,48 @@ const MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE: u64 = 4 * 1024 * 1024 * 1024 * 
 const MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT: u64 = 5_000_000;
 pub const MAX_GENESIS_ARCHIVE_UNPACKED_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
 const MAX_GENESIS_ARCHIVE_UNPACKED_COUNT: u64 = 100;
+
+pub struct ChunkedBytes(pub std::collections::VecDeque<solana_perf::packet::bytes::Bytes>);
+
+impl ChunkedBytes {
+    pub fn new() -> Self {
+        Self(std::collections::VecDeque::with_capacity(1))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn push(&mut self, bytes: solana_perf::packet::bytes::Bytes) {
+        self.0.push_back(bytes);
+    }
+}
+
+impl Default for ChunkedBytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Read for ChunkedBytes {
+    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut copied_len = 0;
+        while let Some(bytes) = self.0.front_mut() {
+            let to_copy_len = bytes.len().min(buf.len());
+            let (to_copy_dst_buf, remaining_buf) = buf.split_at_mut(to_copy_len);
+            bytes.copy_to_slice(to_copy_dst_buf);
+            copied_len += to_copy_len;
+            if bytes.is_empty() {
+                self.0.pop_front();
+            }
+            if remaining_buf.is_empty() {
+                break;
+            }
+            buf = remaining_buf;
+        }
+        return Ok(copied_len);
+    }
+}
 
 fn checked_total_size_sum(total_size: u64, entry_size: u64, limit_size: u64) -> Result<u64> {
     trace!(
@@ -306,7 +349,6 @@ pub fn unpack_snapshot<A: Read>(
     archive: &mut Archive<A>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
-    parallel_selector: Option<ParallelSelector>,
 ) -> Result<UnpackedAppendVecMap> {
     let mut unpacked_append_vec_map = UnpackedAppendVecMap::new();
 
@@ -314,7 +356,6 @@ pub fn unpack_snapshot<A: Read>(
         archive,
         ledger_dir,
         account_paths,
-        parallel_selector,
         |file, path| {
             unpacked_append_vec_map.insert(file.to_string(), path.join("accounts").join(file));
         },
@@ -324,39 +365,39 @@ pub fn unpack_snapshot<A: Read>(
 }
 
 /// Unpacks snapshots and sends entry file paths through the `sender` channel
-pub fn streaming_unpack_snapshot<A: Read>(
-    archive: &mut Archive<A>,
+pub fn streaming_unpack_snapshot(
+    chunks_recv: crossbeam_channel::Receiver<ChunkedBytes>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
-    parallel_selector: Option<ParallelSelector>,
     sender: &crossbeam_channel::Sender<PathBuf>,
-    _rx: crossbeam_channel::Receiver<solana_perf::packet::bytes::Bytes>
 ) -> Result<()> {
-    unpack_snapshot_with_processors(
-        archive,
-        ledger_dir,
-        account_paths,
-        parallel_selector,
-        |_, _| {},
-        |entry_path_buf| {
-            if entry_path_buf.is_file() {
-                let result = sender.send(entry_path_buf);
-                if let Err(err) = result {
-                    panic!(
-                        "failed to send path '{}' from unpacker to rebuilder: {err}",
-                        err.0.display(),
-                    );
+    while let Ok(chunked_bytes) = chunks_recv.recv() {
+        let mut archive = Archive::new(chunked_bytes);
+        unpack_snapshot_with_processors(
+            &mut archive,
+            ledger_dir,
+            account_paths,
+            |_, _| {},
+            |entry_path_buf| {
+                if entry_path_buf.is_file() {
+                    let result = sender.send(entry_path_buf);
+                    if let Err(err) = result {
+                        panic!(
+                            "failed to send path '{}' from unpacker to rebuilder: {err}",
+                            err.0.display(),
+                        );
+                    }
                 }
-            }
-        },
-    )
+            },
+        )?
+    }
+    Ok(())
 }
 
 fn unpack_snapshot_with_processors<A, F, G>(
     archive: &mut Archive<A>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
-    parallel_selector: Option<ParallelSelector>,
     mut accounts_path_processor: F,
     entry_processor: G,
 ) -> Result<()>
@@ -366,7 +407,6 @@ where
     G: Fn(PathBuf),
 {
     assert!(!account_paths.is_empty());
-    let mut i = 0;
 
     unpack_archive(
         archive,
@@ -375,12 +415,6 @@ where
         MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT,
         |parts, kind| {
             if is_valid_snapshot_archive_entry(parts, kind) {
-                i += 1;
-                if let Some(parallel_selector) = &parallel_selector {
-                    if !parallel_selector.select_index(i - 1) {
-                        return UnpackPath::Ignore;
-                    }
-                };
                 if let ["accounts", file] = parts {
                     // Randomly distribute the accounts files about the available `account_paths`,
                     let path_index = thread_rng().gen_range(0..account_paths.len());
@@ -795,7 +829,7 @@ mod tests {
 
     fn finalize_and_unpack_snapshot(archive: tar::Builder<Vec<u8>>) -> Result<()> {
         with_finalize_and_unpack(archive, |a, b| {
-            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], None, |_, _| {}, |_| {})
+            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {})
         })
     }
 
@@ -1050,7 +1084,6 @@ mod tests {
                 ar,
                 tmp,
                 &[tmp.join("accounts_dest")],
-                None,
                 |_, _| {},
                 |path| assert_eq!(path, tmp.join("accounts_dest/123.456")),
             )

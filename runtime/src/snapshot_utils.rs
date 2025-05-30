@@ -28,13 +28,14 @@ use {
         accounts_file::{AccountsFile, AccountsFileError, InternalsForArchive, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
         epoch_accounts_hash::EpochAccountsHash,
-        hardened_unpack::{self, ParallelSelector, UnpackError},
+        hardened_unpack::{self, ChunkedBytes, UnpackError},
         shared_buffer_reader::{SharedBuffer, SharedBufferReader},
         utils::{move_and_async_delete_path, ACCOUNTS_RUN_DIR, ACCOUNTS_SNAPSHOT_DIR},
     },
     solana_clock::{Epoch, Slot},
     solana_hash::Hash,
     solana_measure::{measure::Measure, measure_time, measure_us},
+    solana_perf::packet::bytes::{Bytes, BytesMut},
     std::{
         cmp::Ordering,
         collections::{HashMap, HashSet},
@@ -1631,24 +1632,20 @@ pub fn verify_and_unarchive_snapshots(
 
 /// Spawns a thread for unpacking a snapshot
 fn spawn_unpack_snapshot_thread(
+    chunks_recv: crossbeam_channel::Receiver<ChunkedBytes>,
     file_sender: Sender<PathBuf>,
     account_paths: Arc<Vec<PathBuf>>,
     ledger_dir: Arc<PathBuf>,
-    mut archive: Archive<SharedBufferReader>,
-    parallel_selector: Option<ParallelSelector>,
     thread_index: usize,
 ) -> JoinHandle<()> {
-    let (_tx, rx) = crossbeam_channel::bounded::<solana_perf::packet::bytes::Bytes>(10);
     Builder::new()
         .name(format!("solUnpkSnpsht{thread_index:02}"))
         .spawn(move || {
             hardened_unpack::streaming_unpack_snapshot(
-                &mut archive,
+                chunks_recv,
                 ledger_dir.as_path(),
                 &account_paths,
-                parallel_selector,
                 &file_sender,
-                rx,
             )
             .unwrap();
         })
@@ -1656,90 +1653,157 @@ fn spawn_unpack_snapshot_thread(
 }
 
 /// Streams unpacked files across channel
-#[allow(unused)]
-fn streaming_unarchive_snapshot(
+// #[allow(unused)]
+// fn streaming_unarchive_snapshot(
+//     file_sender: Sender<PathBuf>,
+//     account_paths: Vec<PathBuf>,
+//     ledger_dir: PathBuf,
+//     snapshot_archive_path: PathBuf,
+//     archive_format: ArchiveFormat,
+//     num_threads: usize,
+// ) -> Vec<JoinHandle<()>> {
+//     let account_paths = Arc::new(account_paths);
+//     let ledger_dir = Arc::new(ledger_dir);
+//     let shared_buffer = untar_snapshot_create_shared_buffer(&snapshot_archive_path, archive_format);
+
+//     // All shared buffer readers need to be created before the threads are spawned
+//     let archives: Vec<_> = (0..num_threads)
+//         .map(|_| {
+//             let reader = SharedBufferReader::new(&shared_buffer);
+//             Archive::new(reader)
+//         })
+//         .collect();
+
+//     archives
+//         .into_iter()
+//         .enumerate()
+//         .map(|(thread_index, archive)| {
+//             spawn_unpack_snapshot_thread(
+//                 file_sender.clone(),
+//                 account_paths.clone(),
+//                 ledger_dir.clone(),
+//                 thread_index,
+//             )
+//         })
+//         .collect()
+// }
+
+fn split_off_archive(input: &mut Bytes) -> (Bytes, usize) {
+    let mut arch = Archive::new(input.as_ref());
+
+    const TAR_BLOCK_SIZE: usize = size_of::<tar::Header>();
+    let mut last_entry_end = 0;
+    for entry in arch.entries().unwrap() {
+        let entry = entry.unwrap();
+        // info!(
+        //     "split entry {:?}, h: {}, pos: {} + {}",
+        //     entry.path().unwrap(),
+        //     entry.raw_header_position(),
+        //     entry.raw_file_position(),
+        //     entry.size()
+        // );
+        // End of file data
+        let cur_entry_end = (entry.raw_file_position() + entry.size()) as usize;
+        // Padding to block size
+        let cur_entry_end = TAR_BLOCK_SIZE * cur_entry_end.div_ceil(TAR_BLOCK_SIZE);
+        if cur_entry_end <= input.len() {
+            // Entry ends within decoded input, we can consume it
+            last_entry_end = cur_entry_end;
+        }
+        if cur_entry_end + TAR_BLOCK_SIZE > input.len() {
+            // Stop since next entry's header is beyond input
+            let remaining = input.split_to(last_entry_end);
+            return (remaining, cur_entry_end - last_entry_end);
+        }
+    }
+    // Exchausted all entries, assume this is the end of archive
+    (Bytes::new(), 0)
+}
+
+fn decode_bytes(decoder: &mut impl Read) -> Bytes {
+    let mut decode_buf = BytesMut::with_capacity(1 << 25);
+    let mut_slice =
+        unsafe { std::slice::from_raw_parts_mut(decode_buf.as_mut_ptr(), decode_buf.capacity()) };
+    let mut current_len = decode_buf.len();
+    while current_len < decode_buf.capacity() {
+        let new_bytes = decoder.read(&mut mut_slice[current_len..]).unwrap();
+        if new_bytes == 0 {
+            break;
+        }
+        current_len = current_len + new_bytes;
+        unsafe { decode_buf.set_len(current_len) };
+    }
+    decode_buf.into()
+}
+
+fn streaming_unarchive_snapshot_ks(
     file_sender: Sender<PathBuf>,
     account_paths: Vec<PathBuf>,
     ledger_dir: PathBuf,
     snapshot_archive_path: PathBuf,
-    archive_format: ArchiveFormat,
+    _archive_format: ArchiveFormat,
     num_threads: usize,
 ) -> Vec<JoinHandle<()>> {
     let account_paths = Arc::new(account_paths);
     let ledger_dir = Arc::new(ledger_dir);
-    let shared_buffer = untar_snapshot_create_shared_buffer(&snapshot_archive_path, archive_format);
 
-    // All shared buffer readers need to be created before the threads are spawned
-    let archives: Vec<_> = (0..num_threads)
-        .map(|_| {
-            let reader = SharedBufferReader::new(&shared_buffer);
-            Archive::new(reader)
-        })
-        .collect();
-
-    archives
-        .into_iter()
-        .enumerate()
-        .map(|(thread_index, archive)| {
-            let parallel_selector = Some(ParallelSelector {
-                index: thread_index,
-                divisions: num_threads,
-            });
-
-            spawn_unpack_snapshot_thread(
-                file_sender.clone(),
-                account_paths.clone(),
-                ledger_dir.clone(),
-                archive,
-                parallel_selector,
-                thread_index,
-            )
-        })
-        .collect()
-}
-
-fn streaming_unarchive_snapshot_ks(
-    _file_sender: Sender<PathBuf>,
-    _account_paths: Vec<PathBuf>,
-    _ledger_dir: PathBuf,
-    snapshot_archive_path: PathBuf,
-    _archive_format: ArchiveFormat,
-    _num_threads: usize,
-) -> Vec<JoinHandle<()>> {
-    // let account_paths = Arc::new(account_paths);
-    // let ledger_dir = Arc::new(ledger_dir);
-
-    // let shared_buffer = untar_snapshot_create_shared_buffer(&snapshot_archive_path, archive_format);
-    let decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
         1 << 20,
         fs::File::open(&snapshot_archive_path).unwrap(),
     ))
     .unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
-    let mut arch = Archive::new(decoder);
-    for entry in arch.entries().unwrap() {
-        let entry = entry.unwrap();
-        info!("entry {:?} {}", entry.path().unwrap(), entry.size());
+    let mut handles = vec![];
+    for thread_index in 0..num_threads {
+        handles.push(spawn_unpack_snapshot_thread(
+            rx.clone(),
+            file_sender.clone(),
+            account_paths.clone(),
+            ledger_dir.clone(),
+            thread_index,
+        ))
     }
-    //const TAR_HEADER_SIZE: usize = 512;
-    // let mut buf = [0u8; TAR_HEADER_SIZE];
-    // while decoder.read_exact(&mut buf).is_ok() {
-    //     let header = tar::Header::from_byte_slice(&buf);
-    //     let mut size = header.entry_size().unwrap() as usize;
-    //     info!("header {:?} {}", header.path().unwrap(), size);
-    //     while size > 0 {
-    //         decoder.read_exact(&mut buf[..size]).unwrap();
-    //         size = size.saturating_sub(TAR_HEADER_SIZE);
-    //     }
-    // }
-    vec![]
-    // let mut arch = Archive::new(decoder);
-    // for entry in arch.entries().unwrap() {
-    //     let entry = entry.unwrap();
-    //     tar::entry::EntryFields;
-    //     entry.raw_header_position();
-    //     entry.header().size()
-    // }
+
+    let mut decoded = Bytes::new();
+    let mut open_entry_left = 0;
+    let mut current_archive_chunks = ChunkedBytes::new();
+    loop {
+        if decoded.is_empty() {
+            decoded = decode_bytes(&mut decoder);
+            if decoded.is_empty() {
+                assert!(current_archive_chunks.is_empty());
+                break;
+            }
+        }
+
+        if open_entry_left > 0 {
+            let open_entry_bytes = decoded.split_to(open_entry_left.min(decoded.len()));
+            open_entry_left -= open_entry_bytes.len();
+            current_archive_chunks.push(open_entry_bytes);
+            if open_entry_left == 0 {
+                tx.send(std::mem::take(&mut current_archive_chunks))
+                    .unwrap();
+            }
+            continue;
+        }
+
+        let (complete_archive_chunk, open_entry_len) = split_off_archive(&mut decoded);
+        info!(
+            "split {} {}, open {}",
+            complete_archive_chunk.len(),
+            decoded.len(),
+            open_entry_len
+        );
+        if !complete_archive_chunk.is_empty() {
+            current_archive_chunks.push(complete_archive_chunk);
+            tx.send(std::mem::take(&mut current_archive_chunks))
+                .unwrap();
+        }
+        open_entry_left = open_entry_len;
+    }
+
+    handles
 
     // // All shared buffer readers need to be created before the threads are spawned
     // let archives: Vec<_> = (0..num_threads)
@@ -2363,19 +2427,9 @@ fn unpack_snapshot_local(
     // create 'parallel_divisions' # of parallel workers, each responsible for 1/parallel_divisions of all the files to extract.
     let all_unpacked_append_vec_map = readers
         .into_par_iter()
-        .enumerate()
-        .map(|(index, reader)| {
-            let parallel_selector = Some(ParallelSelector {
-                index,
-                divisions: parallel_divisions,
-            });
+        .map(|reader| {
             let mut archive = Archive::new(reader);
-            hardened_unpack::unpack_snapshot(
-                &mut archive,
-                ledger_dir,
-                account_paths,
-                parallel_selector,
-            )
+            hardened_unpack::unpack_snapshot(&mut archive, ledger_dir, account_paths)
         })
         .collect::<Vec<_>>();
 
