@@ -1692,7 +1692,8 @@ fn split_off_archive(input: &mut Bytes) -> (Bytes, usize) {
     let mut arch = Archive::new(input.as_ref());
 
     const TAR_BLOCK_SIZE: usize = size_of::<tar::Header>();
-    let mut last_entry_end = 0;
+    let mut completed_entry_end = 0;
+    let mut entry_end = 0;
     for entry in arch.entries().unwrap() {
         let entry = entry.unwrap();
         // info!(
@@ -1703,21 +1704,21 @@ fn split_off_archive(input: &mut Bytes) -> (Bytes, usize) {
         //     entry.size()
         // );
         // End of file data
-        let cur_entry_end = (entry.raw_file_position() + entry.size()) as usize;
+        entry_end = (entry.raw_file_position() + entry.size()) as usize;
         // Padding to block size
-        let cur_entry_end = TAR_BLOCK_SIZE * cur_entry_end.div_ceil(TAR_BLOCK_SIZE);
-        if cur_entry_end <= input.len() {
+        entry_end = TAR_BLOCK_SIZE * entry_end.div_ceil(TAR_BLOCK_SIZE);
+        if entry_end <= input.len() {
             // Entry ends within decoded input, we can consume it
-            last_entry_end = cur_entry_end;
+            completed_entry_end = entry_end;
         }
-        if cur_entry_end + TAR_BLOCK_SIZE > input.len() {
+        if entry_end + TAR_BLOCK_SIZE > input.len() {
             // Stop since next entry's header is beyond input
-            let remaining = input.split_to(last_entry_end);
-            return (remaining, cur_entry_end - last_entry_end);
+            break;
         }
     }
-    // Exchausted all entries, assume this is the end of archive
-    (Bytes::new(), 0)
+    // Either we run out of entries or last entry crosses input
+    let completed_entry = input.split_to(completed_entry_end);
+    return (completed_entry, entry_end - completed_entry_end);
 }
 
 fn decode_bytes(decoder: &mut impl Read, mempool: &mut std::collections::VecDeque<Bytes>) -> Bytes {
