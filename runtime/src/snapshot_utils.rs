@@ -1720,11 +1720,16 @@ fn split_off_archive(input: &mut Bytes) -> (Bytes, usize) {
     (Bytes::new(), 0)
 }
 
-fn decode_bytes(decoder: &mut impl Read) -> Bytes {
-    let mut decode_buf = BytesMut::with_capacity(1 << 25);
+fn decode_bytes(decoder: &mut impl Read, mempool: &mut std::collections::VecDeque<Bytes>) -> Bytes {
+    let mut decode_buf = if mempool.front().is_some_and(|bytes| bytes.is_unique()) {
+        mempool.pop_front().unwrap().into()
+    } else {
+        BytesMut::with_capacity(1 << 26)
+    };
+
     let mut_slice =
         unsafe { std::slice::from_raw_parts_mut(decode_buf.as_mut_ptr(), decode_buf.capacity()) };
-    let mut current_len = decode_buf.len();
+    let mut current_len = 0;
     while current_len < decode_buf.capacity() {
         let new_bytes = decoder.read(&mut mut_slice[current_len..]).unwrap();
         if new_bytes == 0 {
@@ -1733,7 +1738,9 @@ fn decode_bytes(decoder: &mut impl Read) -> Bytes {
         current_len = current_len + new_bytes;
         unsafe { decode_buf.set_len(current_len) };
     }
-    decode_buf.into()
+    let bytes: Bytes = decode_buf.into();
+    mempool.push_back(bytes.clone());
+    bytes
 }
 
 fn streaming_unarchive_snapshot_ks(
@@ -1747,11 +1754,6 @@ fn streaming_unarchive_snapshot_ks(
     let account_paths = Arc::new(account_paths);
     let ledger_dir = Arc::new(ledger_dir);
 
-    let mut decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
-        1 << 20,
-        fs::File::open(&snapshot_archive_path).unwrap(),
-    ))
-    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
 
     let mut handles = vec![];
@@ -1765,12 +1767,25 @@ fn streaming_unarchive_snapshot_ks(
         ))
     }
 
+    chunk_decoded_archive(snapshot_archive_path, tx);
+
+    handles
+}
+
+fn chunk_decoded_archive(snapshot_archive_path: PathBuf, tx: Sender<ChunkedBytes>) {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
+        1 << 20,
+        fs::File::open(&snapshot_archive_path).unwrap(),
+    ))
+    .unwrap();
+
+    let mut mempool = std::collections::VecDeque::new();
     let mut decoded = Bytes::new();
     let mut open_entry_left = 0;
     let mut current_archive_chunks = ChunkedBytes::new();
     loop {
         if decoded.is_empty() {
-            decoded = decode_bytes(&mut decoder);
+            decoded = decode_bytes(&mut decoder, &mut mempool);
             if decoded.is_empty() {
                 assert!(current_archive_chunks.is_empty());
                 break;
@@ -1789,49 +1804,28 @@ fn streaming_unarchive_snapshot_ks(
         }
 
         let (complete_archive_chunk, open_entry_len) = split_off_archive(&mut decoded);
-        info!(
-            "split {} {}, open {}",
-            complete_archive_chunk.len(),
-            decoded.len(),
-            open_entry_len
-        );
-        if !complete_archive_chunk.is_empty() {
+        // info!(
+        //     "split {} {}, open {}",
+        //     complete_archive_chunk.len(),
+        //     decoded.len(),
+        //     open_entry_len
+        // );
+        if complete_archive_chunk.is_empty() {
+            if open_entry_len == 0 {
+                info!(
+                    "no progess at split, left {}, {:?}",
+                    decoded.len(),
+                    &decoded[..(2000.min(decoded.len()))]
+                );
+                break;
+            }
+        } else {
             current_archive_chunks.push(complete_archive_chunk);
             tx.send(std::mem::take(&mut current_archive_chunks))
                 .unwrap();
         }
         open_entry_left = open_entry_len;
     }
-
-    handles
-
-    // // All shared buffer readers need to be created before the threads are spawned
-    // let archives: Vec<_> = (0..num_threads)
-    //     .map(|_| {
-    //         let reader = SharedBufferReader::new(&shared_buffer);
-    //         Archive::new(reader)
-    //     })
-    //     .collect();
-
-    // archives
-    //     .into_iter()
-    //     .enumerate()
-    //     .map(|(thread_index, archive)| {
-    //         let parallel_selector = Some(ParallelSelector {
-    //             index: thread_index,
-    //             divisions: num_threads,
-    //         });
-
-    //         spawn_unpack_snapshot_thread(
-    //             file_sender.clone(),
-    //             account_paths.clone(),
-    //             ledger_dir.clone(),
-    //             archive,
-    //             parallel_selector,
-    //             thread_index,
-    //         )
-    //     })
-    //     .collect()
 }
 
 /// BankSnapshotInfo::new_from_dir() requires a few meta files to accept a snapshot dir
