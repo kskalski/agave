@@ -28,7 +28,7 @@ use {
         accounts_file::{AccountsFile, AccountsFileError, InternalsForArchive, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
         epoch_accounts_hash::EpochAccountsHash,
-        hardened_unpack::{self, ChunkedBytes, UnpackError},
+        hardened_unpack::{self, MultiBytes, UnpackError},
         shared_buffer_reader::{SharedBuffer, SharedBufferReader},
         utils::{move_and_async_delete_path, ACCOUNTS_RUN_DIR, ACCOUNTS_SNAPSHOT_DIR},
     },
@@ -1632,7 +1632,7 @@ pub fn verify_and_unarchive_snapshots(
 
 /// Spawns a thread for unpacking a snapshot
 fn spawn_unpack_snapshot_thread(
-    chunks_recv: crossbeam_channel::Receiver<ChunkedBytes>,
+    chunks_recv: crossbeam_channel::Receiver<MultiBytes>,
     file_sender: Sender<PathBuf>,
     account_paths: Arc<Vec<PathBuf>>,
     ledger_dir: Arc<PathBuf>,
@@ -1653,56 +1653,48 @@ fn spawn_unpack_snapshot_thread(
 }
 
 /// Streams unpacked files across channel
-// #[allow(unused)]
-// fn streaming_unarchive_snapshot(
-//     file_sender: Sender<PathBuf>,
-//     account_paths: Vec<PathBuf>,
-//     ledger_dir: PathBuf,
-//     snapshot_archive_path: PathBuf,
-//     archive_format: ArchiveFormat,
-//     num_threads: usize,
-// ) -> Vec<JoinHandle<()>> {
-//     let account_paths = Arc::new(account_paths);
-//     let ledger_dir = Arc::new(ledger_dir);
-//     let shared_buffer = untar_snapshot_create_shared_buffer(&snapshot_archive_path, archive_format);
+fn streaming_unarchive_snapshot(
+    file_sender: Sender<PathBuf>,
+    account_paths: Vec<PathBuf>,
+    ledger_dir: PathBuf,
+    snapshot_archive_path: PathBuf,
+    _archive_format: ArchiveFormat,
+    num_threads: usize,
+) -> Vec<JoinHandle<()>> {
+    let account_paths = Arc::new(account_paths);
+    let ledger_dir = Arc::new(ledger_dir);
 
-//     // All shared buffer readers need to be created before the threads are spawned
-//     let archives: Vec<_> = (0..num_threads)
-//         .map(|_| {
-//             let reader = SharedBufferReader::new(&shared_buffer);
-//             Archive::new(reader)
-//         })
-//         .collect();
+    let mut handles = vec![];
 
-//     archives
-//         .into_iter()
-//         .enumerate()
-//         .map(|(thread_index, archive)| {
-//             spawn_unpack_snapshot_thread(
-//                 file_sender.clone(),
-//                 account_paths.clone(),
-//                 ledger_dir.clone(),
-//                 thread_index,
-//             )
-//         })
-//         .collect()
-// }
+    let (chunk_sender, chunk_recv) = crossbeam_channel::bounded(num_threads * 2);
 
-fn split_off_archive(input: &mut Bytes) -> (Bytes, usize) {
-    let mut arch = Archive::new(input.as_ref());
+    for thread_index in 0..num_threads {
+        handles.push(spawn_unpack_snapshot_thread(
+            chunk_recv.clone(),
+            file_sender.clone(),
+            account_paths.clone(),
+            ledger_dir.clone(),
+            thread_index,
+        ))
+    }
+    handles.push(
+        Builder::new()
+            .name(format!("solTarDecompress"))
+            .spawn(move || decode_and_chunk_archive(snapshot_archive_path, chunk_sender))
+            .unwrap(),
+    );
+
+    handles
+}
+
+fn split_off_complete_archive(input: &mut Bytes) -> (Bytes, usize) {
+    let mut archive = Archive::new(input.as_ref());
 
     const TAR_BLOCK_SIZE: usize = size_of::<tar::Header>();
     let mut completed_entry_end = 0;
     let mut entry_end = 0;
-    for entry in arch.entries().unwrap() {
+    for entry in archive.entries().unwrap() {
         let entry = entry.unwrap();
-        // info!(
-        //     "split entry {:?}, h: {}, pos: {} + {}",
-        //     entry.path().unwrap(),
-        //     entry.raw_header_position(),
-        //     entry.raw_file_position(),
-        //     entry.size()
-        // );
         // End of file data
         entry_end = (entry.raw_file_position() + entry.size()) as usize;
         // Padding to block size
@@ -1712,12 +1704,18 @@ fn split_off_archive(input: &mut Bytes) -> (Bytes, usize) {
             completed_entry_end = entry_end;
         }
         if entry_end + TAR_BLOCK_SIZE > input.len() {
-            // Stop since next entry's header is beyond input
+            // Next entry's header spans beyond input - can't decode it,
+            // so terminate at last completed entry and keep remaining input after it
             break;
         }
     }
     // Either we run out of entries or last entry crosses input
     let completed_entry = input.split_to(completed_entry_end);
+    if completed_entry.is_empty() && entry_end == completed_entry_end {
+        // Archive ended, clear any tar footer from remaining input
+        assert!(input.len() <= 1024, "Footer should be at most 1024 len");
+        input.clear();
+    }
     return (completed_entry, entry_end - completed_entry_end);
 }
 
@@ -1744,86 +1742,56 @@ fn decode_bytes(decoder: &mut impl Read, mempool: &mut std::collections::VecDequ
     bytes
 }
 
-fn streaming_unarchive_snapshot_ks(
-    file_sender: Sender<PathBuf>,
-    account_paths: Vec<PathBuf>,
-    ledger_dir: PathBuf,
-    snapshot_archive_path: PathBuf,
-    _archive_format: ArchiveFormat,
-    num_threads: usize,
-) -> Vec<JoinHandle<()>> {
-    let account_paths = Arc::new(account_paths);
-    let ledger_dir = Arc::new(ledger_dir);
-
-    let (tx, rx) = crossbeam_channel::unbounded();
-
-    let mut handles = vec![];
-    for thread_index in 0..num_threads {
-        handles.push(spawn_unpack_snapshot_thread(
-            rx.clone(),
-            file_sender.clone(),
-            account_paths.clone(),
-            ledger_dir.clone(),
-            thread_index,
-        ))
-    }
-
-    chunk_decoded_archive(snapshot_archive_path, tx);
-
-    handles
-}
-
-fn chunk_decoded_archive(snapshot_archive_path: PathBuf, tx: Sender<ChunkedBytes>) {
+fn decode_and_chunk_archive(archive_path: PathBuf, chunk_sender: Sender<MultiBytes>) {
     let mut decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
-        1 << 20,
-        fs::File::open(&snapshot_archive_path).unwrap(),
+        1 << 25,
+        fs::File::open(&archive_path).unwrap(),
     ))
     .unwrap();
 
+    // Bytes for chunk of archive to be sent to workers for unpacking
+    let mut current_chunk = MultiBytes::new();
     let mut mempool = std::collections::VecDeque::new();
     let mut decoded = Bytes::new();
+    // Number of bytes to add into `current_chunk` to finish last entry
     let mut open_entry_left = 0;
-    let mut current_archive_chunks = ChunkedBytes::new();
     loop {
+        // Re-fill decoded buffer if necessary
         if decoded.is_empty() {
             decoded = decode_bytes(&mut decoder, &mut mempool);
             if decoded.is_empty() {
-                assert!(current_archive_chunks.is_empty());
+                assert!(current_chunk.is_empty());
                 break;
             }
         }
 
+        // Finish up any open entry
         if open_entry_left > 0 {
             let open_entry_bytes = decoded.split_to(open_entry_left.min(decoded.len()));
             open_entry_left -= open_entry_bytes.len();
-            current_archive_chunks.push(open_entry_bytes);
+            current_chunk.push(open_entry_bytes);
             if open_entry_left == 0 {
-                tx.send(std::mem::take(&mut current_archive_chunks))
-                    .unwrap();
+                let chunk = std::mem::take(&mut current_chunk);
+                if chunk_sender.send(chunk).is_err() {
+                    break;
+                }
             }
             continue;
         }
 
-        let (complete_archive_chunk, open_entry_len) = split_off_archive(&mut decoded);
+        let (complete_archive_chunk, open_entry_len) = split_off_complete_archive(&mut decoded);
         // info!(
         //     "split {} {}, open {}",
         //     complete_archive_chunk.len(),
         //     decoded.len(),
         //     open_entry_len
         // );
-        if complete_archive_chunk.is_empty() {
-            if open_entry_len == 0 {
-                info!(
-                    "no progess at split, left {}, {:?}",
-                    decoded.len(),
-                    &decoded[..(2000.min(decoded.len()))]
-                );
+        if !complete_archive_chunk.is_empty() {
+            current_chunk.push(complete_archive_chunk);
+            let chunk = std::mem::take(&mut current_chunk);
+            if chunk_sender.send(chunk).is_err() {
                 break;
             }
-        } else {
-            current_archive_chunks.push(complete_archive_chunk);
-            tx.send(std::mem::take(&mut current_archive_chunks))
-                .unwrap();
         }
         open_entry_left = open_entry_len;
     }
@@ -1881,7 +1849,7 @@ fn unarchive_snapshot(
     let unpacked_snapshots_dir = unpack_dir.path().join("snapshots");
 
     let (file_sender, file_receiver) = crossbeam_channel::unbounded();
-    streaming_unarchive_snapshot_ks(
+    streaming_unarchive_snapshot(
         file_sender,
         account_paths.to_vec(),
         unpack_dir.path().to_path_buf(),

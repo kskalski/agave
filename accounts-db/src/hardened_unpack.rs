@@ -46,9 +46,10 @@ const MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT: u64 = 5_000_000;
 pub const MAX_GENESIS_ARCHIVE_UNPACKED_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
 const MAX_GENESIS_ARCHIVE_UNPACKED_COUNT: u64 = 100;
 
-pub struct ChunkedBytes(pub std::collections::VecDeque<solana_perf::packet::bytes::Bytes>);
+/// Collection of shareable byte slices forming a chain bytes to read (using `std::io::Read`)
+pub struct MultiBytes(pub std::collections::VecDeque<solana_perf::packet::bytes::Bytes>);
 
-impl ChunkedBytes {
+impl MultiBytes {
     pub fn new() -> Self {
         Self(std::collections::VecDeque::with_capacity(1))
     }
@@ -62,13 +63,13 @@ impl ChunkedBytes {
     }
 }
 
-impl Default for ChunkedBytes {
+impl Default for MultiBytes {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Read for ChunkedBytes {
+impl Read for MultiBytes {
     fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
         let mut copied_len = 0;
         while let Some(bytes) = self.0.front_mut() {
@@ -135,7 +136,7 @@ fn unpack_archive<'a, A, C, D>(
     limit_count: u64,
     mut entry_checker: C, // checks if entry is valid
     entry_processor: D,   // processes entry after setting permissions
-) -> Result<()>
+) -> Result<i32>
 where
     A: Read,
     C: FnMut(&[&str], tar::EntryType) -> UnpackPath<'a>,
@@ -233,9 +234,8 @@ where
 
         total_entries += 1;
     }
-    info!("unpacked {} entries total", total_entries);
 
-    return Ok(());
+    return Ok(total_entries);
 
     #[cfg(unix)]
     fn set_perms(dst: &Path, mode: u32) -> std::io::Result<()> {
@@ -364,16 +364,18 @@ pub fn unpack_snapshot<A: Read>(
     .map(|_| unpacked_append_vec_map)
 }
 
-/// Unpacks snapshots and sends entry file paths through the `sender` channel
+/// Unpacks snapshots from chunked archives received through `chunk_recv` and
+/// sends entry file paths through the `sender` channel
 pub fn streaming_unpack_snapshot(
-    chunks_recv: crossbeam_channel::Receiver<ChunkedBytes>,
+    chunk_recv: crossbeam_channel::Receiver<MultiBytes>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
     sender: &crossbeam_channel::Sender<PathBuf>,
 ) -> Result<()> {
-    while let Ok(chunked_bytes) = chunks_recv.recv() {
-        let mut archive = Archive::new(chunked_bytes);
-        unpack_snapshot_with_processors(
+    let mut total_entities = 0;
+    while let Ok(archive_chunk) = chunk_recv.recv() {
+        let mut archive = Archive::new(archive_chunk);
+        total_entities += unpack_snapshot_with_processors(
             &mut archive,
             ledger_dir,
             account_paths,
@@ -389,8 +391,9 @@ pub fn streaming_unpack_snapshot(
                     }
                 }
             },
-        )?
+        )?;
     }
+    info!("unpacked {total_entities} entities");
     Ok(())
 }
 
@@ -400,7 +403,7 @@ fn unpack_snapshot_with_processors<A, F, G>(
     account_paths: &[PathBuf],
     mut accounts_path_processor: F,
     entry_processor: G,
-) -> Result<()>
+) -> Result<i32>
 where
     A: Read,
     F: FnMut(&str, &Path),
@@ -549,14 +552,16 @@ fn unpack_genesis<A: Read>(
     unpack_dir: &Path,
     max_genesis_archive_unpacked_size: u64,
 ) -> Result<()> {
-    unpack_archive(
+    let unpacked_entities = unpack_archive(
         archive,
         max_genesis_archive_unpacked_size,
         max_genesis_archive_unpacked_size,
         MAX_GENESIS_ARCHIVE_UNPACKED_COUNT,
         |p, k| is_valid_genesis_archive_entry(unpack_dir, p, k),
         |_| {},
-    )
+    )?;
+    info!("total genesis entities {unpacked_entities}");
+    Ok(())
 }
 
 fn is_valid_genesis_archive_entry<'a>(
@@ -829,7 +834,8 @@ mod tests {
 
     fn finalize_and_unpack_snapshot(archive: tar::Builder<Vec<u8>>) -> Result<()> {
         with_finalize_and_unpack(archive, |a, b| {
-            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {})
+            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {});
+            Ok(())
         })
     }
 
@@ -1088,6 +1094,6 @@ mod tests {
                 |path| assert_eq!(path, tmp.join("accounts_dest/123.456")),
             )
         });
-        assert_matches!(result, Ok(()));
+        assert_matches!(result, Ok(1));
     }
 }
