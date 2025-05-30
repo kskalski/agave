@@ -1721,14 +1721,16 @@ fn split_off_complete_archive(input: &mut Bytes) -> (Bytes, usize) {
 
 fn decode_bytes(decoder: &mut impl Read, mempool: &mut std::collections::VecDeque<Bytes>) -> Bytes {
     let mut decode_buf = if mempool.front().is_some_and(|bytes| bytes.is_unique()) {
-        mempool.pop_front().unwrap().into()
+        let mut reclaimed: BytesMut = mempool.pop_front().unwrap().into();
+        reclaimed.clear();
+        reclaimed;
     } else {
         BytesMut::with_capacity(1 << 26)
     };
 
     let mut_slice =
         unsafe { std::slice::from_raw_parts_mut(decode_buf.as_mut_ptr(), decode_buf.capacity()) };
-    let mut current_len = 0;
+    let mut current_len = decode_buf.len();
     while current_len < decode_buf.capacity() {
         let new_bytes = decoder.read(&mut mut_slice[current_len..]).unwrap();
         if new_bytes == 0 {
