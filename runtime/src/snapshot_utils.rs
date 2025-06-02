@@ -43,6 +43,7 @@ use {
         mem,
         num::NonZeroUsize,
         ops::RangeInclusive,
+        os::unix::fs::OpenOptionsExt,
         path::{Path, PathBuf},
         process::ExitStatus,
         str::FromStr,
@@ -1698,6 +1699,7 @@ struct ArchiveChunker<R> {
 impl<R: Read> ArchiveChunker<R> {
     const TAR_BLOCK_SIZE: usize = size_of::<tar::Header>();
     const INPUT_READER_BUF_SIZE: usize = 128 * 1024 * 1024;
+    const SEQ_READ_SIZE: usize = Self::INPUT_READER_BUF_SIZE / 8;
     const DECODE_BUF_SIZE: usize = 64 * 1024 * 1024;
 
     pub fn new(input: R) -> Self {
@@ -1720,7 +1722,7 @@ impl<R: Read> ArchiveChunker<R> {
                 let did_finish_entry = !self.has_started_entry();
                 (started_entry_bytes, did_finish_entry)
             } else {
-                (self.take_complete_archive(), true)
+                (self.take_complete_archive()?, true)
             };
             if !new_bytes.is_empty() {
                 current_chunk.push(new_bytes);
@@ -1736,13 +1738,13 @@ impl<R: Read> ArchiveChunker<R> {
     }
 
     /// Take as many bytes as possible from decoded data until last entry boundary.
-    fn take_complete_archive(&mut self) -> Bytes {
+    fn take_complete_archive(&mut self) -> IoResult<Bytes> {
         let mut archive = Archive::new(self.current_decoded.as_ref());
 
         let mut completed_entry_end = 0;
         let mut entry_end = 0;
-        for entry in archive.entries().unwrap() {
-            let entry = entry.unwrap();
+        for entry in archive.entries()? {
+            let entry = entry?;
             // End of file data
             entry_end = (entry.raw_file_position() + entry.size()) as usize;
             // Padding to block size
@@ -1759,6 +1761,11 @@ impl<R: Read> ArchiveChunker<R> {
         }
         // Either we run out of entries or last entry crosses input
         let completed_entry = self.current_decoded.split_to(completed_entry_end);
+        info!(
+            "arch {} {}",
+            completed_entry.len(),
+            self.current_decoded.len()
+        );
         if completed_entry.is_empty() && entry_end == completed_entry_end {
             // Archive ended, clear any tar footer from remaining input
             assert!(
@@ -1768,7 +1775,7 @@ impl<R: Read> ArchiveChunker<R> {
             self.current_decoded.clear();
         }
         self.num_started_entry_bytes = entry_end - completed_entry_end;
-        completed_entry
+        Ok(completed_entry)
     }
 
     fn has_started_entry(&self) -> bool {
@@ -1826,25 +1833,37 @@ impl<R: Read> ArchiveChunker<R> {
     }
 }
 
-impl ArchiveChunker<Box<dyn Read>> {
-    pub fn from_path(archive_path: &Path, archive_format: ArchiveFormat) -> IoResult<Self> {
-        let file = fs::File::open(archive_path).map_err(|err| {
-            IoError::other(format!(
-                "failed to open snapshot archive '{}': {err}",
-                archive_path.display(),
-            ))
-        })?;
+impl<'a> ArchiveChunker<Box<dyn Read + 'a>> {
+    pub fn from_path(
+        buf: &'a mut [u8],
+        archive_path: &Path,
+        archive_format: ArchiveFormat,
+    ) -> IoResult<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT | libc::O_NOATIME)
+            .open(archive_path)
+            .map_err(|err| {
+                IoError::other(format!(
+                    "failed to open snapshot archive '{}': {err}",
+                    archive_path.display(),
+                ))
+            })?;
+        assert!(solana_accounts_db::ring::io_uring_supported());
+        let buf_file = solana_accounts_db::ring::seq_file_reader::SequentialFileReader::<'a>::new(
+            file,
+            buf,
+            Self::SEQ_READ_SIZE,
+        )?;
         // Use buffered reader for decoders that do not buffer internally.
-        let buf_file = BufReader::with_capacity(Self::INPUT_READER_BUF_SIZE, file);
+        //let buf_file = BufReader::with_capacity(Self::INPUT_READER_BUF_SIZE, file);
         Ok(match archive_format {
             ArchiveFormat::TarBzip2 => Self::new(Box::new(BzDecoder::new(buf_file))),
-            ArchiveFormat::TarGzip => Self::new(Box::new(GzDecoder::new(buf_file.into_inner()))),
+            ArchiveFormat::TarGzip => Self::new(Box::new(GzDecoder::new(buf_file))),
             ArchiveFormat::TarZstd { .. } => Self::new(Box::new(
                 zstd::stream::read::Decoder::with_buffer(buf_file)?,
             )),
-            ArchiveFormat::TarLz4 => {
-                Self::new(Box::new(lz4::Decoder::new(buf_file.into_inner()).unwrap()))
-            }
+            ArchiveFormat::TarLz4 => Self::new(Box::new(lz4::Decoder::new(buf_file).unwrap())),
             ArchiveFormat::Tar => Self::new(Box::new(buf_file)),
         })
     }
@@ -1859,7 +1878,9 @@ fn spawn_archive_chunker_thread(
     Builder::new()
         .name(format!("solTarDecompress"))
         .spawn(move || {
-            let chunker = ArchiveChunker::from_path(&archive_path, archive_format).unwrap();
+            let mut buf = BytesMut::zeroed(ArchiveChunker::<MultiBytes>::INPUT_READER_BUF_SIZE);
+            let chunker =
+                ArchiveChunker::from_path(buf.as_mut(), &archive_path, archive_format).unwrap();
             chunker.decode_and_send_chunks(chunk_sender).unwrap()
         })
         .unwrap()

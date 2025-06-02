@@ -38,6 +38,7 @@ pub mod pubkey_bins;
 pub mod read_only_accounts_cache;
 #[cfg(not(feature = "dev-context-only-utils"))]
 mod read_only_accounts_cache;
+pub mod ring;
 mod rolling_bit_field;
 pub mod shared_buffer_reader;
 pub mod sorted_storages;
