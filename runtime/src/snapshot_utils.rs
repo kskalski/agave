@@ -29,7 +29,6 @@ use {
         accounts_hash::{AccountsDeltaHash, AccountsHash},
         epoch_accounts_hash::EpochAccountsHash,
         hardened_unpack::{self, MultiBytes, UnpackError},
-        shared_buffer_reader::{SharedBuffer, SharedBufferReader},
         utils::{move_and_async_delete_path, ACCOUNTS_RUN_DIR, ACCOUNTS_SNAPSHOT_DIR},
     },
     solana_clock::{Epoch, Slot},
@@ -1658,7 +1657,7 @@ fn streaming_unarchive_snapshot(
     account_paths: Vec<PathBuf>,
     ledger_dir: PathBuf,
     snapshot_archive_path: PathBuf,
-    _archive_format: ArchiveFormat,
+    archive_format: ArchiveFormat,
     num_threads: usize,
 ) -> Vec<JoinHandle<()>> {
     let account_paths = Arc::new(account_paths);
@@ -1667,6 +1666,11 @@ fn streaming_unarchive_snapshot(
     let mut handles = vec![];
 
     let (chunk_sender, chunk_recv) = crossbeam_channel::bounded(num_threads * 2);
+    handles.push(spawn_archive_chunker_thread(
+        snapshot_archive_path,
+        archive_format,
+        chunk_sender,
+    ));
 
     for thread_index in 0..num_threads {
         handles.push(spawn_unpack_snapshot_thread(
@@ -1677,126 +1681,188 @@ fn streaming_unarchive_snapshot(
             thread_index,
         ))
     }
-    handles.push(
-        Builder::new()
-            .name(format!("solTarDecompress"))
-            .spawn(move || decode_and_chunk_archive(snapshot_archive_path, chunk_sender))
-            .unwrap(),
-    );
 
     handles
 }
 
-fn split_off_complete_archive(input: &mut Bytes) -> (Bytes, usize) {
-    let mut archive = Archive::new(input.as_ref());
+#[derive(Debug)]
+struct ArchiveChunker<R> {
+    input: R,
+    /// Intermediate buffer with tar contents to seek and split on entry boundaries
+    current_decoded: Bytes,
+    /// Number of bytes from last entry that were not available in decoded buffer
+    num_started_entry_bytes: usize,
+    mempool: std::collections::VecDeque<Bytes>,
+}
 
+impl<R: Read> ArchiveChunker<R> {
     const TAR_BLOCK_SIZE: usize = size_of::<tar::Header>();
-    let mut completed_entry_end = 0;
-    let mut entry_end = 0;
-    for entry in archive.entries().unwrap() {
-        let entry = entry.unwrap();
-        // End of file data
-        entry_end = (entry.raw_file_position() + entry.size()) as usize;
-        // Padding to block size
-        entry_end = TAR_BLOCK_SIZE * entry_end.div_ceil(TAR_BLOCK_SIZE);
-        if entry_end <= input.len() {
-            // Entry ends within decoded input, we can consume it
-            completed_entry_end = entry_end;
-        }
-        if entry_end + TAR_BLOCK_SIZE > input.len() {
-            // Next entry's header spans beyond input - can't decode it,
-            // so terminate at last completed entry and keep remaining input after it
-            break;
+    const INPUT_READER_BUF_SIZE: usize = 128 * 1024 * 1024;
+    const DECODE_BUF_SIZE: usize = 64 * 1024 * 1024;
+
+    pub fn new(input: R) -> Self {
+        Self {
+            input,
+            current_decoded: Bytes::new(),
+            num_started_entry_bytes: 0,
+            mempool: Default::default(),
         }
     }
-    // Either we run out of entries or last entry crosses input
-    let completed_entry = input.split_to(completed_entry_end);
-    if completed_entry.is_empty() && entry_end == completed_entry_end {
-        // Archive ended, clear any tar footer from remaining input
-        assert!(input.len() <= 1024, "Footer should be at most 1024 len");
-        input.clear();
-    }
-    return (completed_entry, entry_end - completed_entry_end);
-}
 
-fn decode_bytes(decoder: &mut impl Read, mempool: &mut std::collections::VecDeque<Bytes>) -> Bytes {
-    let mut decode_buf = if mempool.front().is_some_and(|bytes| bytes.is_unique()) {
-        let mut reclaimed: BytesMut = mempool.pop_front().unwrap().into();
-        reclaimed.clear();
-        reclaimed;
-    } else {
-        BytesMut::with_capacity(1 << 26)
-    };
-
-    let mut_slice =
-        unsafe { std::slice::from_raw_parts_mut(decode_buf.as_mut_ptr(), decode_buf.capacity()) };
-    let mut current_len = decode_buf.len();
-    while current_len < decode_buf.capacity() {
-        let new_bytes = decoder.read(&mut mut_slice[current_len..]).unwrap();
-        if new_bytes == 0 {
-            break;
-        }
-        current_len = current_len + new_bytes;
-        unsafe { decode_buf.set_len(current_len) };
-    }
-    let bytes: Bytes = decode_buf.into();
-    mempool.push_back(bytes.clone());
-    bytes
-}
-
-fn decode_and_chunk_archive(archive_path: PathBuf, chunk_sender: Sender<MultiBytes>) {
-    let mut decoder = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(
-        1 << 25,
-        fs::File::open(&archive_path).unwrap(),
-    ))
-    .unwrap();
-
-    // Bytes for chunk of archive to be sent to workers for unpacking
-    let mut current_chunk = MultiBytes::new();
-    let mut mempool = std::collections::VecDeque::new();
-    let mut decoded = Bytes::new();
-    // Number of bytes to add into `current_chunk` to finish last entry
-    let mut open_entry_left = 0;
-    loop {
-        // Re-fill decoded buffer if necessary
-        if decoded.is_empty() {
-            decoded = decode_bytes(&mut decoder, &mut mempool);
-            if decoded.is_empty() {
-                assert!(current_chunk.is_empty());
-                break;
-            }
-        }
-
-        // Finish up any open entry
-        if open_entry_left > 0 {
-            let open_entry_bytes = decoded.split_to(open_entry_left.min(decoded.len()));
-            open_entry_left -= open_entry_bytes.len();
-            current_chunk.push(open_entry_bytes);
-            if open_entry_left == 0 {
-                let chunk = std::mem::take(&mut current_chunk);
-                if chunk_sender.send(chunk).is_err() {
-                    break;
+    /// Read `input`, split it at TAR archive boundaries and send chunks consisting of complete,
+    /// independent tar archives into `chunk_sender`.
+    pub fn decode_and_send_chunks(mut self, chunk_sender: Sender<MultiBytes>) -> IoResult<()> {
+        // Bytes for chunk of archive to be sent to workers for unpacking
+        let mut current_chunk = MultiBytes::new();
+        while self.refill_decoded_buf()? {
+            let (new_bytes, was_archive_completion) = if self.has_started_entry() {
+                let started_entry_bytes = self.take_started_entry_bytes();
+                let did_finish_entry = !self.has_started_entry();
+                (started_entry_bytes, did_finish_entry)
+            } else {
+                (self.take_complete_archive(), true)
+            };
+            if !new_bytes.is_empty() {
+                current_chunk.push(new_bytes);
+                if was_archive_completion {
+                    let chunk = std::mem::take(&mut current_chunk);
+                    if chunk_sender.send(chunk).is_err() {
+                        break;
+                    }
                 }
             }
-            continue;
         }
+        Ok(())
+    }
 
-        let (complete_archive_chunk, open_entry_len) = split_off_complete_archive(&mut decoded);
-        // info!(
-        //     "split {} {}, open {}",
-        //     complete_archive_chunk.len(),
-        //     decoded.len(),
-        //     open_entry_len
-        // );
-        if !complete_archive_chunk.is_empty() {
-            current_chunk.push(complete_archive_chunk);
-            let chunk = std::mem::take(&mut current_chunk);
-            if chunk_sender.send(chunk).is_err() {
+    /// Take as many bytes as possible from decoded data until last entry boundary.
+    fn take_complete_archive(&mut self) -> Bytes {
+        let mut archive = Archive::new(self.current_decoded.as_ref());
+
+        let mut completed_entry_end = 0;
+        let mut entry_end = 0;
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            // End of file data
+            entry_end = (entry.raw_file_position() + entry.size()) as usize;
+            // Padding to block size
+            entry_end = Self::TAR_BLOCK_SIZE * entry_end.div_ceil(Self::TAR_BLOCK_SIZE);
+            if entry_end <= self.current_decoded.len() {
+                // Entry ends within decoded input, we can consume it
+                completed_entry_end = entry_end;
+            }
+            if entry_end + Self::TAR_BLOCK_SIZE > self.current_decoded.len() {
+                // Next entry's header spans beyond input - can't decode it,
+                // so terminate at last completed entry and keep remaining input after it
                 break;
             }
         }
-        open_entry_left = open_entry_len;
+        // Either we run out of entries or last entry crosses input
+        let completed_entry = self.current_decoded.split_to(completed_entry_end);
+        if completed_entry.is_empty() && entry_end == completed_entry_end {
+            // Archive ended, clear any tar footer from remaining input
+            assert!(
+                self.current_decoded.len() <= 1024,
+                "Footer should be at most 1024 len"
+            );
+            self.current_decoded.clear();
+        }
+        self.num_started_entry_bytes = entry_end - completed_entry_end;
+        completed_entry
     }
+
+    fn has_started_entry(&self) -> bool {
+        self.num_started_entry_bytes > 0
+    }
+
+    fn take_started_entry_bytes(&mut self) -> Bytes {
+        let num_bytes = self.num_started_entry_bytes.min(self.current_decoded.len());
+        self.num_started_entry_bytes -= num_bytes;
+        self.current_decoded.split_to(num_bytes)
+    }
+
+    /// Re-fill decoded buffer such that it has minimum bytes to decode TAR header.
+    ///
+    /// Return `false` on EOF
+    fn refill_decoded_buf(&mut self) -> IoResult<bool> {
+        if self.current_decoded.len() < Self::TAR_BLOCK_SIZE {
+            let mut next_buffer = self.get_next_buffer();
+            if !self.current_decoded.is_empty() {
+                next_buffer.extend_from_slice(&self.current_decoded);
+            }
+            self.current_decoded = self.decode_bytes(next_buffer)?;
+        }
+        Ok(!self.current_decoded.is_empty())
+    }
+
+    /// Acquire memory buffer for decoding input reusing already consumed chunks.
+    fn get_next_buffer(&mut self) -> BytesMut {
+        if self.mempool.front().is_some_and(Bytes::is_unique) {
+            let mut reclaimed: BytesMut = self.mempool.pop_front().unwrap().into();
+            reclaimed.clear();
+            reclaimed
+        } else {
+            BytesMut::with_capacity(Self::DECODE_BUF_SIZE)
+        }
+    }
+
+    /// Fill `decode_buf` with data from `input`.
+    fn decode_bytes(&mut self, mut decode_buf: BytesMut) -> IoResult<Bytes> {
+        let mut_slice = unsafe {
+            std::slice::from_raw_parts_mut(decode_buf.as_mut_ptr(), decode_buf.capacity())
+        };
+        let mut current_len = decode_buf.len();
+        while current_len < decode_buf.capacity() {
+            let new_bytes = self.input.read(&mut mut_slice[current_len..])?;
+            if new_bytes == 0 {
+                break;
+            }
+            current_len = current_len + new_bytes;
+            unsafe { decode_buf.set_len(current_len) };
+        }
+        let bytes: Bytes = decode_buf.into();
+        self.mempool.push_back(bytes.clone());
+        Ok(bytes)
+    }
+}
+
+impl ArchiveChunker<Box<dyn Read>> {
+    pub fn from_path(archive_path: &Path, archive_format: ArchiveFormat) -> IoResult<Self> {
+        let file = fs::File::open(archive_path).map_err(|err| {
+            IoError::other(format!(
+                "failed to open snapshot archive '{}': {err}",
+                archive_path.display(),
+            ))
+        })?;
+        // Use buffered reader for decoders that do not buffer internally.
+        let buf_file = BufReader::with_capacity(Self::INPUT_READER_BUF_SIZE, file);
+        Ok(match archive_format {
+            ArchiveFormat::TarBzip2 => Self::new(Box::new(BzDecoder::new(buf_file))),
+            ArchiveFormat::TarGzip => Self::new(Box::new(GzDecoder::new(buf_file.into_inner()))),
+            ArchiveFormat::TarZstd { .. } => Self::new(Box::new(
+                zstd::stream::read::Decoder::with_buffer(buf_file)?,
+            )),
+            ArchiveFormat::TarLz4 => {
+                Self::new(Box::new(lz4::Decoder::new(buf_file.into_inner()).unwrap()))
+            }
+            ArchiveFormat::Tar => Self::new(Box::new(buf_file)),
+        })
+    }
+}
+
+fn spawn_archive_chunker_thread(
+    archive_path: impl AsRef<Path>,
+    archive_format: ArchiveFormat,
+    chunk_sender: Sender<MultiBytes>,
+) -> JoinHandle<()> {
+    let archive_path = archive_path.as_ref().to_path_buf();
+    Builder::new()
+        .name(format!("solTarDecompress"))
+        .spawn(move || {
+            let chunker = ArchiveChunker::from_path(&archive_path, archive_format).unwrap();
+            chunker.decode_and_send_chunks(chunk_sender).unwrap()
+        })
+        .unwrap()
 }
 
 /// BankSnapshotInfo::new_from_dir() requires a few meta files to accept a snapshot dir
@@ -2377,26 +2443,23 @@ pub fn purge_old_snapshot_archives(
 
 #[cfg(feature = "dev-context-only-utils")]
 fn unpack_snapshot_local(
-    shared_buffer: SharedBuffer,
+    snapshot_path: impl AsRef<Path>,
+    archive_format: ArchiveFormat,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
     parallel_divisions: usize,
 ) -> Result<UnpackedAppendVecMap> {
     assert!(parallel_divisions > 0);
 
-    // allocate all readers before any readers start reading
-    let readers = (0..parallel_divisions)
-        .map(|_| SharedBufferReader::new(&shared_buffer))
-        .collect::<Vec<_>>();
+    let (chunk_sender, chunk_recv) = crossbeam_channel::bounded(parallel_divisions);
+    let handle = spawn_archive_chunker_thread(snapshot_path, archive_format, chunk_sender);
 
     // create 'parallel_divisions' # of parallel workers, each responsible for 1/parallel_divisions of all the files to extract.
-    let all_unpacked_append_vec_map = readers
+    let all_unpacked_append_vec_map = (0..parallel_divisions)
         .into_par_iter()
-        .map(|reader| {
-            let mut archive = Archive::new(reader);
-            hardened_unpack::unpack_snapshot(&mut archive, ledger_dir, account_paths)
-        })
+        .map(|_| hardened_unpack::unpack_snapshot(chunk_recv.clone(), ledger_dir, account_paths))
         .collect::<Vec<_>>();
+    handle.join().unwrap();
 
     let mut unpacked_append_vec_map = UnpackedAppendVecMap::new();
     for h in all_unpacked_append_vec_map {
@@ -2404,44 +2467,6 @@ fn unpack_snapshot_local(
     }
 
     Ok(unpacked_append_vec_map)
-}
-
-fn untar_snapshot_create_shared_buffer(
-    snapshot_tar: &Path,
-    archive_format: ArchiveFormat,
-) -> SharedBuffer {
-    let open_file = || {
-        fs::File::open(snapshot_tar)
-            .map_err(|err| {
-                IoError::other(format!(
-                    "failed to open snapshot archive '{}': {err}",
-                    snapshot_tar.display(),
-                ))
-            })
-            .unwrap()
-    };
-    // Apply buffered reader for decoders that do not buffer internally.
-    match archive_format {
-        ArchiveFormat::TarBzip2 => SharedBuffer::new(BzDecoder::new(BufReader::new(open_file()))),
-        ArchiveFormat::TarGzip => SharedBuffer::new(GzDecoder::new(open_file())),
-        ArchiveFormat::TarZstd { .. } => {
-            SharedBuffer::new(zstd::stream::read::Decoder::new(open_file()).unwrap())
-        }
-        ArchiveFormat::TarLz4 => SharedBuffer::new(lz4::Decoder::new(open_file()).unwrap()),
-        ArchiveFormat::Tar => SharedBuffer::new(BufReader::new(open_file())),
-    }
-}
-
-#[cfg(feature = "dev-context-only-utils")]
-fn untar_snapshot_in(
-    snapshot_tar: impl AsRef<Path>,
-    unpack_dir: &Path,
-    account_paths: &[PathBuf],
-    archive_format: ArchiveFormat,
-    parallel_divisions: usize,
-) -> Result<UnpackedAppendVecMap> {
-    let shared_buffer = untar_snapshot_create_shared_buffer(snapshot_tar.as_ref(), archive_format);
-    unpack_snapshot_local(shared_buffer, unpack_dir, account_paths, parallel_divisions)
 }
 
 pub fn verify_unpacked_snapshots_dir_and_version(
@@ -2506,11 +2531,11 @@ pub fn verify_snapshot_archive(
     let temp_dir = tempfile::TempDir::new().unwrap();
     let unpack_dir = temp_dir.path();
     let unpack_account_dir = create_accounts_run_and_snapshot_dirs(unpack_dir).unwrap().0;
-    untar_snapshot_in(
+    unpack_snapshot_local(
         snapshot_archive,
+        archive_format,
         unpack_dir,
         &[unpack_account_dir.clone()],
-        archive_format,
         1,
     )
     .unwrap();

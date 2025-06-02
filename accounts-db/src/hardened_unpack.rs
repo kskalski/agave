@@ -130,7 +130,7 @@ pub enum UnpackPath<'a> {
 }
 
 fn unpack_archive<'a, A, C, D>(
-    archive: &mut Archive<A>,
+    mut archive: Archive<A>,
     apparent_limit_size: u64,
     actual_limit_size: u64,
     limit_count: u64,
@@ -345,23 +345,26 @@ impl ParallelSelector {
 }
 
 /// Unpacks snapshot and collects AppendVec file names & paths
-pub fn unpack_snapshot<A: Read>(
-    archive: &mut Archive<A>,
+pub fn unpack_snapshot(
+    chunk_recv: crossbeam_channel::Receiver<MultiBytes>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
 ) -> Result<UnpackedAppendVecMap> {
     let mut unpacked_append_vec_map = UnpackedAppendVecMap::new();
 
-    unpack_snapshot_with_processors(
-        archive,
-        ledger_dir,
-        account_paths,
-        |file, path| {
-            unpacked_append_vec_map.insert(file.to_string(), path.join("accounts").join(file));
-        },
-        |_| {},
-    )
-    .map(|_| unpacked_append_vec_map)
+    while let Ok(archive_chunk) = chunk_recv.recv() {
+        let archive = Archive::new(archive_chunk);
+        unpack_snapshot_with_processors(
+            archive,
+            ledger_dir,
+            account_paths,
+            |file, path| {
+                unpacked_append_vec_map.insert(file.to_string(), path.join("accounts").join(file));
+            },
+            |_| {},
+        )?;
+    }
+    Ok(unpacked_append_vec_map)
 }
 
 /// Unpacks snapshots from chunked archives received through `chunk_recv` and
@@ -374,9 +377,9 @@ pub fn streaming_unpack_snapshot(
 ) -> Result<()> {
     let mut total_entities = 0;
     while let Ok(archive_chunk) = chunk_recv.recv() {
-        let mut archive = Archive::new(archive_chunk);
+        let archive = Archive::new(archive_chunk);
         total_entities += unpack_snapshot_with_processors(
-            &mut archive,
+            archive,
             ledger_dir,
             account_paths,
             |_, _| {},
@@ -398,7 +401,7 @@ pub fn streaming_unpack_snapshot(
 }
 
 fn unpack_snapshot_with_processors<A, F, G>(
-    archive: &mut Archive<A>,
+    archive: Archive<A>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
     mut accounts_path_processor: F,
@@ -533,12 +536,8 @@ pub fn unpack_genesis_archive(
     fs::create_dir_all(destination_dir)?;
     let tar_bz2 = File::open(archive_filename)?;
     let tar = BzDecoder::new(BufReader::new(tar_bz2));
-    let mut archive = Archive::new(tar);
-    unpack_genesis(
-        &mut archive,
-        destination_dir,
-        max_genesis_archive_unpacked_size,
-    )?;
+    let archive = Archive::new(tar);
+    unpack_genesis(archive, destination_dir, max_genesis_archive_unpacked_size)?;
     info!(
         "Extracted {:?} in {:?}",
         archive_filename,
@@ -548,7 +547,7 @@ pub fn unpack_genesis_archive(
 }
 
 fn unpack_genesis<A: Read>(
-    archive: &mut Archive<A>,
+    archive: Archive<A>,
     unpack_dir: &Path,
     max_genesis_archive_unpacked_size: u64,
 ) -> Result<()> {
@@ -816,26 +815,25 @@ mod tests {
         );
     }
 
-    fn with_finalize_and_unpack<C>(archive: tar::Builder<Vec<u8>>, checker: C) -> Result<()>
+    fn with_finalize_and_unpack<C, R>(archive: tar::Builder<Vec<u8>>, checker: C) -> Result<R>
     where
-        C: Fn(&mut Archive<BufReader<&[u8]>>, &Path) -> Result<()>,
+        C: Fn(Archive<BufReader<&[u8]>>, &Path) -> Result<R>,
     {
         let data = archive.into_inner().unwrap();
         let reader = BufReader::new(&data[..]);
-        let mut archive: Archive<std::io::BufReader<&[u8]>> = Archive::new(reader);
+        let archive: Archive<std::io::BufReader<&[u8]>> = Archive::new(reader);
         let temp_dir = tempfile::TempDir::new().unwrap();
 
-        checker(&mut archive, temp_dir.path())?;
+        let check_value = checker(archive, temp_dir.path())?;
         // Check that there is no bad permissions preventing deletion.
         let result = temp_dir.close();
         assert_matches!(result, Ok(()));
-        Ok(())
+        Ok(check_value)
     }
 
     fn finalize_and_unpack_snapshot(archive: tar::Builder<Vec<u8>>) -> Result<()> {
         with_finalize_and_unpack(archive, |a, b| {
-            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {});
-            Ok(())
+            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {}).map(|_| ())
         })
     }
 
@@ -977,7 +975,7 @@ mod tests {
 
         let mut archive = Builder::new(Vec::new());
         archive.append(&header, data).unwrap();
-        with_finalize_and_unpack(archive, |unpacking_archive, path| {
+        with_finalize_and_unpack(archive, |mut unpacking_archive, path| {
             for entry in unpacking_archive.entries()? {
                 if !entry?.unpack_in(path)? {
                     return Err(UnpackError::Archive("failed!".to_string()));
