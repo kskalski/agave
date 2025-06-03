@@ -332,7 +332,8 @@ impl<'a> RingOp<SequentialFileReaderState<'a>> for ReadOp<'a> {
     }
 
     fn complete(
-        self,
+        &mut self,
+        _entry: &io_uring::cqueue::Entry,
         res: io::Result<i32>,
         ring: &mut RingCtx<SequentialFileReaderState<'a>, Self>,
     ) -> io::Result<()> {
@@ -353,30 +354,30 @@ impl<'a> RingOp<SequentialFileReaderState<'a>> for ReadOp<'a> {
             reader_state.eof = true;
         }
 
-        let total_read_len = buf_off + last_read_len;
+        let total_read_len = *buf_off + last_read_len;
 
-        if last_read_len < read_len && !reader_state.eof {
+        if last_read_len < *read_len && !reader_state.eof {
             println!(
-                "SHORT READ {reader_buf_index} {} last {last_read_len} total {total_read_len} expected {read_len}",
-                reader_state.current_buf
+                "SHORT READ {} {} last {last_read_len} total {total_read_len} expected {}",
+                *reader_buf_index, reader_state.current_buf, read_len
             );
             let op = ReadOp {
-                fd,
+                fd: *fd,
                 buf,
                 buf_off: total_read_len,
-                io_buf_index,
-                file_off: file_off + last_read_len,
-                read_len: read_len - last_read_len,
-                reader_buf_index,
+                io_buf_index: *io_buf_index,
+                file_off: *file_off + last_read_len,
+                read_len: *read_len - last_read_len,
+                reader_buf_index: *reader_buf_index,
             };
             // Safety:
             // The op points to a buffer which is guaranteed to be valid for the
             // lifetime of the operation ('a)
             unsafe { ring.push(op).expect("pushing ReadOp failed") };
         } else {
-            reader_state.buffers[reader_buf_index] = ReadBufState::Full {
+            reader_state.buffers[*reader_buf_index] = ReadBufState::Full {
                 cursor: Cursor::new(&mut buf[..total_read_len]),
-                io_buf_index,
+                io_buf_index: *io_buf_index,
             };
         }
 

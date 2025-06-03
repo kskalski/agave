@@ -1,6 +1,6 @@
 use {
     io_uring::{
-        squeue,
+        cqueue, squeue,
         types::{SubmitArgs, Timespec},
         CompletionQueue, IoUring, SubmissionQueue, Submitter,
     },
@@ -11,7 +11,7 @@ use {
 /// An io_uring instance.
 pub struct Ring<T, E: RingOp<T>> {
     ring: IoUring,
-    entries: Slab<E>,
+    entries: Slab<Option<E>>,
     ctx: T,
 }
 
@@ -22,7 +22,7 @@ impl<T, E: RingOp<T>> Ring<T, E> {
     /// complete.
     pub fn new(ring: IoUring, ctx: T) -> Self {
         Self {
-            entries: Slab::with_capacity(ring.params().cq_entries() as usize),
+            entries: Slab::with_capacity(ring.params().cq_entries() as usize * 2),
             ring,
             ctx,
         }
@@ -57,9 +57,9 @@ impl<T, E: RingOp<T>> Ring<T, E> {
     /// operation.
     ///
     /// See also [Ring::submit].
-    pub unsafe fn push(&mut self, mut op: E) -> io::Result<()> {
-        let entry = op.entry();
-        let key = self.entries.insert(op);
+    pub unsafe fn push(&mut self, op: E) -> io::Result<()> {
+        let key = self.entries.insert(Some(op));
+        let entry = self.entries[key].as_mut().unwrap().entry();
         let entry = entry.user_data(key as u64);
         while self.ring.submission().push(&entry).is_err() {
             self.submit()?;
@@ -170,7 +170,12 @@ impl<T, E: RingOp<T>> Ring<T, E> {
 /// Trait for operations that can be submitted to a [Ring].
 pub trait RingOp<T> {
     fn entry(&mut self) -> squeue::Entry;
-    fn complete(self, res: io::Result<i32>, sub_queue: &mut RingCtx<T, Self>) -> io::Result<()>
+    fn complete(
+        &mut self,
+        entry: &cqueue::Entry,
+        res: io::Result<i32>,
+        sub_queue: &mut RingCtx<T, Self>,
+    ) -> io::Result<()>
     where
         Self: Sized;
     fn result(&self, res: i32) -> io::Result<i32> {
@@ -187,7 +192,7 @@ pub struct RingCtx<'a, 'b, T, E: RingOp<T>> {
     submission: SubmissionQueue<'a>,
     completion: CompletionQueue<'a>,
     submitter: Submitter<'a>,
-    entries: &'b mut Slab<E>,
+    entries: &'b mut Slab<Option<E>>,
     ctx: &'b mut T,
 }
 
@@ -210,7 +215,7 @@ impl<'a, 'b, T, E: RingOp<T>> RingCtx<'a, 'b, T, E> {
     /// See also [Ring::push].
     pub unsafe fn push(&mut self, mut op: E) -> io::Result<()> {
         let entry = op.entry();
-        let key = self.entries.insert(op);
+        let key = self.entries.insert(Some(op));
         let entry = entry.user_data(key as u64);
         while self.submission.push(&entry).is_err() {
             self.submit()?;
@@ -250,10 +255,16 @@ impl<'a, 'b, T, E: RingOp<T>> RingCtx<'a, 'b, T, E> {
             let Some(cqe) = self.completion.next() else {
                 break;
             };
-            let completed_key = cqe.user_data();
-            let entry = self.entries.remove(completed_key as usize);
+            let completed_key = cqe.user_data() as usize;
+            let mut entry = self.entries[completed_key as usize].take().unwrap();
             let result = entry.result(cqe.result());
-            entry.complete(result, self)?;
+            let res = entry.complete(&cqe, result, self);
+            if !cqueue::more(cqe.flags()) {
+                self.entries.remove(completed_key as usize);
+            } else {
+                self.entries[completed_key as usize] = Some(entry);
+            }
+            res?
         }
 
         Ok(())
