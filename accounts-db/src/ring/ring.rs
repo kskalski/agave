@@ -250,7 +250,6 @@ impl<'a, 'b, T, E: RingOp<T>> RingCtx<'a, 'b, T, E> {
             let Some(cqe) = self.completion.next() else {
                 break;
             };
-            println!("completion {:?}", cqe);
             let completed_key = cqe.user_data();
             let entry = self.entries.remove(completed_key as usize);
             let result = entry.result(cqe.result());

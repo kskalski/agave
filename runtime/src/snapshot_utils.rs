@@ -1699,7 +1699,7 @@ struct ArchiveChunker<R> {
 impl<R: Read> ArchiveChunker<R> {
     const TAR_BLOCK_SIZE: usize = size_of::<tar::Header>();
     const INPUT_READER_BUF_SIZE: usize = 128 * 1024 * 1024;
-    const SEQ_READ_SIZE: usize = Self::INPUT_READER_BUF_SIZE / 8;
+    const SEQ_READ_SIZE: usize = Self::INPUT_READER_BUF_SIZE / 128;
     const DECODE_BUF_SIZE: usize = 64 * 1024 * 1024;
 
     pub fn new(input: R) -> Self {
@@ -1761,11 +1761,6 @@ impl<R: Read> ArchiveChunker<R> {
         }
         // Either we run out of entries or last entry crosses input
         let completed_entry = self.current_decoded.split_to(completed_entry_end);
-        info!(
-            "arch {} {}",
-            completed_entry.len(),
-            self.current_decoded.len()
-        );
         if completed_entry.is_empty() && entry_end == completed_entry_end {
             // Archive ended, clear any tar footer from remaining input
             assert!(
@@ -1841,7 +1836,7 @@ impl<'a> ArchiveChunker<Box<dyn Read + 'a>> {
     ) -> IoResult<Self> {
         let file = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECT | libc::O_NOATIME)
+            .custom_flags(/*libc::O_DIRECT |*/ libc::O_NOATIME)
             .open(archive_path)
             .map_err(|err| {
                 IoError::other(format!(

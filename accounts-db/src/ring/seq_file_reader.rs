@@ -102,6 +102,7 @@ impl<'a> SequentialFileReader<'a> {
         for i in 0..reader.ring.ctx().buffers.len() {
             reader.start_reading_buf(i);
         }
+        reader.ring.submit()?;
 
         Ok(reader)
     }
@@ -158,7 +159,6 @@ impl<'a> Read for SequentialFileReader<'a> {
 
 impl<'a> BufRead for SequentialFileReader<'a> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        println!("fill buff");
         let _have_data = loop {
             let state = self.ring.ctx_mut();
             let read_buf = &mut state.buffers[state.current_buf];
@@ -202,9 +202,7 @@ impl<'a> BufRead for SequentialFileReader<'a> {
             }
         };
 
-        println!("check on io");
         loop {
-            // FIXME: submit and wait
             self.ring.process_completions()?;
             let state = self.ring.ctx();
 
@@ -212,10 +210,11 @@ impl<'a> BufRead for SequentialFileReader<'a> {
                 ReadBufState::Full { .. } => break,
                 ReadBufState::Empty { .. } if state.eof => break,
                 // Still no data, wait for more completions.
-                _ => {}
+                _ => {
+                    self.ring.submit_and_wait(1, None)?;
+                }
             }
         }
-        println!("got data");
 
         // At this point we must have data or be at EOF.
         let state = self.ring.ctx_mut();
