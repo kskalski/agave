@@ -166,3 +166,9 @@ impl AsRef<[u8]> for BorrowedBytesMut {
         unsafe { slice::from_raw_parts(self.ptr, self.size) }
     }
 }
+
+impl AsMut<[u8]> for BorrowedBytesMut {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+}

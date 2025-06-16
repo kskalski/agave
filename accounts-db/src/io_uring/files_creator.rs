@@ -1,0 +1,515 @@
+use std::{
+    collections::VecDeque,
+    ffi::CStr,
+    io::{self, Read},
+    mem,
+    os::{fd::RawFd, unix::ffi::OsStrExt as _},
+    path::PathBuf,
+    ptr,
+    time::Duration,
+};
+
+use io_uring::{opcode, squeue, types, IoUring};
+use libc::{O_CREAT, O_NOATIME, O_NOFOLLOW, O_TRUNC, O_WRONLY};
+use slab::Slab;
+
+use agave_io_uring::{Completion, Ring, RingOp};
+
+use crate::io_uring::memory::{BorrowedBytesMut, LargeBuffer};
+
+const DEFAULT_WRITE_SIZE: usize = 1024 * 1024;
+#[allow(dead_code)]
+const DEFAULT_BUFFER_SIZE: usize = 64 * DEFAULT_WRITE_SIZE;
+
+/// Multiple files creator with `io_uring` queue for open -> write -> close
+/// operations.
+pub struct FilesCreator<F: FnMut(PathBuf), B = LargeBuffer> {
+    ring: Ring<FileCreatorState<F>, FileCreatorOp<F>>,
+    #[allow(dead_code)]
+    backing_buffer: B,
+}
+
+struct FileCreatorState<F: FnMut(PathBuf)> {
+    files: Slab<PendingFile>,
+    buffers: VecDeque<WriteBuf>,
+    open_fds: usize,
+    entry_callback: F,
+}
+
+impl<F: FnMut(PathBuf)> FilesCreator<F, LargeBuffer> {
+    /// Create a new `SequentialFileReader` for the given `file` using internally allocated
+    /// large buffer and default read size.
+    ///
+    /// See [SequentialFileReader::with_buffer] for more information.
+    #[allow(dead_code)]
+    pub fn new(wrote_callback: F) -> io::Result<Self> {
+        Self::with_capacity(DEFAULT_BUFFER_SIZE, wrote_callback)
+    }
+
+    /// Create a new `SequentialFileReader` for the given `file` using internally allocated
+    /// buffer of specified `buf_size` and default read size.
+    pub fn with_capacity(buf_size: usize, wrote_callback: F) -> io::Result<Self> {
+        Self::with_buffer(
+            LargeBuffer::new(buf_size),
+            DEFAULT_WRITE_SIZE,
+            wrote_callback,
+        )
+    }
+}
+
+impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
+    pub fn with_buffer(buffer: B, write_capacity: usize, entry_callback: F) -> io::Result<Self> {
+        let ring = IoUring::builder().build(512)?;
+        ring.submitter().register_iowq_max_workers(&mut [4, 0])?;
+        Self::with_buffer_and_ring(ring, buffer, write_capacity, entry_callback)
+    }
+
+    fn with_buffer_and_ring(
+        ring: IoUring,
+        mut backing_buffer: B,
+        write_capacity: usize,
+        entry_callback: F,
+    ) -> io::Result<Self> {
+        let buffer = backing_buffer.as_mut();
+        assert!(buffer.len() % write_capacity == 0);
+
+        // We register fixed buffers in chunks of up to 1GB as this is faster than registering many
+        // `read_capacity` buffers. Registering fixed buffers saves the kernel some work in
+        // checking/mapping/unmapping buffers for each read operation.
+        const FIXED_BUFFER_LEN: usize = 1024 * 1024 * 1024;
+        let iovecs = buffer
+            .chunks(FIXED_BUFFER_LEN)
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_ptr() as _,
+                iov_len: buf.len(),
+            })
+            .collect::<Vec<_>>();
+
+        // Split the buffer into `read_capacity` sized chunks.
+        let buf_start = buffer.as_ptr() as usize;
+        let buffers = buffer
+            .chunks_exact_mut(write_capacity)
+            .map(|buf| {
+                let io_buf_index = (buf.as_ptr() as usize - buf_start) / FIXED_BUFFER_LEN;
+                WriteBuf {
+                    buf: BorrowedBytesMut::from_mut_slice(buf),
+                    io_buf_index,
+                }
+            })
+            .collect::<VecDeque<_>>();
+
+        let ring = Ring::new(
+            ring,
+            FileCreatorState {
+                // FIXME: see how many files we have in a snapshot today and
+                // initialize with that capacity
+                files: Slab::new(),
+                buffers,
+                open_fds: 0,
+                entry_callback,
+            },
+        );
+
+        // Safety:
+        // The iovecs point to a buffer which is guaranteed to be valid for the
+        // lifetime of the reader
+        unsafe { ring.register_buffers(&iovecs)? };
+
+        Ok(Self {
+            ring,
+            backing_buffer,
+        })
+    }
+
+    fn wait_free_buf(&mut self) -> io::Result<WriteBuf> {
+        // let mut i = 0;
+        loop {
+            self.ring.process_completions()?;
+            let buf = self.ring.context_mut().buffers.pop_front();
+            match buf {
+                Some(buf) => return Ok(buf),
+                None => {
+                    //eprintln!("unpacker waiting {i}");
+                    //i += 1;
+                    self.ring
+                        .submit_and_wait(1, Some(Duration::from_millis(10)))?;
+                }
+            }
+        }
+    }
+
+    pub fn drain(mut self) -> io::Result<()> {
+        self.ring.drain()
+    }
+
+    pub fn wrote_callback(&mut self) -> &mut F {
+        &mut self.ring.context_mut().entry_callback
+    }
+}
+
+impl<F: FnMut(PathBuf)> FilesCreator<F> {
+    pub fn open(&mut self, path: PathBuf, mode: u32) -> io::Result<usize> {
+        while self.ring.context().files.len() >= 1000 {
+            eprintln!("too many open files");
+            self.ring.process_completions()?;
+            self.ring
+                .submit_and_wait(1, Some(Duration::from_millis(10)))?;
+        }
+
+        // FIXME: pre-open accounts/, change accounts/bla to bla so we don't
+        // keep re-walking the path and locking etc
+
+        let mut path_bytes = Vec::with_capacity(4096);
+        let buf_ptr = path_bytes.as_mut_ptr() as *mut u8;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() <= path_bytes.capacity() - 1);
+        // Safety:
+        // We know that the buffer is large enough to hold the copy and the
+        // pointers don't overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, bytes.len());
+            buf_ptr.add(bytes.len()).write(0);
+            path_bytes.set_len(bytes.len() + 1);
+        }
+
+        let file = PendingFile {
+            path,
+            fd: None,
+            backlog: Vec::new(),
+            writes_started: 0,
+            writes_completed: 0,
+            eof: false,
+        };
+        let file_key = self.ring.context_mut().files.insert(file);
+
+        let op = FileCreatorOp::Open(OpenOp {
+            path: path_bytes,
+            mode,
+            file_key,
+            _f: std::marker::PhantomData,
+        });
+        self.ring.push(op)?;
+
+        Ok(file_key)
+    }
+
+    pub fn write_and_close(
+        &mut self,
+        src: &mut dyn Read,
+        file_key: usize,
+        size: u64,
+    ) -> io::Result<u64> {
+        let mut offset = 0;
+        let mut remaining = size as usize;
+        while remaining > 0 {
+            // eprintln!("waiting buf");
+            let buf = self.wait_free_buf()?;
+            // eprintln!("have buf");
+            let state = self.ring.context_mut();
+            let file = &mut state.files[file_key];
+
+            let read_len = remaining.min(buf.buf.len());
+            let len = src.read(buf.buf.sub_buf_to(read_len).as_mut())?;
+            remaining -= len;
+            if len == 0 || remaining == 0 {
+                file.eof = true;
+
+                if len == 0 {
+                    state.buffers.push_front(buf);
+                    if file.complete() {
+                        let path = mem::replace(&mut file.path, PathBuf::new());
+                        (state.entry_callback)(path);
+                        let fd = file.fd.take().unwrap();
+                        self.ring
+                            .push(FileCreatorOp::Close(CloseOp::new(fd, file_key)))?;
+                    }
+                    break;
+                }
+            }
+
+            file.writes_started += 1;
+            if let Some(fd) = &file.fd {
+                let op = WriteOp {
+                    file_key,
+                    fd: *fd,
+                    offset,
+                    buf,
+                    write_len: len,
+                    _f: std::marker::PhantomData,
+                };
+
+                self.ring.push(FileCreatorOp::Write(op))?;
+            } else {
+                file.backlog.push((buf, offset, len));
+            }
+
+            offset += len;
+        }
+
+        Ok(size - remaining as u64)
+    }
+}
+
+struct OpenOp<F> {
+    // FIXME: pin this
+    path: Vec<u8>,
+    mode: libc::mode_t,
+    file_key: usize,
+    _f: std::marker::PhantomData<F>,
+}
+
+impl<F> std::fmt::Debug for OpenOp<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOp")
+            .field("path", &unsafe { CStr::from_ptr(self.path.as_ptr() as _) })
+            .field("file_key", &self.file_key)
+            .finish()
+    }
+}
+
+impl<F: FnMut(PathBuf)> OpenOp<F> {
+    fn entry(&mut self) -> squeue::Entry {
+        opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), self.path.as_ptr() as _)
+            .flags(O_CREAT | O_TRUNC | O_NOFOLLOW | O_WRONLY | O_NOATIME)
+            .mode(self.mode)
+            .build()
+    }
+
+    fn complete(
+        &mut self,
+        ring: &mut Completion<FileCreatorState<F>, FileCreatorOp<F>>,
+        res: io::Result<i32>,
+    ) -> io::Result<()>
+    where
+        Self: Sized,
+    {
+        let fd = match res {
+            Ok(fd) => fd,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Safety:
+                // Self::path is guaranteed to be valid while it's referenced by pointer by the
+                // corresponding squeue::Entry.
+                eprintln!(
+                    "retrying {}",
+                    CStr::from_bytes_until_nul(&self.path)
+                        .unwrap()
+                        .to_string_lossy()
+                );
+                //ring.push(CreatorOp::Open(self));
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        let state = ring.context_mut();
+        let file = &mut state.files[self.file_key];
+        // Safety: the fd is valid, having just been returned by the ring
+        file.fd = Some(fd);
+        state.open_fds += 1;
+
+        let fd = file.fd.clone();
+        let mut backlog = mem::replace(&mut file.backlog, Vec::new());
+        for (buf, offset, len) in backlog.drain(..) {
+            let op = WriteOp {
+                file_key: self.file_key,
+                fd: fd.clone().unwrap(),
+                offset,
+                buf,
+                write_len: len,
+                _f: std::marker::PhantomData,
+            };
+            ring.push(FileCreatorOp::Write(op));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CloseOp<F> {
+    fd: Option<RawFd>,
+    file_key: usize,
+    _f: std::marker::PhantomData<F>,
+}
+
+impl<F: FnMut(PathBuf)> CloseOp<F> {
+    fn new(fd: RawFd, file_key: usize) -> Self {
+        Self {
+            fd: Some(fd),
+            file_key,
+            _f: std::marker::PhantomData,
+        }
+    }
+
+    fn entry(&mut self) -> squeue::Entry {
+        opcode::Close::new(types::Fd(self.fd.take().unwrap())).build()
+    }
+
+    fn complete(
+        &mut self,
+        ring: &mut Completion<FileCreatorState<F>, FileCreatorOp<F>>,
+        res: io::Result<i32>,
+    ) -> io::Result<()>
+    where
+        Self: Sized,
+    {
+        let _ = res?;
+
+        let state = ring.context_mut();
+        let _ = state.files.remove(self.file_key);
+        state.open_fds -= 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct WriteOp<F> {
+    file_key: usize,
+    fd: RawFd,
+    offset: usize,
+    buf: WriteBuf,
+    write_len: usize,
+    _f: std::marker::PhantomData<F>,
+}
+
+impl<F: FnMut(PathBuf)> WriteOp<F> {
+    fn entry(&mut self) -> squeue::Entry {
+        let WriteOp {
+            file_key: _,
+            fd,
+            offset,
+            buf,
+            write_len,
+            _f: _,
+        } = self;
+
+        opcode::WriteFixed::new(
+            types::Fd(*fd),
+            buf.buf.as_mut_ptr(),
+            *write_len as u32,
+            buf.io_buf_index as u16,
+        )
+        .offset(*offset as u64)
+        .ioprio(2 << 13)
+        .build()
+        .flags(squeue::Flags::ASYNC)
+    }
+
+    fn complete(
+        &mut self,
+        ring: &mut Completion<FileCreatorState<F>, FileCreatorOp<F>>,
+        res: io::Result<i32>,
+    ) -> io::Result<()>
+    where
+        Self: Sized,
+    {
+        let written = res? as usize;
+
+        let WriteOp {
+            file_key,
+            fd,
+            offset: _,
+            ref mut buf,
+            write_len,
+            _f: _,
+        } = self;
+        let buf = std::mem::replace(buf, WriteBuf::empty());
+
+        assert_eq!(written, *write_len, "short write");
+
+        let state = ring.context_mut();
+        state.buffers.push_front(buf);
+
+        let file = &mut state.files[*file_key];
+        file.writes_completed += 1;
+        if file.complete() {
+            let path = mem::replace(&mut file.path, PathBuf::new());
+            (state.entry_callback)(path);
+            ring.push(FileCreatorOp::Close(CloseOp::new(*fd, *file_key)));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum FileCreatorOp<F> {
+    Open(OpenOp<F>),
+    Close(CloseOp<F>),
+    Write(WriteOp<F>),
+}
+
+impl<F: FnMut(PathBuf)> RingOp<FileCreatorState<F>> for FileCreatorOp<F> {
+    fn entry(&mut self) -> squeue::Entry {
+        match self {
+            Self::Open(op) => op.entry(),
+            Self::Close(op) => op.entry(),
+            Self::Write(op) => op.entry(),
+        }
+    }
+
+    fn complete(
+        &mut self,
+        ring: &mut Completion<FileCreatorState<F>, Self>,
+        res: io::Result<i32>,
+    ) -> io::Result<()>
+    where
+        Self: Sized,
+    {
+        match self {
+            Self::Open(op) => op.complete(ring, res),
+            Self::Close(op) => op.complete(ring, res),
+            Self::Write(op) => op.complete(ring, res),
+        }
+    }
+}
+
+struct PendingFile {
+    path: PathBuf,
+    fd: Option<RawFd>,
+    // FIXME: make this a smallvec
+    backlog: Vec<(WriteBuf, usize, usize)>,
+    eof: bool,
+    writes_started: usize,
+    writes_completed: usize,
+}
+
+impl PendingFile {
+    fn complete(&self) -> bool {
+        self.eof && self.writes_started == self.writes_completed
+    }
+}
+
+impl std::fmt::Debug for PendingFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingFile")
+            .field("fd", &self.fd)
+            .field("complete", &self.eof)
+            .field("writes_started", &self.writes_started)
+            .field("writes_completed", &self.writes_completed)
+            .field("backlog", &self.backlog)
+            .finish()
+    }
+}
+
+struct WriteBuf {
+    buf: BorrowedBytesMut,
+    io_buf_index: usize,
+}
+
+impl WriteBuf {
+    fn empty() -> Self {
+        Self {
+            buf: BorrowedBytesMut::empty(),
+            io_buf_index: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for WriteBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteBuf")
+            .field("io_buf_index", &self.io_buf_index)
+            .finish()
+    }
+}

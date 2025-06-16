@@ -1,5 +1,5 @@
 use {
-    bzip2::bufread::BzDecoder,
+    crate::io_uring::files_creator::FilesCreator,
     log::*,
     rand::{thread_rng, Rng},
     solana_genesis_config::{GenesisConfig, DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE},
@@ -7,7 +7,7 @@ use {
     std::{
         collections::{HashMap, VecDeque},
         fs::{self, File},
-        io::{BufReader, Read, Result as IoResult},
+        io::{Read, Result as IoResult},
         path::{
             Component::{self, CurDir, Normal},
             Path, PathBuf,
@@ -312,12 +312,12 @@ fn unpack_archive<'a, A, C, D>(
     actual_limit_size: u64,
     limit_count: u64,
     mut entry_checker: C, // checks if entry is valid
-    entry_processor: D,   // processes entry after setting permissions
+    mut file_creator: FilesCreator<D>,
 ) -> Result<()>
 where
     A: Read,
     C: FnMut(&[&str], tar::EntryType) -> UnpackPath<'a>,
-    D: Fn(PathBuf),
+    D: FnMut(PathBuf),
 {
     let mut apparent_total_size: u64 = 0;
     let mut actual_total_size: u64 = 0;
@@ -327,7 +327,7 @@ where
     let mut sanitized_paths_cache = Vec::new();
 
     for entry in archive.entries()? {
-        let mut entry = entry?;
+        let entry = entry?;
         let path = entry.path()?;
         let path_str = path.display().to_string();
 
@@ -398,24 +398,51 @@ where
             continue; // skip it
         };
 
-        let unpack = entry.unpack(&entry_path);
-        check_unpack_result(unpack.map(|_unpack| true)?, path_str)?;
-
-        // Sanitize permissions.
-        let mode = match entry.header().entry_type() {
-            GNUSparse | Regular => 0o644,
-            _ => 0o755,
-        };
-        set_perms(&entry_path, mode)?;
-
-        // Process entry after setting permissions
-        entry_processor(entry_path);
+        let unpack = unpack_entry(&mut file_creator, entry, entry_path);
+        check_unpack_result(unpack.map(|_unpack| true)?, path_str).unwrap();
 
         total_entries += 1;
     }
+    file_creator.drain()?;
+
     info!("unpacked {} entries total", total_entries);
 
     return Ok(());
+}
+
+fn unpack_entry<F: FnMut(PathBuf), R: Read>(
+    file_creator: &mut FilesCreator<F>,
+    mut entry: tar::Entry<'_, R>,
+    dst: PathBuf,
+) -> Result<tar::Unpacked> {
+    let mode = match entry.header().entry_type() {
+        GNUSparse | Regular => 0o644,
+        _ => 0o755,
+    };
+    match entry.header().entry_type() {
+        tar::EntryType::Directory
+        | tar::EntryType::Link
+        | tar::EntryType::Symlink
+        | tar::EntryType::GNULongName
+        | tar::EntryType::GNULongLink => {
+            let unpacked = entry.unpack(&dst)?;
+            // Sanitize permissions.
+            set_perms(&dst, mode)?;
+
+            // Process entry after setting permissions
+            file_creator.wrote_callback()(dst);
+
+            return Ok(unpacked);
+        }
+        _ => (),
+    }
+
+    let file_key = file_creator.open(dst, mode)?;
+
+    let entry_size = entry.size();
+    file_creator.write_and_close(&mut entry, file_key, entry_size)?;
+
+    return Ok(tar::Unpacked::__Nonexhaustive);
 
     #[cfg(unix)]
     fn set_perms(dst: &Path, mode: u32) -> IoResult<()> {
@@ -535,7 +562,7 @@ pub fn unpack_snapshot<A: Read>(
         |file, path| {
             unpacked_append_vec_map.insert(file.to_string(), path.join("accounts").join(file));
         },
-        |_| {},
+        FilesCreator::new(|_| {})?,
     )
     .map(|_| unpacked_append_vec_map)
 }
@@ -548,23 +575,19 @@ pub fn streaming_unpack_snapshot<A: Read>(
     account_paths: &[PathBuf],
     sender: &crossbeam_channel::Sender<PathBuf>,
 ) -> Result<()> {
-    unpack_snapshot_with_processors(
-        archive,
-        ledger_dir,
-        account_paths,
-        |_, _| {},
-        |entry_path_buf| {
-            if entry_path_buf.is_file() {
-                let result = sender.send(entry_path_buf);
-                if let Err(err) = result {
-                    panic!(
-                        "failed to send path '{}' from unpacker to rebuilder: {err}",
-                        err.0.display(),
-                    );
-                }
+    let file_creator = FilesCreator::new(|entry_path_buf| {
+        if entry_path_buf.is_file() {
+            let result = sender.send(entry_path_buf);
+            if let Err(err) = result {
+                panic!(
+                    "failed to send path '{}' from unpacker to rebuilder: {err}",
+                    err.0.display(),
+                );
             }
-        },
-    )
+        }
+    })?;
+
+    unpack_snapshot_with_processors(archive, ledger_dir, account_paths, |_, _| {}, file_creator)
 }
 
 fn unpack_snapshot_with_processors<A, F, G>(
@@ -572,12 +595,12 @@ fn unpack_snapshot_with_processors<A, F, G>(
     ledger_dir: &Path,
     account_paths: &[PathBuf],
     mut accounts_path_processor: F,
-    entry_processor: G,
+    file_creator: FilesCreator<G>,
 ) -> Result<()>
 where
     A: Read,
     F: FnMut(&str, &Path),
-    G: Fn(PathBuf),
+    G: FnMut(PathBuf),
 {
     assert!(!account_paths.is_empty());
 
@@ -608,7 +631,7 @@ where
                 UnpackPath::Invalid
             }
         },
-        entry_processor,
+        file_creator,
     )
 }
 
@@ -702,7 +725,7 @@ pub fn unpack_genesis_archive(
 
     fs::create_dir_all(destination_dir)?;
     let tar_bz2 = File::open(archive_filename)?;
-    let tar = BzDecoder::new(BufReader::new(tar_bz2));
+    let tar = bzip2::read::BzDecoder::new(tar_bz2);
     let archive = Archive::new(tar);
     unpack_genesis(archive, destination_dir, max_genesis_archive_unpacked_size)?;
     info!(
@@ -724,7 +747,7 @@ fn unpack_genesis<A: Read>(
         max_genesis_archive_unpacked_size,
         MAX_GENESIS_ARCHIVE_UNPACKED_COUNT,
         |p, k| is_valid_genesis_archive_entry(unpack_dir, p, k),
-        |_| {},
+        FilesCreator::new(|_| {})?,
     )
 }
 
@@ -753,6 +776,7 @@ mod tests {
     use {
         super::*,
         assert_matches::assert_matches,
+        std::io::BufReader,
         tar::{Builder, Header},
     };
 
@@ -986,7 +1010,7 @@ mod tests {
     {
         let data = archive.into_inner().unwrap();
         let reader = BufReader::new(&data[..]);
-        let archive: Archive<std::io::BufReader<&[u8]>> = Archive::new(reader);
+        let archive: Archive<BufReader<&[u8]>> = Archive::new(reader);
         let temp_dir = tempfile::TempDir::new().unwrap();
 
         checker(archive, temp_dir.path())?;
