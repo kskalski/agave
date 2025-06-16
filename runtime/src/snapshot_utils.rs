@@ -1554,8 +1554,7 @@ pub(crate) fn get_storages_to_serialize(
         .collect::<Vec<_>>()
 }
 
-// From testing, 4 seems to be a sweet spot for ranges of 60M-360M accounts and 16-64 cores. This may need to be tuned later.
-const PARALLEL_UNTAR_READERS_DEFAULT: usize = 4;
+const PARALLEL_UNTAR_WRITERS_DEFAULT: usize = 1;
 
 /// Unarchives the given full and incremental snapshot archives, as long as they are compatible.
 pub fn verify_and_unarchive_snapshots(
@@ -1574,7 +1573,7 @@ pub fn verify_and_unarchive_snapshots(
         incremental_snapshot_archive_info,
     )?;
 
-    let num_worker_threads = (num_cpus::get() / 4).clamp(1, PARALLEL_UNTAR_READERS_DEFAULT);
+    let num_writer_threads = (num_cpus::get() / 4).clamp(1, PARALLEL_UNTAR_WRITERS_DEFAULT);
 
     let next_append_vec_id = Arc::new(AtomicAccountsFileId::new(0));
     let unarchived_full_snapshot = unarchive_snapshot(
@@ -1584,7 +1583,7 @@ pub fn verify_and_unarchive_snapshots(
         "snapshot untar",
         account_paths,
         full_snapshot_archive_info.archive_format(),
-        num_worker_threads,
+        num_writer_threads,
         next_append_vec_id.clone(),
         storage_access,
     )?;
@@ -1598,7 +1597,7 @@ pub fn verify_and_unarchive_snapshots(
                 "incremental snapshot untar",
                 account_paths,
                 incremental_snapshot_archive_info.archive_format(),
-                num_worker_threads,
+                num_writer_threads,
                 next_append_vec_id.clone(),
                 storage_access,
             )?;

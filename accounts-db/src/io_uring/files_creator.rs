@@ -14,12 +14,15 @@ use libc::{O_CREAT, O_NOATIME, O_NOFOLLOW, O_TRUNC, O_WRONLY};
 use slab::Slab;
 
 use agave_io_uring::{Completion, Ring, RingOp};
+use smallvec::SmallVec;
 
 use crate::io_uring::memory::{BorrowedBytesMut, LargeBuffer};
 
 const DEFAULT_WRITE_SIZE: usize = 1024 * 1024;
 #[allow(dead_code)]
 const DEFAULT_BUFFER_SIZE: usize = 64 * DEFAULT_WRITE_SIZE;
+
+const MAX_OPEN_FILES: usize = 1000;
 
 /// Multiple files creator with `io_uring` queue for open -> write -> close
 /// operations.
@@ -33,21 +36,21 @@ struct FileCreatorState<F: FnMut(PathBuf)> {
     files: Slab<PendingFile>,
     buffers: VecDeque<WriteBuf>,
     open_fds: usize,
-    entry_callback: F,
+    wrote_callback: F,
 }
 
 impl<F: FnMut(PathBuf)> FilesCreator<F, LargeBuffer> {
-    /// Create a new `SequentialFileReader` for the given `file` using internally allocated
-    /// large buffer and default read size.
+    /// Create a new `FilesCreator` using `wrote_callback` to notify caller when
+    /// file contents are already persisted.
     ///
-    /// See [SequentialFileReader::with_buffer] for more information.
+    /// See [FilesCreator::with_buffer] for more information.
     #[allow(dead_code)]
     pub fn new(wrote_callback: F) -> io::Result<Self> {
         Self::with_capacity(DEFAULT_BUFFER_SIZE, wrote_callback)
     }
 
-    /// Create a new `SequentialFileReader` for the given `file` using internally allocated
-    /// buffer of specified `buf_size` and default read size.
+    /// Create a new `FilesCreator` using internally allocated buffer of specified
+    /// `buf_size` and default write size.
     pub fn with_capacity(buf_size: usize, wrote_callback: F) -> io::Result<Self> {
         Self::with_buffer(
             LargeBuffer::new(buf_size),
@@ -58,10 +61,16 @@ impl<F: FnMut(PathBuf)> FilesCreator<F, LargeBuffer> {
 }
 
 impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
-    pub fn with_buffer(buffer: B, write_capacity: usize, entry_callback: F) -> io::Result<Self> {
+    /// Create a new `FilesCreator` using provided `buffer` and `wrote_callback`
+    /// to notify caller when file contents are already persisted.
+    ///
+    /// `buffer` is the internal buffer used for writing scheduled file contents.
+    /// It must be at least `write_capacity` long. The creator will execute multiple
+    /// `write_capacity` sized writes in parallel to empty the work queue of files to create.
+    pub fn with_buffer(buffer: B, write_capacity: usize, wrote_callback: F) -> io::Result<Self> {
         let ring = IoUring::builder().build(512)?;
         ring.submitter().register_iowq_max_workers(&mut [4, 0])?;
-        Self::with_buffer_and_ring(ring, buffer, write_capacity, entry_callback)
+        Self::with_buffer_and_ring(ring, buffer, write_capacity, wrote_callback)
     }
 
     fn with_buffer_and_ring(
@@ -106,7 +115,7 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
                 files: Slab::new(),
                 buffers,
                 open_fds: 0,
-                entry_callback,
+                wrote_callback: entry_callback,
             },
         );
 
@@ -143,13 +152,23 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
     }
 
     pub fn wrote_callback(&mut self) -> &mut F {
-        &mut self.ring.context_mut().entry_callback
+        &mut self.ring.context_mut().wrote_callback
     }
 }
 
 impl<F: FnMut(PathBuf)> FilesCreator<F> {
-    pub fn open(&mut self, path: PathBuf, mode: u32) -> io::Result<usize> {
-        while self.ring.context().files.len() >= 1000 {
+    /// Schedule creating a file at `path` with `mode` permissons and
+    /// bytes read from `contents`.
+    pub fn create(&mut self, path: PathBuf, mode: u32, contents: &mut dyn Read) -> io::Result<()> {
+        let file_key = self.open(path, mode)?;
+        self.write_and_close(contents, file_key)
+    }
+
+    /// Schedule opening file at `path` with `mode` permissons.
+    ///
+    /// Returns key that can be used for scheduling writes for it.
+    fn open(&mut self, path: PathBuf, mode: u32) -> io::Result<usize> {
+        while self.ring.context().files.len() >= MAX_OPEN_FILES {
             eprintln!("too many open files");
             self.ring.process_completions()?;
             self.ring
@@ -175,7 +194,7 @@ impl<F: FnMut(PathBuf)> FilesCreator<F> {
         let file = PendingFile {
             path,
             fd: None,
-            backlog: Vec::new(),
+            backlog: SmallVec::new(),
             writes_started: 0,
             writes_completed: 0,
             eof: false,
@@ -193,32 +212,23 @@ impl<F: FnMut(PathBuf)> FilesCreator<F> {
         Ok(file_key)
     }
 
-    pub fn write_and_close(
-        &mut self,
-        src: &mut dyn Read,
-        file_key: usize,
-        size: u64,
-    ) -> io::Result<u64> {
+    fn write_and_close(&mut self, src: &mut dyn Read, file_key: usize) -> io::Result<()> {
         let mut offset = 0;
-        let mut remaining = size as usize;
-        while remaining > 0 {
-            // eprintln!("waiting buf");
+        loop {
             let buf = self.wait_free_buf()?;
-            // eprintln!("have buf");
             let state = self.ring.context_mut();
             let file = &mut state.files[file_key];
 
-            let read_len = remaining.min(buf.buf.len());
+            let read_len = buf.buf.len();
             let len = src.read(buf.buf.sub_buf_to(read_len).as_mut())?;
-            remaining -= len;
-            if len == 0 || remaining == 0 {
+            if len == 0 {
                 file.eof = true;
 
                 if len == 0 {
                     state.buffers.push_front(buf);
                     if file.complete() {
                         let path = mem::replace(&mut file.path, PathBuf::new());
-                        (state.entry_callback)(path);
+                        (state.wrote_callback)(path);
                         let fd = file.fd.take().unwrap();
                         self.ring
                             .push(FileCreatorOp::Close(CloseOp::new(fd, file_key)))?;
@@ -246,7 +256,7 @@ impl<F: FnMut(PathBuf)> FilesCreator<F> {
             offset += len;
         }
 
-        Ok(size - remaining as u64)
+        Ok(())
     }
 }
 
@@ -308,7 +318,7 @@ impl<F: FnMut(PathBuf)> OpenOp<F> {
         state.open_fds += 1;
 
         let fd = file.fd.clone();
-        let mut backlog = mem::replace(&mut file.backlog, Vec::new());
+        let mut backlog = mem::replace(&mut file.backlog, SmallVec::new());
         for (buf, offset, len) in backlog.drain(..) {
             let op = WriteOp {
                 file_key: self.file_key,
@@ -424,7 +434,7 @@ impl<F: FnMut(PathBuf)> WriteOp<F> {
         file.writes_completed += 1;
         if file.complete() {
             let path = mem::replace(&mut file.path, PathBuf::new());
-            (state.entry_callback)(path);
+            (state.wrote_callback)(path);
             ring.push(FileCreatorOp::Close(CloseOp::new(*fd, *file_key)));
         }
 
@@ -467,8 +477,7 @@ impl<F: FnMut(PathBuf)> RingOp<FileCreatorState<F>> for FileCreatorOp<F> {
 struct PendingFile {
     path: PathBuf,
     fd: Option<RawFd>,
-    // FIXME: make this a smallvec
-    backlog: Vec<(WriteBuf, usize, usize)>,
+    backlog: SmallVec<[(WriteBuf, usize, usize); 8]>,
     eof: bool,
     writes_started: usize,
     writes_completed: usize,

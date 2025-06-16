@@ -411,7 +411,7 @@ where
 }
 
 fn unpack_entry<F: FnMut(PathBuf), R: Read>(
-    file_creator: &mut FilesCreator<F>,
+    files_creator: &mut FilesCreator<F>,
     mut entry: tar::Entry<'_, R>,
     dst: PathBuf,
 ) -> Result<tar::Unpacked> {
@@ -430,17 +430,14 @@ fn unpack_entry<F: FnMut(PathBuf), R: Read>(
             set_perms(&dst, mode)?;
 
             // Process entry after setting permissions
-            file_creator.wrote_callback()(dst);
+            files_creator.wrote_callback()(dst);
 
             return Ok(unpacked);
         }
         _ => (),
     }
 
-    let file_key = file_creator.open(dst, mode)?;
-
-    let entry_size = entry.size();
-    file_creator.write_and_close(&mut entry, file_key, entry_size)?;
+    files_creator.create(dst, mode, &mut entry)?;
 
     return Ok(tar::Unpacked::__Nonexhaustive);
 
