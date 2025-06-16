@@ -16,7 +16,7 @@ use slab::Slab;
 use agave_io_uring::{Completion, Ring, RingOp};
 use smallvec::SmallVec;
 
-use crate::io_uring::memory::{BorrowedBytesMut, LargeBuffer};
+use crate::io_uring::memory::{IoFixedBuffer, LargeBuffer};
 
 const DEFAULT_WRITE_SIZE: usize = 1024 * 1024;
 #[allow(dead_code)]
@@ -34,7 +34,7 @@ pub struct FilesCreator<F: FnMut(PathBuf), B = LargeBuffer> {
 
 struct FileCreatorState<F: FnMut(PathBuf)> {
     files: Slab<PendingFile>,
-    buffers: VecDeque<WriteBuf>,
+    buffers: VecDeque<IoFixedBuffer>,
     open_fds: usize,
     wrote_callback: F,
 }
@@ -77,52 +77,23 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
         ring: IoUring,
         mut backing_buffer: B,
         write_capacity: usize,
-        entry_callback: F,
+        wrote_callback: F,
     ) -> io::Result<Self> {
         let buffer = backing_buffer.as_mut();
         assert!(buffer.len() % write_capacity == 0);
 
-        // We register fixed buffers in chunks of up to 1GB as this is faster than registering many
-        // `read_capacity` buffers. Registering fixed buffers saves the kernel some work in
-        // checking/mapping/unmapping buffers for each read operation.
-        const FIXED_BUFFER_LEN: usize = 1024 * 1024 * 1024;
-        let iovecs = buffer
-            .chunks(FIXED_BUFFER_LEN)
-            .map(|buf| libc::iovec {
-                iov_base: buf.as_ptr() as _,
-                iov_len: buf.len(),
-            })
-            .collect::<Vec<_>>();
-
-        // Split the buffer into `read_capacity` sized chunks.
-        let buf_start = buffer.as_ptr() as usize;
-        let buffers = buffer
-            .chunks_exact_mut(write_capacity)
-            .map(|buf| {
-                let io_buf_index = (buf.as_ptr() as usize - buf_start) / FIXED_BUFFER_LEN;
-                WriteBuf {
-                    buf: BorrowedBytesMut::from_mut_slice(buf),
-                    io_buf_index,
-                }
-            })
-            .collect::<VecDeque<_>>();
+        let buffers =
+            IoFixedBuffer::register_and_chunk_buffer(&ring, buffer, write_capacity)?.collect();
 
         let ring = Ring::new(
             ring,
             FileCreatorState {
-                // FIXME: see how many files we have in a snapshot today and
-                // initialize with that capacity
-                files: Slab::new(),
-                buffers,
+                files: Slab::with_capacity(MAX_OPEN_FILES),
                 open_fds: 0,
-                wrote_callback: entry_callback,
+                buffers,
+                wrote_callback,
             },
         );
-
-        // Safety:
-        // The iovecs point to a buffer which is guaranteed to be valid for the
-        // lifetime of the reader
-        unsafe { ring.register_buffers(&iovecs)? };
 
         Ok(Self {
             ring,
@@ -130,7 +101,7 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
         })
     }
 
-    fn wait_free_buf(&mut self) -> io::Result<WriteBuf> {
+    fn wait_free_buf(&mut self) -> io::Result<IoFixedBuffer> {
         // let mut i = 0;
         loop {
             self.ring.process_completions()?;
@@ -215,12 +186,11 @@ impl<F: FnMut(PathBuf)> FilesCreator<F> {
     fn write_and_close(&mut self, src: &mut dyn Read, file_key: usize) -> io::Result<()> {
         let mut offset = 0;
         loop {
-            let buf = self.wait_free_buf()?;
+            let mut buf = self.wait_free_buf()?;
             let state = self.ring.context_mut();
             let file = &mut state.files[file_key];
 
-            let read_len = buf.buf.len();
-            let len = src.read(buf.buf.sub_buf_to(read_len).as_mut())?;
+            let len = src.read(buf.as_mut())?;
             if len == 0 {
                 file.eof = true;
 
@@ -377,7 +347,7 @@ struct WriteOp<F> {
     file_key: usize,
     fd: RawFd,
     offset: usize,
-    buf: WriteBuf,
+    buf: IoFixedBuffer,
     write_len: usize,
     _f: std::marker::PhantomData<F>,
 }
@@ -395,9 +365,9 @@ impl<F: FnMut(PathBuf)> WriteOp<F> {
 
         opcode::WriteFixed::new(
             types::Fd(*fd),
-            buf.buf.as_mut_ptr(),
+            buf.as_mut_ptr(),
             *write_len as u32,
-            buf.io_buf_index as u16,
+            buf.io_buf_index(),
         )
         .offset(*offset as u64)
         .ioprio(2 << 13)
@@ -423,7 +393,7 @@ impl<F: FnMut(PathBuf)> WriteOp<F> {
             write_len,
             _f: _,
         } = self;
-        let buf = std::mem::replace(buf, WriteBuf::empty());
+        let buf = std::mem::replace(buf, IoFixedBuffer::empty());
 
         assert_eq!(written, *write_len, "short write");
 
@@ -477,7 +447,7 @@ impl<F: FnMut(PathBuf)> RingOp<FileCreatorState<F>> for FileCreatorOp<F> {
 struct PendingFile {
     path: PathBuf,
     fd: Option<RawFd>,
-    backlog: SmallVec<[(WriteBuf, usize, usize); 8]>,
+    backlog: SmallVec<[(IoFixedBuffer, usize, usize); 8]>,
     eof: bool,
     writes_started: usize,
     writes_completed: usize,
@@ -497,28 +467,6 @@ impl std::fmt::Debug for PendingFile {
             .field("writes_started", &self.writes_started)
             .field("writes_completed", &self.writes_completed)
             .field("backlog", &self.backlog)
-            .finish()
-    }
-}
-
-struct WriteBuf {
-    buf: BorrowedBytesMut,
-    io_buf_index: usize,
-}
-
-impl WriteBuf {
-    fn empty() -> Self {
-        Self {
-            buf: BorrowedBytesMut::empty(),
-            io_buf_index: 0,
-        }
-    }
-}
-
-impl std::fmt::Debug for WriteBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteBuf")
-            .field("io_buf_index", &self.io_buf_index)
             .finish()
     }
 }

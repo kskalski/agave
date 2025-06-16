@@ -1019,7 +1019,9 @@ mod tests {
 
     fn finalize_and_unpack_snapshot(archive: tar::Builder<Vec<u8>>) -> Result<()> {
         with_finalize_and_unpack(archive, |a, b| {
-            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {}).map(|_| ())
+            let files_creator = FilesCreator::new(|_| {})?;
+            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, files_creator)
+                .map(|_| ())
         })
     }
 
@@ -1270,12 +1272,14 @@ mod tests {
         let mut archive = Builder::new(Vec::new());
         archive.append(&header, data).unwrap();
         let result = with_finalize_and_unpack(archive, |ar, tmp| {
+            let files_creator =
+                FilesCreator::new(|path| assert_eq!(path, tmp.join("accounts_dest/123.456")))?;
             unpack_snapshot_with_processors(
                 ar,
                 tmp,
                 &[tmp.join("accounts_dest")],
                 |_, _| {},
-                |path| assert_eq!(path, tmp.join("accounts_dest/123.456")),
+                files_creator,
             )
         });
         assert_matches!(result, Ok(()));

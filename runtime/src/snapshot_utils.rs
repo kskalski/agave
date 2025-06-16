@@ -1554,8 +1554,6 @@ pub(crate) fn get_storages_to_serialize(
         .collect::<Vec<_>>()
 }
 
-const PARALLEL_UNTAR_WRITERS_DEFAULT: usize = 1;
-
 /// Unarchives the given full and incremental snapshot archives, as long as they are compatible.
 pub fn verify_and_unarchive_snapshots(
     bank_snapshots_dir: impl AsRef<Path>,
@@ -1573,7 +1571,15 @@ pub fn verify_and_unarchive_snapshots(
         incremental_snapshot_archive_info,
     )?;
 
-    let num_writer_threads = (num_cpus::get() / 4).clamp(1, PARALLEL_UNTAR_WRITERS_DEFAULT);
+    let num_writer_threads = if solana_accounts_db::io_uring_supported() {
+        // With asynchronous IO we don't even need spearate threads,
+        // but using 1 allows keeping same code structure as sync path.
+        1
+    } else {
+        // Writers will do synchronous syscalls, use several to parallelize
+        // actual data writes.
+        (num_cpus::get() / 4).clamp(1, 4)
+    };
 
     let next_append_vec_id = Arc::new(AtomicAccountsFileId::new(0));
     let unarchived_full_snapshot = unarchive_snapshot(
