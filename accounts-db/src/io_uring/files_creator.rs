@@ -23,6 +23,10 @@ const DEFAULT_WRITE_SIZE: usize = 1024 * 1024;
 const DEFAULT_BUFFER_SIZE: usize = 64 * DEFAULT_WRITE_SIZE;
 
 const MAX_OPEN_FILES: usize = 1000;
+const SQPOLL_IDLE_TIMEOUT: u32 = 50;
+const MAX_IOWQ_WORKERS: u32 = 4;
+const IO_URING_QUEUES_SIZE: u32 = 512;
+const CHECK_PROGRESS_AFTER_SUBMIT_TIMEOUT: Option<Duration> = Some(Duration::from_millis(10));
 
 /// Multiple files creator with `io_uring` queue for open -> write -> close
 /// operations.
@@ -68,8 +72,12 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
     /// It must be at least `write_capacity` long. The creator will execute multiple
     /// `write_capacity` sized writes in parallel to empty the work queue of files to create.
     pub fn with_buffer(buffer: B, write_capacity: usize, wrote_callback: F) -> io::Result<Self> {
-        let ring = IoUring::builder().build(512)?;
-        ring.submitter().register_iowq_max_workers(&mut [4, 0])?;
+        let ring = IoUring::builder()
+            .setup_coop_taskrun()
+            .setup_sqpoll(SQPOLL_IDLE_TIMEOUT)
+            .build(IO_URING_QUEUES_SIZE)?;
+        ring.submitter()
+            .register_iowq_max_workers(&mut [MAX_IOWQ_WORKERS, 0])?;
         Self::with_buffer_and_ring(ring, buffer, write_capacity, wrote_callback)
     }
 
@@ -102,19 +110,14 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
     }
 
     fn wait_free_buf(&mut self) -> io::Result<IoFixedBuffer> {
-        // let mut i = 0;
         loop {
             self.ring.process_completions()?;
             let buf = self.ring.context_mut().buffers.pop_front();
-            match buf {
-                Some(buf) => return Ok(buf),
-                None => {
-                    //eprintln!("unpacker waiting {i}");
-                    //i += 1;
-                    self.ring
-                        .submit_and_wait(1, Some(Duration::from_millis(10)))?;
-                }
+            if let Some(buf) = buf {
+                return Ok(buf);
             }
+            self.ring
+                .submit_and_wait(1, CHECK_PROGRESS_AFTER_SUBMIT_TIMEOUT)?;
         }
     }
 
@@ -130,7 +133,7 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
 impl<F: FnMut(PathBuf)> FilesCreator<F> {
     /// Schedule creating a file at `path` with `mode` permissons and
     /// bytes read from `contents`.
-    pub fn create(&mut self, path: PathBuf, mode: u32, contents: &mut dyn Read) -> io::Result<()> {
+    pub fn create(&mut self, path: PathBuf, mode: u32, contents: impl Read) -> io::Result<()> {
         let file_key = self.open(path, mode)?;
         self.write_and_close(contents, file_key)
     }
@@ -143,7 +146,7 @@ impl<F: FnMut(PathBuf)> FilesCreator<F> {
             eprintln!("too many open files");
             self.ring.process_completions()?;
             self.ring
-                .submit_and_wait(1, Some(Duration::from_millis(10)))?;
+                .submit_and_wait(1, CHECK_PROGRESS_AFTER_SUBMIT_TIMEOUT)?;
         }
 
         // FIXME: pre-open accounts/, change accounts/bla to bla so we don't
@@ -183,7 +186,7 @@ impl<F: FnMut(PathBuf)> FilesCreator<F> {
         Ok(file_key)
     }
 
-    fn write_and_close(&mut self, src: &mut dyn Read, file_key: usize) -> io::Result<()> {
+    fn write_and_close(&mut self, mut src: impl Read, file_key: usize) -> io::Result<()> {
         let mut offset = 0;
         loop {
             let mut buf = self.wait_free_buf()?;
@@ -275,7 +278,10 @@ impl<F: FnMut(PathBuf)> OpenOp<F> {
                         .unwrap()
                         .to_string_lossy()
                 );
-                //ring.push(CreatorOp::Open(self));
+                ring.push(FileCreatorOp::Open(Self {
+                    path: std::mem::take(&mut self.path),
+                    ..*self
+                }));
                 return Ok(());
             }
             Err(e) => return Err(e),

@@ -77,6 +77,7 @@ impl<B: AsMut<[u8]>> SequentialFileReader<B> {
         // to submit them for reading.
         let ring_qsize = (buf_len / read_capacity / 2).max(1) as u32;
         let ring = IoUring::builder()
+            .setup_coop_taskrun()
             .setup_sqpoll(SQPOLL_IDLE_TIMEOUT)
             .build(ring_qsize)?;
         ring.submitter()

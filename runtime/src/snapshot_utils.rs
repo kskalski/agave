@@ -1655,7 +1655,8 @@ fn streaming_unarchive_snapshot(
 
     let mut handles = vec![];
 
-    let (chunk_sender, chunk_receiver) = crossbeam_channel::bounded(num_threads * 2);
+    const ARCHIVE_CHUNKS_QUEUE_SIZE: usize = 16;
+    let (chunk_sender, chunk_receiver) = crossbeam_channel::bounded(ARCHIVE_CHUNKS_QUEUE_SIZE);
     handles.push(spawn_archive_chunker_thread(
         snapshot_archive_path,
         archive_format,
