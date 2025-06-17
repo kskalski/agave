@@ -23,7 +23,6 @@ const DEFAULT_WRITE_SIZE: usize = 1024 * 1024;
 const DEFAULT_BUFFER_SIZE: usize = 64 * DEFAULT_WRITE_SIZE;
 
 const MAX_OPEN_FILES: usize = 1000;
-const SQPOLL_IDLE_TIMEOUT: u32 = 50;
 const MAX_IOWQ_WORKERS: u32 = 4;
 const IO_URING_QUEUES_SIZE: u32 = 512;
 const CHECK_PROGRESS_AFTER_SUBMIT_TIMEOUT: Option<Duration> = Some(Duration::from_millis(10));
@@ -74,7 +73,6 @@ impl<B: AsMut<[u8]>, F: FnMut(PathBuf)> FilesCreator<F, B> {
     pub fn with_buffer(buffer: B, write_capacity: usize, wrote_callback: F) -> io::Result<Self> {
         let ring = IoUring::builder()
             .setup_coop_taskrun()
-            .setup_sqpoll(SQPOLL_IDLE_TIMEOUT)
             .build(IO_URING_QUEUES_SIZE)?;
         ring.submitter()
             .register_iowq_max_workers(&mut [MAX_IOWQ_WORKERS, 0])?;
@@ -272,8 +270,8 @@ impl<F: FnMut(PathBuf)> OpenOp<F> {
                 // Safety:
                 // Self::path is guaranteed to be valid while it's referenced by pointer by the
                 // corresponding squeue::Entry.
-                eprintln!(
-                    "retrying {}",
+                log::warn!(
+                    "retrying file open: {}",
                     CStr::from_bytes_until_nul(&self.path)
                         .unwrap()
                         .to_string_lossy()
