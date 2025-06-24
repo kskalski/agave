@@ -96,8 +96,8 @@ fn unpack_archive<'a, A, C, D>(
     apparent_limit_size: u64,
     actual_limit_size: u64,
     limit_count: u64,
-    mut entry_checker: C, // checks if entry is valid
-    entry_processor: D,   // processes entry after setting permissions
+    mut entry_checker: C,   // checks if entry is valid
+    file_path_processor: D, // processes file paths after writing
 ) -> Result<()>
 where
     A: Read,
@@ -111,7 +111,8 @@ where
     let mut total_entries = 0;
     let mut open_dirs = Vec::new();
 
-    let mut files_creator = crate::file_io::files_creator(entry_processor, UNPACK_WRITE_BUF_SIZE)?;
+    let mut files_creator =
+        crate::file_io::files_creator(file_path_processor, UNPACK_WRITE_BUF_SIZE)?;
 
     for entry in archive.entries()? {
         let entry = entry?;
@@ -218,8 +219,10 @@ fn unpack_entry<'a, R: Read>(
             // Sanitize permissions.
             set_perms(&dst, mode)?;
 
-            // Process entry after setting permissions
-            files_creator.on_written(dst);
+            if !entry.header().entry_type().is_dir() {
+                // Process file after setting permissions
+                files_creator.on_written(dst);
+            }
 
             return Ok(unpacked);
         }
@@ -364,15 +367,13 @@ pub fn streaming_unpack_snapshot<A: Read>(
         ledger_dir,
         account_paths,
         |_, _| {},
-        |entry_path_buf| {
-            if entry_path_buf.is_file() {
-                let result = sender.send(entry_path_buf);
-                if let Err(err) = result {
-                    panic!(
-                        "failed to send path '{}' from unpacker to rebuilder: {err}",
-                        err.0.display(),
-                    );
-                }
+        |file_path| {
+            let result = sender.send(file_path);
+            if let Err(err) = result {
+                panic!(
+                    "failed to send path '{}' from unpacker to rebuilder: {err}",
+                    err.0.display(),
+                );
             }
         },
     )
@@ -383,7 +384,7 @@ fn unpack_snapshot_with_processors<A, F, G>(
     ledger_dir: &Path,
     account_paths: &[PathBuf],
     mut accounts_path_processor: F,
-    entry_processor: G,
+    file_path_processor: G,
 ) -> Result<()>
 where
     A: Read,
@@ -419,7 +420,7 @@ where
                 UnpackPath::Invalid
             }
         },
-        entry_processor,
+        file_path_processor,
     )
 }
 
