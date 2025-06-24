@@ -1594,16 +1594,6 @@ pub fn verify_and_unarchive_snapshots(
         incremental_snapshot_archive_info,
     )?;
 
-    let num_writer_threads = if solana_accounts_db::io_uring_supported() {
-        // With asynchronous IO we don't even need spearate threads,
-        // but using 1 allows keeping same code structure as sync path.
-        1
-    } else {
-        // Writers will do synchronous syscalls, use several to parallelize
-        // actual data writes.
-        (num_cpus::get() / 4).clamp(1, 4)
-    };
-
     let next_append_vec_id = Arc::new(AtomicAccountsFileId::new(0));
     let UnarchivedSnapshot {
         unpack_dir: full_unpack_dir,
@@ -1619,7 +1609,6 @@ pub fn verify_and_unarchive_snapshots(
         "snapshot untar",
         account_paths,
         full_snapshot_archive_info.archive_format(),
-        num_writer_threads,
         next_append_vec_id.clone(),
         storage_access,
     )?;
@@ -1646,7 +1635,6 @@ pub fn verify_and_unarchive_snapshots(
             "incremental snapshot untar",
             account_paths,
             incremental_snapshot_archive_info.archive_format(),
-            num_writer_threads,
             next_append_vec_id.clone(),
             storage_access,
         )?;
@@ -1693,7 +1681,6 @@ fn streaming_unarchive_snapshot(
     ledger_dir: PathBuf,
     snapshot_archive_path: PathBuf,
     archive_format: ArchiveFormat,
-    _num_threads: usize,
 ) -> JoinHandle<Result<()>> {
     Builder::new()
         .name("solTarUnpack".to_string())
@@ -1875,7 +1862,6 @@ fn unarchive_snapshot(
     measure_name: &'static str,
     account_paths: &[PathBuf],
     archive_format: ArchiveFormat,
-    num_untar_threads: usize,
     next_append_vec_id: Arc<AtomicAccountsFileId>,
     storage_access: StorageAccess,
 ) -> Result<UnarchivedSnapshot> {
@@ -1891,12 +1877,9 @@ fn unarchive_snapshot(
         unpack_dir.path().to_path_buf(),
         snapshot_archive_path.as_ref().to_path_buf(),
         archive_format,
-        num_untar_threads,
     );
 
-    let num_rebuilder_threads = num_cpus::get_physical()
-        .saturating_sub(num_untar_threads)
-        .max(1);
+    let num_rebuilder_threads = num_cpus::get_physical().saturating_sub(1).max(1);
     let snapshot_result = snapshot_fields_from_files(&file_receiver).and_then(
         |SnapshotFieldsBundle {
              snapshot_version,
