@@ -1253,7 +1253,7 @@ impl AppendVec {
                 let mut reader = BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(
                     self_len,
                     file,
-                    mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>(),
+                    4096.max(mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>()),
                 );
                 while let Ok(BufferedReaderStatus::Success) = reader.read() {
                     let (offset, bytes) = reader.get_offset_and_data();
