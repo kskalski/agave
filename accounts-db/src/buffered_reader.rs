@@ -17,6 +17,7 @@ use {
         ops::Range,
         path::Path,
         slice,
+        sync::atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -62,6 +63,9 @@ pub enum BufferedReaderStatus {
     Eof,
     Success,
 }
+
+pub static STATS_TOTAL_BYTES_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+pub static STATS_TOTAL_BYTES_READ: AtomicUsize = AtomicUsize::new(0);
 
 /// read a file a large buffer at a time and provide access to a slice in that buffer
 pub struct BufferedReader<'a, T> {
@@ -111,6 +115,7 @@ impl<'a, T> BufferedReader<'a, T> {
             self.buf_valid_bytes.start += delta;
         } else {
             let additional_amount_to_skip = delta - self.buf_valid_bytes.len();
+            STATS_TOTAL_BYTES_SKIPPED.fetch_add(additional_amount_to_skip, Ordering::Relaxed);
             self.buf_valid_bytes = 0..0;
             self.file_offset_of_next_read += additional_amount_to_skip;
         }
@@ -135,6 +140,7 @@ where
         if self.buf_valid_bytes.len() < must_read {
             // we haven't used all the bytes we read last time, so adjust the effective offset
             debug_assert!(self.buf_valid_bytes.len() <= self.file_offset_of_next_read);
+            let prev = self.file_offset_of_next_read;
             self.file_last_offset = self.file_offset_of_next_read - self.buf_valid_bytes.len();
             read_more_buffer(
                 self.file,
@@ -144,6 +150,8 @@ where
                 unsafe { self.buf.as_mut_slice() },
                 &mut self.buf_valid_bytes,
             )?;
+            STATS_TOTAL_BYTES_READ
+                .fetch_add(self.file_offset_of_next_read - prev, Ordering::Relaxed);
             if self.buf_valid_bytes.len() < must_read {
                 return Ok(BufferedReaderStatus::Eof);
             }

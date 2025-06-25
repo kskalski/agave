@@ -25,6 +25,7 @@ pub mod tests;
 
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
+use crate::buffered_reader::STATS_TOTAL_BYTES_SKIPPED;
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
@@ -8040,6 +8041,11 @@ impl AccountsDb {
             let total_including_duplicates = AtomicU64::new(0);
             let all_accounts_are_zero_lamports_slots = AtomicU64::new(0);
             let mut all_zeros_slots = Mutex::new(Vec::<(Slot, Arc<AccountStorageEntry>)>::new());
+            log::info!(
+                "start index {} {}",
+                STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed),
+                STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed)
+            );
             let scan_time: u64 = slots
                 .par_chunks(chunk_size)
                 .map(|slots| {
@@ -8157,6 +8163,11 @@ impl AccountsDb {
                 })
                 .sum();
             index_time.stop();
+            log::info!(
+                "end index {} {}",
+                STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed),
+                STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed)
+            );
 
             info!("rent_collector: {:?}", rent_collector);
 
