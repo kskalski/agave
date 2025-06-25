@@ -25,7 +25,7 @@ pub mod tests;
 
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
-use crate::buffered_reader::STATS_TOTAL_BYTES_SKIPPED;
+use crate::buffered_reader::{STATS_TOTAL_BYTES_READ, STATS_TOTAL_BYTES_SKIPPED};
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
@@ -8044,7 +8044,7 @@ impl AccountsDb {
             log::info!(
                 "start index {} {}",
                 STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed),
-                STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed)
+                STATS_TOTAL_BYTES_READ.load(Ordering::Relaxed)
             );
             let scan_time: u64 = slots
                 .par_chunks(chunk_size)
@@ -8166,7 +8166,7 @@ impl AccountsDb {
             log::info!(
                 "end index {} {}",
                 STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed),
-                STATS_TOTAL_BYTES_SKIPPED.load(Ordering::Relaxed)
+                STATS_TOTAL_BYTES_READ.load(Ordering::Relaxed)
             );
 
             info!("rent_collector: {:?}", rent_collector);
