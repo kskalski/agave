@@ -200,7 +200,8 @@ impl IoFixedBuffer {
 
 impl std::fmt::Debug for IoFixedBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteBuf")
+        f.debug_struct("IoFixedBuffer")
+            .field("size", &self.size)
             .field("io_buf_index", &self.io_buf_index)
             .finish()
     }
