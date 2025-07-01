@@ -16,6 +16,7 @@ use {
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     std::{
+        fs::File,
         mem,
         path::{Path, PathBuf},
     },
@@ -250,6 +251,14 @@ impl AccountsFile {
         match self {
             Self::AppendVec(av) => av.path(),
             Self::TieredStorage(ts) => ts.path(),
+        }
+    }
+
+    /// Return the `File` and its size if accounts are backed by file-io.
+    pub fn file_io_info(&self) -> Option<(&File, usize)> {
+        match self {
+            Self::AppendVec(av) => av.file_io_info(),
+            Self::TieredStorage(_) => unimplemented!(),
         }
     }
 

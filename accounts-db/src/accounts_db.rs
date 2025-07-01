@@ -51,7 +51,7 @@ use {
         active_stats::{ActiveStatItem, ActiveStats},
         ancestors::Ancestors,
         append_vec::{self, aligned_stored_size, IndexInfo, IndexInfoInner, STORE_META_OVERHEAD},
-        buffered_reader::RequiredLenBufFileRead,
+        buffered_reader::{FileBufRead, RequiredLenBufFileRead},
         contains::Contains,
         is_zero_lamport::IsZeroLamport,
         partitioned_rewards::{
@@ -6741,8 +6741,11 @@ impl AccountsDb {
         }
 
         let mut total_accum = IndexGenerationAccumulator::new();
-        let storages_orderer =
-            AccountStoragesOrderer::with_random_order(&storages).into_concurrent_consumer();
+        // Balance ratio of small to large files to amortize per-operation cost across the
+        // whole scan process and keep total bytes in pending reads similar at all times.
+        let ratio = append_vec::SCAN_ACCOUNTS_SMALL_TO_LARGE_FILE_RATIO;
+        let storages_orderer = AccountStoragesOrderer::with_small_to_large_ratio(&storages, ratio)
+            .into_concurrent_consumer();
         let exit_logger = AtomicBool::new(false);
         let num_processed = AtomicU64::new(0);
         let num_threads = num_cpus::get();
@@ -6755,7 +6758,29 @@ impl AccountsDb {
                         .spawn_scoped(s, || {
                             let mut thread_accum = IndexGenerationAccumulator::new();
                             let mut reader = append_vec::new_scan_accounts_reader();
-                            while let Some(next_item) = storages_orderer.next() {
+                            // Always consume a multiple of small/large files cycle, when chunk
+                            // is replenished, it will get a single cycle (half capacity) and
+                            // add it to prefetch, while the existing cycle is being read.
+                            let mut prefetch_chunk =
+                                VecDeque::with_capacity(2 * (ratio.0 + ratio.1));
+
+                            loop {
+                                if prefetch_chunk.is_empty()
+                                    || prefetch_chunk.len() == prefetch_chunk.capacity() / 2
+                                {
+                                    let new_entries =
+                                        storages_orderer.take_up_to_capacity(&mut prefetch_chunk);
+                                    let new_files = new_entries
+                                        .filter_map(|item| item.storage.accounts.file_io_info());
+                                    reader
+                                        .add_files_to_prefetch(new_files)
+                                        .expect("must prefetch accounts storage");
+                                }
+
+                                let Some(next_item) = prefetch_chunk.pop_front() else {
+                                    break;
+                                };
+
                                 self.maybe_throttle_index_generation();
                                 let storage = next_item.storage;
                                 let store_id = storage.id();
