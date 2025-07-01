@@ -155,19 +155,14 @@ impl IoFixedBuffer {
         self.ptr
     }
 
+    pub fn as_slice(&self, pos: usize, limit: &Option<usize>) -> &[u8] {
+        assert!(pos <= self.size);
+        unsafe { slice::from_raw_parts(self.ptr.byte_add(pos), limit.unwrap_or(self.size) - pos) }
+    }
+
     /// The index of the fixed buffer in the ring. See register_buffers().
     pub fn io_buf_index(&self) -> u16 {
         self.io_buf_index as u16
-    }
-
-    /// Return a clone of `self` reduced to specified `size`
-    pub fn sub_buf_to(&self, size: usize) -> Self {
-        assert!(size <= self.size);
-        Self {
-            ptr: self.ptr,
-            size,
-            io_buf_index: self.io_buf_index,
-        }
     }
 
     /// Registed provided buffers as fixed buffer in `io_uring` and split it into

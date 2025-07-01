@@ -8,7 +8,7 @@ use {
     std::{
         collections::VecDeque,
         fs::File,
-        io::{self, BufRead, Cursor, Read},
+        io::{self, BufRead, Read},
         marker::PhantomData,
         mem,
         os::fd::{AsRawFd, RawFd},
@@ -102,7 +102,6 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
             .collect();
 
         let state = SequentialFileReaderState {
-            read_capacity,
             buffers,
             files: VecDeque::new(),
             next_read_file_index: None,
@@ -120,7 +119,7 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
 impl<'a, B> SequentialFileReader<'a, B> {
     /// Add file reference to read. Starts reading the file as soon as a buffer is available.
     pub fn add_file(&mut self, file: File) -> io::Result<()> {
-        self.add_file_by_fd(file.as_raw_fd())?;
+        self.add_file_by_fd(file.as_raw_fd(), None)?;
         self.owned_files.push_back(file);
         Ok(())
     }
@@ -128,15 +127,15 @@ impl<'a, B> SequentialFileReader<'a, B> {
     /// Add file reference to read. Starts reading the file as soon as a buffer is available.
     /// Lifetime of reference is tied to the reader's lifetime.
     #[allow(unused)]
-    pub fn add_file_ref(&mut self, file: &'a File) -> io::Result<()> {
-        self.add_file_by_fd(file.as_raw_fd())
+    pub fn add_file_ref(&mut self, file: &'a File, limit_len: usize) -> io::Result<()> {
+        self.add_file_by_fd(file.as_raw_fd(), Some(limit_len))
     }
 
     /// Caller must ensure that the file is not closed while the reader is using it.
-    fn add_file_by_fd(&mut self, fd: RawFd) -> io::Result<()> {
+    fn add_file_by_fd(&mut self, fd: RawFd, limit_len: Option<usize>) -> io::Result<()> {
         let state = self.inner.context_mut();
 
-        state.files.push_back(FileState::new(fd));
+        state.files.push_back(FileState::new(fd, limit_len));
 
         if state.all_buffers_used() {
             // Just added file to backlog, no reads can be started yet.
@@ -156,22 +155,43 @@ impl<'a, B> SequentialFileReader<'a, B> {
     }
 
     #[allow(unused)]
-    pub fn move_to_next_file(&mut self) {
+    pub fn move_to_next_file(&mut self) -> io::Result<()> {
         let state = self.inner.context_mut();
 
         let Some(file_state) = state.files.pop_front() else {
-            return;
+            return Ok(());
         };
         if let Some(next_file_index) = state.next_read_file_index.as_mut() {
             state.next_read_file_index = next_file_index.checked_sub(1);
         }
 
         if let Some(buf_index) = file_state.current_buf_index {
-            let ReadBufState::Full { seen_eof, .. } = &state.buffers[buf_index] else {
+            let ReadBufState::Full {
+                eof_pos: Some(_), ..
+            } = &state.buffers[buf_index]
+            else {
                 panic!("cannot move from incompletely read buffer");
             };
-            assert!(seen_eof);
         }
+
+        if file_state.read_limit.is_none() {
+            // This was unlimited file read, so no other files are queued,
+            // but some ops might still be in-flight, drain them.
+            self.inner.drain()?;
+            self.inner.context_mut().reset_buffers();
+            if !self.inner.context().files.is_empty() {
+                self.inner.context_mut().next_read_file_index = Some(0);
+            }
+
+            // Start reading as many buffers as necessary for queued files.
+            while let Some(op) = self.inner.context_mut().next_read_op() {
+                self.inner.push(op)?;
+            }
+            // Make sure work is started in case submission queue is large and we
+            // never submitted work when adding buffers.
+            self.inner.submit()?
+        }
+
         if self
             .owned_files
             .front()
@@ -179,6 +199,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
         {
             self.owned_files.pop_front();
         }
+        Ok(())
     }
 }
 
@@ -194,10 +215,10 @@ struct FileState {
 }
 
 impl FileState {
-    fn new(raw_fd: RawFd) -> Self {
+    fn new(raw_fd: RawFd, read_limit: Option<usize>) -> Self {
         Self {
             raw_fd,
-            read_limit: None,
+            read_limit,
             offset: 0,
             current_buf_index: None,
         }
@@ -213,7 +234,7 @@ impl FileState {
     fn next_read_op(&mut self, index: usize, bufs: &mut [ReadBufState]) -> Option<ReadOp> {
         let Self {
             current_buf_index,
-            raw_fd: file,
+            raw_fd,
             offset,
             read_limit,
         } = self;
@@ -233,11 +254,12 @@ impl FileState {
 
         let read_len = left_to_read.min(buf.len());
         let op = ReadOp {
-            fd: file.as_raw_fd(),
+            raw_fd: *raw_fd,
             buf,
             buf_offset: 0,
             file_offset: *offset,
             read_len,
+            is_last_read: read_limit.is_some_and(|l| *offset + read_len >= l),
             reader_buf_index: index,
         };
         if current_buf_index.is_none() {
@@ -253,7 +275,6 @@ impl FileState {
 
 /// Holds the state of the reader.
 struct SequentialFileReaderState {
-    read_capacity: usize,
     buffers: Vec<ReadBufState>,
     files: VecDeque<FileState>,
     next_read_file_index: Option<usize>,
@@ -303,6 +324,20 @@ impl SequentialFileReaderState {
     fn all_buffers_used(&mut self) -> bool {
         self.buffers[self.next_read_buf_index].is_used()
     }
+
+    fn reset_buffers(&mut self) {
+        for buf in &mut self.buffers {
+            match buf {
+                ReadBufState::Uninit(_) => (),
+                ReadBufState::Reading => unreachable!("no buffer should be reading"),
+                ReadBufState::Full {
+                    buf: fixed_io_buf, ..
+                } => {
+                    *buf = ReadBufState::Uninit(mem::replace(fixed_io_buf, IoFixedBuffer::empty()));
+                }
+            }
+        }
+    }
 }
 
 // BufRead requires Read, but we never really use the Read interface.
@@ -324,42 +359,29 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         let _have_data = loop {
             let state = self.inner.context_mut();
-            let Some(current_buf_index) = state
-                .files
-                .front_mut()
-                .and_then(|f| f.current_buf_index.as_mut())
-            else {
+            let Some(file_state) = state.files.front_mut() else {
+                return Ok(&[]);
+            };
+            let Some(current_buf_index) = file_state.current_buf_index.as_mut() else {
                 return Ok(&[]);
             };
             match &mut state.buffers[*current_buf_index] {
-                ReadBufState::Full {
-                    ref mut cursor,
-                    seen_eof,
-                } => {
-                    if !cursor.fill_buf()?.is_empty() {
+                ReadBufState::Full { buf, pos, eof_pos } => {
+                    if *pos < buf.len() && eof_pos.is_none_or(|eof| *pos < eof) {
                         // we have some data available
                         break true;
                     }
 
-                    if *seen_eof {
+                    if eof_pos.is_some() {
                         // This is the last filled buf for the whole file
                         return Ok(&[]);
                     } else {
-                        // we have finished consuming this buffer, queue the next read
-                        let cursor = mem::replace(cursor, Cursor::new(IoFixedBuffer::empty()));
-                        let buf = cursor.into_inner();
-
-                        // The very last read when we hit EOF could return less than `read_capacity`, in
-                        // which case what's in the cursor is shorter than `read_capacity` and for
-                        // strict correctness we should reset the length.
-                        //
-                        // Note though that once we hit EOF we don't queue any more reads, so even if we
-                        // didn't reset the length it wouldn't matter.
-                        debug_assert!(buf.len() == state.read_capacity);
-
-                        state.buffers[*current_buf_index] = ReadBufState::Uninit(buf);
+                        // We have finished consuming this buffer - uninitialize its state.
+                        state.buffers[*current_buf_index] =
+                            ReadBufState::Uninit(mem::replace(buf, IoFixedBuffer::empty()));
                         *current_buf_index = (*current_buf_index + 1) % state.buffers.len();
 
+                        // Queue up next read
                         if let Some(op) = state.next_read_op() {
                             self.inner.push(op)?;
                         }
@@ -384,8 +406,8 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
         }
 
         // At this point we must have data or be at EOF.
-        match self.inner.context_mut().current_buf_mut().unwrap() {
-            ReadBufState::Full { cursor, .. } => Ok(cursor.fill_buf()?),
+        match self.inner.context().current_buf().unwrap() {
+            ReadBufState::Full { buf, pos, eof_pos } => Ok(buf.as_slice(*pos, eof_pos)),
             // after the loop above we either have some data or we must be at EOF
             _ => unreachable!(),
         }
@@ -397,7 +419,7 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
             return;
         };
         match current_buf {
-            ReadBufState::Full { cursor, .. } => cursor.consume(amt),
+            ReadBufState::Full { pos, .. } => *pos += amt,
             _ => assert_eq!(amt, 0),
         }
     }
@@ -413,8 +435,9 @@ enum ReadBufState {
     Reading,
     /// The buffer is filled and ready to be consumed.
     Full {
-        cursor: Cursor<IoFixedBuffer>,
-        seen_eof: bool,
+        buf: IoFixedBuffer,
+        pos: usize,
+        eof_pos: Option<usize>,
     },
 }
 
@@ -426,7 +449,7 @@ impl ReadBufState {
 
 #[derive(Debug)]
 struct ReadOp {
-    fd: RawFd,
+    raw_fd: RawFd,
     buf: IoFixedBuffer,
     /// This is the offset inside the buffer. It's typically 0, but can be non-zero if a previous
     /// read returned less data than requested (because of EINTR or whatever) and we submitted a new
@@ -437,6 +460,8 @@ struct ReadOp {
     /// The length of the read. This is typically `read_capacity` but can be less if a previous read
     /// returned less data than requested.
     read_len: usize,
+    /// Indicates that after reading `read_len` we have reached configured read limit.
+    is_last_read: bool,
     /// This is the index of the buffer in the reader's state. It's used to update the state once the
     /// read completes.
     reader_buf_index: usize,
@@ -445,11 +470,12 @@ struct ReadOp {
 impl RingOp<SequentialFileReaderState> for ReadOp {
     fn entry(&mut self) -> squeue::Entry {
         let ReadOp {
-            fd,
+            raw_fd: fd,
             buf,
             buf_offset: buf_off,
             file_offset: file_off,
             read_len,
+            is_last_read: _,
             reader_buf_index: _,
         } = self;
         debug_assert!(*buf_off + *read_len <= buf.len());
@@ -471,11 +497,12 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
         res: io::Result<i32>,
     ) -> io::Result<()> {
         let ReadOp {
-            fd,
+            raw_fd: fd,
             buf,
             buf_offset: buf_off,
             file_offset: file_off,
             read_len,
+            is_last_read,
             reader_buf_index,
         } = self;
         let reader_state = completion.context_mut();
@@ -487,12 +514,13 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
         if last_read_len > 0 && last_read_len < *read_len {
             // Partial read, retry the op with updated offsets
             let op: ReadOp = ReadOp {
-                fd: *fd,
+                raw_fd: *fd,
                 buf: mem::replace(buf, IoFixedBuffer::empty()),
                 buf_offset: total_read_len,
                 file_offset: *file_off + last_read_len,
                 read_len: *read_len - last_read_len,
                 reader_buf_index: *reader_buf_index,
+                is_last_read: *is_last_read,
             };
             // Safety:
             // The op points to a buffer which is guaranteed to be valid for the
@@ -500,8 +528,9 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
             completion.push(op);
         } else {
             reader_state.buffers[*reader_buf_index] = ReadBufState::Full {
-                cursor: Cursor::new(buf.sub_buf_to(total_read_len)),
-                seen_eof: last_read_len == 0,
+                buf: mem::replace(buf, IoFixedBuffer::empty()),
+                pos: 0,
+                eof_pos: (last_read_len == 0 || *is_last_read).then_some(total_read_len),
             };
         }
 
@@ -576,7 +605,7 @@ mod tests {
         let mut f = File::open(temp_file.path()).unwrap();
         {
             let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
-            reader.add_file_ref(&f).unwrap();
+            reader.add_file_ref(&f, 3).unwrap();
             let mut all_read_data = Vec::new();
             reader.read_to_end(&mut all_read_data).unwrap();
             assert_eq!(all_read_data.len(), 3);
@@ -587,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_files() {
+    fn test_multiple_unlimited_files() {
         let mut temp_file1 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp_file1, &[0xa, 0xb, 0xc]).unwrap();
 
@@ -598,15 +627,39 @@ mod tests {
         let f1 = File::open(temp_file1.path()).unwrap();
         let f2 = File::open(temp_file2.path()).unwrap();
         let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
-        reader.add_file_ref(&f1).unwrap();
-        reader.add_file_ref(&f2).unwrap();
+        reader.add_file(f1).unwrap();
+        reader.add_file(f2).unwrap();
         let mut all_read_data = Vec::new();
         reader.read_to_end(&mut all_read_data).unwrap();
-        assert_eq!(all_read_data.len(), 3);
+        assert_eq!(all_read_data, vec![0xa, 0xb, 0xc]);
 
-        reader.move_to_next_file();
+        reader.move_to_next_file().unwrap();
         all_read_data.clear();
         reader.read_to_end(&mut all_read_data).unwrap();
-        assert_eq!(all_read_data.len(), 4);
+        assert_eq!(all_read_data, vec![0xd, 0xe, 0xf, 0x10]);
+    }
+
+    #[test]
+    fn test_multiple_limited_files() {
+        let mut temp_file1 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp_file1, &[0xa, 0xb, 0xc]).unwrap();
+
+        let mut temp_file2 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp_file2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
+
+        let buf = vec![0; 1024];
+        let f1 = File::open(temp_file1.path()).unwrap();
+        let f2 = File::open(temp_file2.path()).unwrap();
+        let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+        reader.add_file_ref(&f1, 2).unwrap();
+        reader.add_file_ref(&f2, 3).unwrap();
+        let mut all_read_data = Vec::new();
+        reader.read_to_end(&mut all_read_data).unwrap();
+        assert_eq!(all_read_data, vec![0xa, 0xb]);
+
+        reader.move_to_next_file().unwrap();
+        all_read_data.clear();
+        reader.read_to_end(&mut all_read_data).unwrap();
+        assert_eq!(all_read_data, vec![0xd, 0xe, 0xf]);
     }
 }
