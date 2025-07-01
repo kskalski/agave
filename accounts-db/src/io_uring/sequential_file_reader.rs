@@ -9,8 +9,9 @@ use {
         collections::VecDeque,
         fs::File,
         io::{self, BufRead, Cursor, Read},
+        marker::PhantomData,
         mem,
-        os::fd::{AsRawFd as _, RawFd},
+        os::fd::{AsRawFd, RawFd},
         path::Path,
     },
 };
@@ -24,15 +25,17 @@ const MAX_IOWQ_WORKERS: u32 = 4;
 /// Reader for non-seekable files.
 ///
 /// Implements read-ahead using io_uring.
-pub struct SequentialFileReader<B> {
+pub struct SequentialFileReader<'a, B> {
     // Note: state is tied to `backing_buffer` and contains unsafe pointer references to it
     inner: Ring<SequentialFileReaderState, ReadOp>,
+    owned_files: VecDeque<File>,
     /// Owned buffer used across lifespan of `inner` (should get dropped last)
     #[allow(dead_code)]
     backing_buffer: B,
+    _phantom: PhantomData<&'a ()>,
 }
 
-impl SequentialFileReader<LargeBuffer> {
+impl SequentialFileReader<'_, LargeBuffer> {
     #[allow(dead_code)]
     pub fn from_path(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut this = Self::new()?;
@@ -61,7 +64,7 @@ impl SequentialFileReader<LargeBuffer> {
     }
 }
 
-impl<B: AsMut<[u8]>> SequentialFileReader<B> {
+impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
     /// Create a new `SequentialFileReader` for the given file using provided backing `buffer`.
     ///
     /// `buffer` is the internal buffer used for reading. It must be at least `read_capacity` long.
@@ -107,16 +110,33 @@ impl<B: AsMut<[u8]>> SequentialFileReader<B> {
         };
         Ok(Self {
             inner: Ring::new(ring, state),
+            owned_files: VecDeque::new(),
             backing_buffer,
+            _phantom: PhantomData,
         })
     }
 }
 
-impl<B> SequentialFileReader<B> {
+impl<'a, B> SequentialFileReader<'a, B> {
+    /// Add file reference to read. Starts reading the file as soon as a buffer is available.
     pub fn add_file(&mut self, file: File) -> io::Result<()> {
+        self.add_file_by_fd(file.as_raw_fd())?;
+        self.owned_files.push_back(file);
+        Ok(())
+    }
+
+    /// Add file reference to read. Starts reading the file as soon as a buffer is available.
+    /// Lifetime of reference is tied to the reader's lifetime.
+    #[allow(unused)]
+    pub fn add_file_ref(&mut self, file: &'a File) -> io::Result<()> {
+        self.add_file_by_fd(file.as_raw_fd())
+    }
+
+    /// Caller must ensure that the file is not closed while the reader is using it.
+    fn add_file_by_fd(&mut self, fd: RawFd) -> io::Result<()> {
         let state = self.inner.context_mut();
 
-        state.files.push_back(FileState::new(file));
+        state.files.push_back(FileState::new(fd));
 
         if state.all_buffers_used() {
             // Just added file to backlog, no reads can be started yet.
@@ -134,11 +154,37 @@ impl<B> SequentialFileReader<B> {
         // never submitted work when adding buffers.
         self.inner.submit()
     }
+
+    #[allow(unused)]
+    pub fn move_to_next_file(&mut self) {
+        let state = self.inner.context_mut();
+
+        let Some(file_state) = state.files.pop_front() else {
+            return;
+        };
+        if let Some(next_file_index) = state.next_read_file_index.as_mut() {
+            state.next_read_file_index = next_file_index.checked_sub(1);
+        }
+
+        if let Some(buf_index) = file_state.current_buf_index {
+            let ReadBufState::Full { seen_eof, .. } = &state.buffers[buf_index] else {
+                panic!("cannot move from incompletely read buffer");
+            };
+            assert!(seen_eof);
+        }
+        if self
+            .owned_files
+            .front()
+            .is_some_and(|f| f.as_raw_fd() == file_state.raw_fd)
+        {
+            self.owned_files.pop_front();
+        }
+    }
 }
 
 /// Holds the state of a single file being read.
 struct FileState {
-    file: File,
+    raw_fd: RawFd,
     /// Limit file offset to read up to.
     read_limit: Option<usize>,
     /// Offset of the next byte to read from file
@@ -148,9 +194,9 @@ struct FileState {
 }
 
 impl FileState {
-    fn new(file: File) -> Self {
+    fn new(raw_fd: RawFd) -> Self {
         Self {
-            file,
+            raw_fd,
             read_limit: None,
             offset: 0,
             current_buf_index: None,
@@ -167,7 +213,7 @@ impl FileState {
     fn next_read_op(&mut self, index: usize, bufs: &mut [ReadBufState]) -> Option<ReadOp> {
         let Self {
             current_buf_index,
-            file,
+            raw_fd: file,
             offset,
             read_limit,
         } = self;
@@ -222,12 +268,11 @@ impl SequentialFileReaderState {
     }
 
     fn current_buf(&self) -> Option<&ReadBufState> {
-        self.current_buf_index().map(|index| &self.buffers[index])
+        self.current_buf_index().map(|idx| &self.buffers[idx])
     }
 
     fn current_buf_mut(&mut self) -> Option<&mut ReadBufState> {
-        self.current_buf_index()
-            .map(|index| &mut self.buffers[index])
+        self.current_buf_index().map(|idx| &mut self.buffers[idx])
     }
 
     fn next_read_op(&mut self) -> Option<ReadOp> {
@@ -261,7 +306,7 @@ impl SequentialFileReaderState {
 }
 
 // BufRead requires Read, but we never really use the Read interface.
-impl<B: AsMut<[u8]>> Read for SequentialFileReader<B> {
+impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let available = self.fill_buf()?;
         if available.is_empty() {
@@ -275,7 +320,7 @@ impl<B: AsMut<[u8]>> Read for SequentialFileReader<B> {
     }
 }
 
-impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<B> {
+impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         let _have_data = loop {
             let state = self.inner.context_mut();
@@ -520,5 +565,48 @@ mod tests {
         check_reading_file(250_000, 4096, 1024);
         check_reading_file(250_000, 4096, 2048);
         check_reading_file(250_000, 4096, 4096);
+    }
+
+    #[test]
+    fn test_add_file_ref() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp_file, &[0xa, 0xb, 0xc]).unwrap();
+
+        let buf = vec![0; 1024];
+        let mut f = File::open(temp_file.path()).unwrap();
+        {
+            let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+            reader.add_file_ref(&f).unwrap();
+            let mut all_read_data = Vec::new();
+            reader.read_to_end(&mut all_read_data).unwrap();
+            assert_eq!(all_read_data.len(), 3);
+        }
+        let mut all_read_data = Vec::new();
+        f.read_to_end(&mut all_read_data).unwrap();
+        assert_eq!(all_read_data.len(), 3);
+    }
+
+    #[test]
+    fn test_multiple_files() {
+        let mut temp_file1 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp_file1, &[0xa, 0xb, 0xc]).unwrap();
+
+        let mut temp_file2 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp_file2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
+
+        let buf = vec![0; 1024];
+        let f1 = File::open(temp_file1.path()).unwrap();
+        let f2 = File::open(temp_file2.path()).unwrap();
+        let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+        reader.add_file_ref(&f1).unwrap();
+        reader.add_file_ref(&f2).unwrap();
+        let mut all_read_data = Vec::new();
+        reader.read_to_end(&mut all_read_data).unwrap();
+        assert_eq!(all_read_data.len(), 3);
+
+        reader.move_to_next_file();
+        all_read_data.clear();
+        reader.read_to_end(&mut all_read_data).unwrap();
+        assert_eq!(all_read_data.len(), 4);
     }
 }
