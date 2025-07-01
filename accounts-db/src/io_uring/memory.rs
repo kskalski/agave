@@ -180,19 +180,17 @@ impl FixedIoBuffer {
         self.ptr
     }
 
+    pub fn slice_range(&self, pos: usize, limit: &Option<usize>) -> &[u8] {
+        let limit = limit
+            .inspect(|limit| assert!(*limit <= self.size))
+            .unwrap_or(self.size);
+        assert!(pos <= limit);
+        unsafe { slice::from_raw_parts(self.ptr.byte_add(pos), limit - pos) }
+    }
+
     /// The index of the fixed buffer in the ring. See register_buffers().
     pub fn io_buf_index(&self) -> Option<u16> {
         self.io_buf_index
-    }
-
-    /// Return a clone of `self` reduced to specified `size`
-    pub fn into_shrinked(self, size: usize) -> Self {
-        assert!(size <= self.size);
-        Self {
-            ptr: self.ptr,
-            size,
-            io_buf_index: self.io_buf_index,
-        }
     }
 
     /// Registed provided buffer as fixed buffer in `io_uring`.
@@ -215,6 +213,7 @@ impl FixedIoBuffer {
 impl std::fmt::Debug for FixedIoBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IoFixedBuffer")
+            .field("size", &self.size)
             .field("io_buf_index", &self.io_buf_index)
             .finish()
     }
