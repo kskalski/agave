@@ -10,10 +10,12 @@ pub mod test_utils;
 // Used all over the accounts-db crate.  Probably should be minimized.
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
+use crate::io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader};
 #[cfg(feature = "dev-context-only-utils")]
 pub use meta::{AccountMeta, StoredMeta};
 #[cfg(not(feature = "dev-context-only-utils"))]
 use meta::{AccountMeta, StoredMeta};
+
 use {
     crate::{
         account_info::Offset,
@@ -1006,9 +1008,10 @@ impl AppendVec {
     /// as it can potentially read less and be faster.
     pub fn scan_accounts(
         &self,
+        r_reader: &mut SequentialFileReader<LargeBuffer>,
         mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
     ) -> Result<()> {
-        self.scan_accounts_stored_meta(|stored_account_meta| {
+        self.scan_accounts_stored_meta(r_reader, |stored_account_meta| {
             let offset = stored_account_meta.offset();
             let account = StoredAccountInfo {
                 pubkey: stored_account_meta.pubkey(),
@@ -1029,6 +1032,7 @@ impl AppendVec {
     #[allow(clippy::blocks_in_conditions)]
     pub fn scan_accounts_stored_meta(
         &self,
+        _r_reader: &mut SequentialFileReader<LargeBuffer>,
         mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
     ) -> Result<()> {
         match &self.backing {
@@ -1355,6 +1359,13 @@ impl AppendVec {
             AppendVecFileBacking::File(_file) => InternalsForArchive::FileIo(self.path()),
             // note this returns the entire mmap slice, even bytes that we consider invalid
             AppendVecFileBacking::Mmap(mmap) => InternalsForArchive::Mmap(mmap),
+        }
+    }
+
+    pub(crate) fn get_file(&self) -> Option<(&File, usize)> {
+        match &self.backing {
+            AppendVecFileBacking::File(file) => Some((file, self.len())),
+            AppendVecFileBacking::Mmap(_) => None,
         }
     }
 }
@@ -1708,9 +1719,11 @@ pub mod tests {
         let av_file = AppendVec::new_from_file(&path.path, av_mmap.len(), StorageAccess::File)
             .unwrap()
             .0;
+        let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
+
         for av in [&av_mmap, &av_file] {
             let mut index = 0;
-            av.scan_accounts_stored_meta(|v| {
+            av.scan_accounts_stored_meta(&mut r_reader, |v| {
                 let (pubkey, account) = &test_accounts[index];
                 let recovered = v.to_account_shared_data();
                 assert_eq!(&recovered, account);
@@ -1759,7 +1772,9 @@ pub mod tests {
 
         let mut sample = 0;
         let now = Instant::now();
-        av.scan_accounts_stored_meta(|v| {
+        let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
+
+        av.scan_accounts_stored_meta(&mut r_reader, |v| {
             let account = create_test_account(sample + 1);
             let recovered = v.to_account_shared_data();
             assert_eq!(recovered, account.1);
