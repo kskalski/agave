@@ -200,7 +200,7 @@ pub fn large_file_buf_reader(
         let io_uring_reader = SequentialFileReader::with_capacity(buf_size);
         match io_uring_reader {
             Ok(mut reader) => {
-                reader.add_file(file)?;
+                reader.add_file(file, None)?;
                 return Ok(Box::new(reader));
             }
             Err(error) => {

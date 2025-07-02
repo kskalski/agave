@@ -155,9 +155,12 @@ impl IoFixedBuffer {
         self.ptr
     }
 
-    pub fn as_slice(&self, pos: usize, limit: &Option<usize>) -> &[u8] {
-        assert!(pos <= self.size);
-        unsafe { slice::from_raw_parts(self.ptr.byte_add(pos), limit.unwrap_or(self.size) - pos) }
+    pub fn slice_range(&self, pos: usize, limit: &Option<usize>) -> &[u8] {
+        let limit = limit
+            .inspect(|limit| assert!(*limit <= self.size))
+            .unwrap_or(self.size);
+        assert!(pos <= limit);
+        unsafe { slice::from_raw_parts(self.ptr.byte_add(pos), limit - pos) }
     }
 
     /// The index of the fixed buffer in the ring. See register_buffers().
