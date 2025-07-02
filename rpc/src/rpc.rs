@@ -2683,14 +2683,18 @@ fn get_token_program_id_and_mint(
 
 fn _send_transaction(
     meta: JsonRpcRequestProcessor,
+    message_hash: Hash,
     signature: Signature,
+    blockhash: Hash,
     wire_transaction: Vec<u8>,
     last_valid_block_height: u64,
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
     let transaction_info = TransactionInfo::new(
+        message_hash,
         signature,
+        blockhash,
         wire_transaction,
         last_valid_block_height,
         durable_nonce_info,
@@ -3800,6 +3804,7 @@ pub mod rpc_full {
                 Error::internal_error()
             })?;
 
+            let message_hash = transaction.message().hash();
             let signature = if !transaction.signatures.is_empty() {
                 transaction.signatures[0]
             } else {
@@ -3808,7 +3813,9 @@ pub mod rpc_full {
 
             _send_transaction(
                 meta,
+                message_hash,
                 signature,
+                blockhash,
                 wire_transaction,
                 last_valid_block_height,
                 None,
@@ -3854,15 +3861,17 @@ pub mod rpc_full {
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
             )?;
+            let blockhash = *transaction.message().recent_blockhash();
+            let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
 
             let mut last_valid_block_height = preflight_bank
-                .get_blockhash_last_valid_block_height(transaction.message().recent_blockhash())
+                .get_blockhash_last_valid_block_height(&blockhash)
                 .unwrap_or(0);
 
             let durable_nonce_info = transaction
                 .get_durable_nonce()
-                .map(|&pubkey| (pubkey, *transaction.message().recent_blockhash()));
+                .map(|&pubkey| (pubkey, blockhash));
             if durable_nonce_info.is_some() || (skip_preflight && last_valid_block_height == 0) {
                 // While it uses a defined constant, this last_valid_block_height value is chosen arbitrarily.
                 // It provides a fallback timeout for durable-nonce transaction retries in case of
@@ -3915,7 +3924,7 @@ pub mod rpc_full {
                     return Err(RpcCustomError::SendTransactionPreflightFailure {
                         message: format!("Transaction simulation failed: {err}"),
                         result: RpcSimulateTransactionResult {
-                            err: Some(err),
+                            err: Some(err.into()),
                             logs: Some(logs),
                             accounts: None,
                             units_consumed: Some(units_consumed),
@@ -3931,7 +3940,9 @@ pub mod rpc_full {
 
             _send_transaction(
                 meta,
+                message_hash,
                 signature,
+                blockhash,
                 wire_transaction,
                 last_valid_block_height,
                 durable_nonce_info,
@@ -4062,7 +4073,7 @@ pub mod rpc_full {
             Ok(new_response(
                 bank,
                 RpcSimulateTransactionResult {
-                    err: result.err(),
+                    err: result.err().map(Into::into),
                     logs: Some(logs),
                     accounts,
                     units_consumed: Some(units_consumed),
@@ -7265,17 +7276,17 @@ pub mod tests {
                     let meta = meta.unwrap();
                     assert_eq!(
                         meta.err,
-                        Some(TransactionError::InstructionError(
-                            0,
-                            InstructionError::Custom(1)
-                        ))
+                        Some(
+                            TransactionError::InstructionError(0, InstructionError::Custom(1))
+                                .into()
+                        )
                     );
                     assert_eq!(
                         meta.status,
-                        Err(TransactionError::InstructionError(
-                            0,
-                            InstructionError::Custom(1)
-                        ))
+                        Err(
+                            TransactionError::InstructionError(0, InstructionError::Custom(1))
+                                .into()
+                        ),
                     );
                 } else {
                     assert_eq!(meta, None);
@@ -7311,17 +7322,17 @@ pub mod tests {
                     let meta = meta.unwrap();
                     assert_eq!(
                         meta.err,
-                        Some(TransactionError::InstructionError(
-                            0,
-                            InstructionError::Custom(1)
-                        ))
+                        Some(
+                            TransactionError::InstructionError(0, InstructionError::Custom(1))
+                                .into()
+                        )
                     );
                     assert_eq!(
                         meta.status,
-                        Err(TransactionError::InstructionError(
-                            0,
-                            InstructionError::Custom(1)
-                        ))
+                        Err(
+                            TransactionError::InstructionError(0, InstructionError::Custom(1))
+                                .into()
+                        ),
                     );
                 } else {
                     assert_eq!(meta, None);
@@ -8522,7 +8533,7 @@ pub mod tests {
                 },
             ]);
         }
-        assert_eq!(result["result"]["value"]["data"], expected_value);
+        assert_eq!(result["result"]["value"]["data"], expected_value,);
 
         // Test Mint
         let req = format!(

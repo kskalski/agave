@@ -25,13 +25,11 @@ mod serde_snapshot_tests {
             accounts_hash::AccountsHash,
             ancestors::Ancestors,
         },
-        solana_clock::Slot,
+        solana_clock::{Epoch, Slot},
         solana_epoch_schedule::EpochSchedule,
-        solana_genesis_config::{ClusterType, GenesisConfig},
         solana_hash::Hash,
         solana_nohash_hasher::BuildNoHashHasher,
         solana_pubkey::Pubkey,
-        solana_rent_collector::RentCollector,
         std::{
             fs::File,
             io::{self, BufReader, Cursor, Read, Write},
@@ -72,10 +70,6 @@ mod serde_snapshot_tests {
             snapshot_accounts_db_fields,
             account_paths,
             storage_and_next_append_vec_id,
-            &GenesisConfig {
-                cluster_type: ClusterType::Development,
-                ..GenesisConfig::default()
-            },
             None,
             false,
             Some(solana_accounts_db::accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING),
@@ -147,13 +141,12 @@ mod serde_snapshot_tests {
             io::copy(&mut reader, &mut writer)?;
 
             // Read new file into append-vec and build new entry
-            let (accounts_file, num_accounts) =
+            let (accounts_file, _num_accounts) =
                 AccountsFile::new_from_file(output_path, reader.len(), storage_access)?;
             let new_storage_entry = AccountStorageEntry::new_existing(
                 storage_entry.slot(),
                 storage_entry.id(),
                 accounts_file,
-                num_accounts,
             );
             next_append_vec_id = next_append_vec_id.max(new_storage_entry.id());
             storage.insert(new_storage_entry.slot(), Arc::new(new_storage_entry));
@@ -530,12 +523,9 @@ mod serde_snapshot_tests {
 
         let ancestors = Ancestors::default();
         let epoch_schedule = EpochSchedule::default();
-        let rent_collector = RentCollector::default();
-        let config = VerifyAccountsHashAndLamportsConfig::new_for_test(
-            &ancestors,
-            &epoch_schedule,
-            &rent_collector,
-        );
+        let epoch = Epoch::default();
+        let config =
+            VerifyAccountsHashAndLamportsConfig::new_for_test(&ancestors, &epoch_schedule, epoch);
 
         accounts
             .verify_accounts_hash_and_lamports_for_tests(4, 1222, config)
@@ -825,11 +815,11 @@ mod serde_snapshot_tests {
             let no_ancestors = Ancestors::default();
 
             let epoch_schedule = EpochSchedule::default();
-            let rent_collector = RentCollector::default();
+            let epoch = Epoch::default();
             let config = VerifyAccountsHashAndLamportsConfig::new_for_test(
                 &no_ancestors,
                 &epoch_schedule,
-                &rent_collector,
+                epoch,
             );
 
             accounts.update_accounts_hash_for_tests(current_slot, &no_ancestors, false, false);

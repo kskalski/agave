@@ -3,6 +3,7 @@ use {
         admin_rpc_service::{self, load_staked_nodes_overrides, StakedNodesOverrides},
         bootstrap,
         cli::{self},
+        commands::{run::args::RunArgs, FromClapArgMatches},
         ledger_lockfile, lock_ledger,
     },
     clap::{crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, ArgMatches},
@@ -37,7 +38,7 @@ use {
         },
     },
     solana_gossip::{
-        cluster_info::{Node, NodeConfig},
+        cluster_info::{BindIpAddrs, Node, NodeConfig},
         contact_info::ContactInfo,
     },
     solana_hash::Hash,
@@ -60,9 +61,8 @@ use {
     },
     solana_runtime::{
         runtime_config::RuntimeConfig,
-        snapshot_bank_utils::DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
         snapshot_config::{SnapshotConfig, SnapshotUsage},
-        snapshot_utils::{self, ArchiveFormat, SnapshotVersion},
+        snapshot_utils::{self, ArchiveFormat, SnapshotInterval, SnapshotVersion},
     },
     solana_send_transaction_service::send_transaction_service,
     solana_signer::Signer,
@@ -76,7 +76,7 @@ use {
         collections::HashSet,
         fs::{self, File},
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        num::NonZeroUsize,
+        num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         process::exit,
         str::FromStr,
@@ -100,6 +100,8 @@ pub fn execute(
     ledger_path: &Path,
     operation: Operation,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let run_args = RunArgs::from_clap_arg_match(matches)?;
+
     let cli::thread_args::NumThreadConfig {
         accounts_db_clean_threads,
         accounts_db_foreground_threads,
@@ -111,31 +113,22 @@ pub fn execute(
         replay_transactions_threads,
         rocksdb_compaction_threads,
         rocksdb_flush_threads,
+        tpu_transaction_forward_receive_threads,
+        tpu_transaction_receive_threads,
+        tpu_vote_transaction_receive_threads,
         tvu_receive_threads,
         tvu_retransmit_threads,
         tvu_sigverify_threads,
     } = cli::thread_args::parse_num_threads_args(matches);
 
-    let identity_keypair = keypair_of(matches, "identity").unwrap_or_else(|| {
-        clap::Error::with_description(
-            "The --identity <KEYPAIR> argument is required",
-            clap::ErrorKind::ArgumentNotFound,
-        )
-        .exit();
-    });
+    let identity_keypair = Arc::new(run_args.identity_keypair);
 
-    let logfile = {
-        let logfile = matches
-            .value_of("logfile")
-            .map(|s| s.into())
-            .unwrap_or_else(|| format!("agave-validator-{}.log", identity_keypair.pubkey()));
-
-        if logfile == "-" {
-            None
-        } else {
-            println!("log file: {logfile}");
-            Some(logfile)
-        }
+    let logfile = run_args.logfile;
+    let logfile = if logfile == "-" {
+        None
+    } else {
+        println!("log file: {logfile}");
+        Some(logfile)
     };
     let use_progress_bar = logfile.is_none();
     let _logger_thread = redirect_stderr_to_file(logfile);
@@ -303,15 +296,22 @@ pub fn execute(
         "--gossip-validator",
     )?;
 
-    let bind_address = solana_net_utils::parse_host(matches.value_of("bind_address").unwrap())
-        .expect("invalid bind_address");
+    let bind_addresses = {
+        let parsed = matches
+            .values_of("bind_address")
+            .expect("bind_address should always be present due to default")
+            .map(solana_net_utils::parse_host)
+            .collect::<Result<Vec<_>, _>>()?;
+        BindIpAddrs::new(parsed).map_err(|err| format!("invalid bind_addresses: {err}"))?
+    };
+
     let rpc_bind_address = if matches.is_present("rpc_bind_address") {
         solana_net_utils::parse_host(matches.value_of("rpc_bind_address").unwrap())
             .expect("invalid rpc_bind_address")
     } else if private_rpc {
         solana_net_utils::parse_host("127.0.0.1").unwrap()
     } else {
-        bind_address
+        bind_addresses.primary()
     };
 
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
@@ -366,41 +366,13 @@ pub fn execute(
     // version can then be deleted from gossip and get_rpc_node above.
     let expected_shred_version = value_t!(matches, "expected_shred_version", u16)
         .ok()
-        .or_else(|| get_cluster_shred_version(&entrypoint_addrs, bind_address));
+        .or_else(|| get_cluster_shred_version(&entrypoint_addrs, bind_addresses.primary()));
 
+    let tower_path = value_t!(matches, "tower", PathBuf)
+        .ok()
+        .unwrap_or_else(|| ledger_path.clone());
     let tower_storage: Arc<dyn tower_storage::TowerStorage> =
-        match value_t_or_exit!(matches, "tower_storage", String).as_str() {
-            "file" => {
-                let tower_path = value_t!(matches, "tower", PathBuf)
-                    .ok()
-                    .unwrap_or_else(|| ledger_path.clone());
-
-                Arc::new(tower_storage::FileTowerStorage::new(tower_path))
-            }
-            "etcd" => {
-                let endpoints = values_t_or_exit!(matches, "etcd_endpoint", String);
-                let domain_name = value_t_or_exit!(matches, "etcd_domain_name", String);
-                let ca_certificate_file = value_t_or_exit!(matches, "etcd_cacert_file", String);
-                let identity_certificate_file = value_t_or_exit!(matches, "etcd_cert_file", String);
-                let identity_private_key_file = value_t_or_exit!(matches, "etcd_key_file", String);
-
-                let read =
-                    |file| fs::read(&file).map_err(|err| format!("unable to read {file}: {err}"));
-
-                let tls_config = tower_storage::EtcdTlsConfig {
-                    domain_name,
-                    ca_certificate: read(ca_certificate_file)?,
-                    identity_certificate: read(identity_certificate_file)?,
-                    identity_private_key: read(identity_private_key_file)?,
-                };
-
-                Arc::new(
-                    tower_storage::EtcdTowerStorage::new(endpoints, Some(tls_config))
-                        .map_err(|err| format!("failed to connect to etcd: {err}"))?,
-                )
-            }
-            _ => unreachable!(),
-        };
+        Arc::new(tower_storage::FileTowerStorage::new(tower_path));
 
     let mut accounts_index_config = AccountsIndexConfig {
         num_flush_threads: Some(accounts_index_flush_threads),
@@ -523,7 +495,6 @@ pub fn execute(
         )
         .ok(),
         exhaustively_verify_refcounts: matches.is_present("accounts_db_verify_refcounts"),
-        test_skip_rewrites_but_include_in_bank_hash: false,
         storage_access,
         scan_filter_for_shrinking,
         enable_experimental_accumulator_hash: !matches
@@ -641,8 +612,8 @@ pub fn execute(
         new_hard_forks: hardforks_of(matches, "hard_forks"),
         rpc_config: JsonRpcConfig {
             enable_rpc_transaction_history: matches.is_present("enable_rpc_transaction_history"),
-            enable_extended_tx_metadata_storage: matches.is_present("enable_cpi_and_log_storage")
-                || matches.is_present("enable_extended_tx_metadata_storage"),
+            enable_extended_tx_metadata_storage: matches
+                .is_present("enable_extended_tx_metadata_storage"),
             rpc_bigtable_config,
             faucet_addr: matches.value_of("rpc_faucet_addr").map(|address| {
                 solana_net_utils::parse_host_port(address).expect("failed to parse faucet address")
@@ -713,8 +684,7 @@ pub fn execute(
         gossip_validators,
         max_ledger_shreds,
         blockstore_options,
-        run_verification: !(matches.is_present("skip_poh_verify")
-            || matches.is_present("skip_startup_ledger_verification")),
+        run_verification: !matches.is_present("skip_startup_ledger_verification"),
         debug_keys,
         contact_debug_interval,
         send_transaction_service_config: send_transaction_service::Config {
@@ -780,11 +750,6 @@ pub fn execute(
         ..ValidatorConfig::default()
     };
 
-    let available = core_affinity::get_core_ids()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|core_id| core_id.id)
-        .collect::<HashSet<_>>();
     let reserved = validator_config
         .retransmit_xdp
         .as_ref()
@@ -793,8 +758,15 @@ pub fn execute(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
-    let available = available.difference(&reserved);
-    set_cpu_affinity(available.into_iter().copied()).unwrap();
+    if !reserved.is_empty() {
+        let available = core_affinity::get_core_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|core_id| core_id.id)
+            .collect::<HashSet<_>>();
+        let available = available.difference(&reserved);
+        set_cpu_affinity(available.into_iter().copied()).unwrap();
+    }
 
     let vote_account = pubkey_of(matches, "vote_account").unwrap_or_else(|| {
         if !validator_config.voting_disabled {
@@ -933,35 +905,23 @@ pub fn execute(
         .transpose()?
         .unwrap_or(SnapshotVersion::default());
 
-    let (full_snapshot_archive_interval_slots, incremental_snapshot_archive_interval_slots) =
+    let (full_snapshot_archive_interval, incremental_snapshot_archive_interval) =
         if matches.is_present("no_snapshots") {
             // snapshots are disabled
-            (
-                DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
-                DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
-            )
+            (SnapshotInterval::Disabled, SnapshotInterval::Disabled)
         } else {
             match (
                 !matches.is_present("no_incremental_snapshots"),
-                value_t_or_exit!(matches, "snapshot_interval_slots", u64),
+                value_t_or_exit!(matches, "snapshot_interval_slots", NonZeroU64),
             ) {
-                (_, 0) => {
-                    // snapshots are disabled
-                    warn!(
-                        "Snapshot generation was disabled with `--snapshot-interval-slots 0`, \
-                         which is now deprecated. Use `--no-snapshots` instead.",
-                    );
-                    (
-                        DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
-                        DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
-                    )
-                }
                 (true, incremental_snapshot_interval_slots) => {
                     // incremental snapshots are enabled
                     // use --snapshot-interval-slots for the incremental snapshot interval
+                    let full_snapshot_interval_slots =
+                        value_t_or_exit!(matches, "full_snapshot_interval_slots", NonZeroU64);
                     (
-                        value_t_or_exit!(matches, "full_snapshot_interval_slots", u64),
-                        incremental_snapshot_interval_slots,
+                        SnapshotInterval::Slots(full_snapshot_interval_slots),
+                        SnapshotInterval::Slots(incremental_snapshot_interval_slots),
                     )
                 }
                 (false, full_snapshot_interval_slots) => {
@@ -970,27 +930,29 @@ pub fn execute(
                     // also warn if --full-snapshot-interval-slots was specified
                     if matches.occurrences_of("full_snapshot_interval_slots") > 0 {
                         warn!(
-                            "Incremental snapshots are disabled, yet --full-snapshot-interval-slots was specified! \
-                             Note that --full-snapshot-interval-slots is *ignored* when incremental snapshots are disabled. \
+                            "Incremental snapshots are disabled, yet \
+                             --full-snapshot-interval-slots was specified! \
+                             Note that --full-snapshot-interval-slots is *ignored* \
+                             when incremental snapshots are disabled. \
                              Use --snapshot-interval-slots instead.",
                         );
                     }
                     (
-                        full_snapshot_interval_slots,
-                        DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
+                        SnapshotInterval::Slots(full_snapshot_interval_slots),
+                        SnapshotInterval::Disabled,
                     )
                 }
             }
         };
 
     validator_config.snapshot_config = SnapshotConfig {
-        usage: if full_snapshot_archive_interval_slots == DISABLED_SNAPSHOT_ARCHIVE_INTERVAL {
+        usage: if full_snapshot_archive_interval == SnapshotInterval::Disabled {
             SnapshotUsage::LoadOnly
         } else {
             SnapshotUsage::LoadAndGenerate
         },
-        full_snapshot_archive_interval_slots,
-        incremental_snapshot_archive_interval_slots,
+        full_snapshot_archive_interval,
+        incremental_snapshot_archive_interval,
         bank_snapshots_dir,
         full_snapshot_archives_dir: full_snapshot_archives_dir.clone(),
         incremental_snapshot_archives_dir: incremental_snapshot_archives_dir.clone(),
@@ -1003,28 +965,27 @@ pub fn execute(
 
     info!(
         "Snapshot configuration: full snapshot interval: {}, incremental snapshot interval: {}",
-        if full_snapshot_archive_interval_slots == DISABLED_SNAPSHOT_ARCHIVE_INTERVAL {
-            "disabled".to_string()
-        } else {
-            format!("{full_snapshot_archive_interval_slots} slots")
+        match full_snapshot_archive_interval {
+            SnapshotInterval::Disabled => "disabled".to_string(),
+            SnapshotInterval::Slots(interval) => format!("{interval} slots"),
         },
-        if incremental_snapshot_archive_interval_slots == DISABLED_SNAPSHOT_ARCHIVE_INTERVAL {
-            "disabled".to_string()
-        } else {
-            format!("{incremental_snapshot_archive_interval_slots} slots")
+        match incremental_snapshot_archive_interval {
+            SnapshotInterval::Disabled => "disabled".to_string(),
+            SnapshotInterval::Slots(interval) => format!("{interval} slots"),
         },
     );
 
     // It is unlikely that a full snapshot interval greater than an epoch is a good idea.
     // Minimally we should warn the user in case this was a mistake.
-    if full_snapshot_archive_interval_slots > DEFAULT_SLOTS_PER_EPOCH
-        && full_snapshot_archive_interval_slots != DISABLED_SNAPSHOT_ARCHIVE_INTERVAL
-    {
-        warn!(
-            "The full snapshot interval is excessively large: {}! This will negatively \
-            impact the background cleanup tasks in accounts-db. Consider a smaller value.",
-            full_snapshot_archive_interval_slots,
-        );
+    if let SnapshotInterval::Slots(full_snapshot_interval_slots) = full_snapshot_archive_interval {
+        let full_snapshot_interval_slots = full_snapshot_interval_slots.get();
+        if full_snapshot_interval_slots > DEFAULT_SLOTS_PER_EPOCH {
+            warn!(
+                "The full snapshot interval is excessively large: {}! This will negatively \
+                impact the background cleanup tasks in accounts-db. Consider a smaller value.",
+                full_snapshot_interval_slots,
+            );
+        }
     }
 
     if !is_snapshot_config_valid(&validator_config.snapshot_config) {
@@ -1042,6 +1003,17 @@ pub fn execute(
         "block_verification_method",
         BlockVerificationMethod
     );
+    match validator_config.block_verification_method {
+        BlockVerificationMethod::BlockstoreProcessor => {
+            warn!(
+                "The value \"blockstore-processor\" for --block-verification-method has been \
+                deprecated. The value \"blockstore-processor\" is still allowed for now, but \
+                is planned for removal in the near future. To update, either set the value \
+                \"unified-scheduler\" or remove the --block-verification-method argument"
+            );
+        }
+        BlockVerificationMethod::UnifiedScheduler => {}
+    }
     validator_config.block_production_method = value_t_or_exit!(
         matches, // comment to align formatting...
         "block_production_method",
@@ -1109,45 +1081,52 @@ pub fn execute(
         },
     );
 
-    let gossip_host: IpAddr = matches
+    let gossip_host = matches
         .value_of("gossip_host")
         .map(|gossip_host| {
+            warn!("--gossip-host is deprecated. Use --bind-address or rely on automatic public IP discovery instead.");
             solana_net_utils::parse_host(gossip_host)
                 .map_err(|err| format!("failed to parse --gossip-host: {err}"))
         })
-        .transpose()?
-        .or_else(|| {
-            if !entrypoint_addrs.is_empty() {
-                let mut order: Vec<_> = (0..entrypoint_addrs.len()).collect();
-                order.shuffle(&mut thread_rng());
-                // Return once we determine our IP from an entrypoint
-                order.into_iter().find_map(|i| {
-                    let entrypoint_addr = &entrypoint_addrs[i];
-                    info!(
-                        "Contacting {} to determine the validator's public IP address",
-                        entrypoint_addr
-                    );
-                    solana_net_utils::get_public_ip_addr_with_binding(entrypoint_addr, bind_address)
-                        .map_or_else(
-                            |err| {
-                                warn!(
-                                    "Failed to contact cluster entrypoint {entrypoint_addr}: {err}"
-                                );
-                                None
-                            },
-                            Some,
-                        )
-                })
-            } else {
-                Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
-            }
-        })
-        .ok_or_else(|| "unable to determine the validator's public IP address".to_string())?;
+        .transpose()?;
+
+    let advertised_ip = if let Some(ip) = gossip_host {
+        ip
+    } else if !bind_addresses.primary().is_unspecified() && !bind_addresses.primary().is_loopback()
+    {
+        bind_addresses.primary()
+    } else if !entrypoint_addrs.is_empty() {
+        let mut order: Vec<_> = (0..entrypoint_addrs.len()).collect();
+        order.shuffle(&mut thread_rng());
+
+        order
+            .into_iter()
+            .find_map(|i| {
+                let entrypoint_addr = &entrypoint_addrs[i];
+                info!(
+                    "Contacting {} to determine the validator's public IP address",
+                    entrypoint_addr
+                );
+                solana_net_utils::get_public_ip_addr_with_binding(
+                    entrypoint_addr,
+                    bind_addresses.primary(),
+                )
+                .map_or_else(
+                    |err| {
+                        warn!("Failed to contact cluster entrypoint {entrypoint_addr}: {err}");
+                        None
+                    },
+                    Some,
+                )
+            })
+            .ok_or_else(|| "unable to determine the validator's public IP address".to_string())?
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
     let gossip_port = value_t!(matches, "gossip_port", u16).or_else(|_| {
-        solana_net_utils::find_available_port_in_range(bind_address, (0, 1))
+        solana_net_utils::find_available_port_in_range(bind_addresses.primary(), (0, 1))
             .map_err(|err| format!("unable to find an available gossip port: {err}"))
     })?;
-    let gossip_addr = SocketAddr::new(gossip_host, gossip_port);
 
     let public_tpu_addr = matches
         .value_of("public_tpu_addr")
@@ -1165,6 +1144,19 @@ pub fn execute(
         })
         .transpose()?;
 
+    let tpu_vortexor_receiver_address =
+        matches
+            .value_of("tpu_vortexor_receiver_address")
+            .map(|tpu_vortexor_receiver_address| {
+                solana_net_utils::parse_host_port(tpu_vortexor_receiver_address).unwrap_or_else(
+                    |err| {
+                        eprintln!("Failed to parse --tpu-vortexor-receiver-address: {err}");
+                        exit(1);
+                    },
+                )
+            });
+
+    info!("tpu_vortexor_receiver_address is {tpu_vortexor_receiver_address:?}");
     let num_quic_endpoints = value_t_or_exit!(matches, "num_quic_endpoints", NonZeroUsize);
 
     let tpu_max_connections_per_peer =
@@ -1183,14 +1175,16 @@ pub fn execute(
     let max_streams_per_ms = value_t_or_exit!(matches, "tpu_max_streams_per_ms", u64);
 
     let node_config = NodeConfig {
-        gossip_addr,
+        advertised_ip,
+        gossip_port,
         port_range: dynamic_port_range,
-        bind_ip_addr: bind_address,
+        bind_ip_addrs: bind_addresses,
         public_tpu_addr,
         public_tpu_forwards_addr,
         num_tvu_receive_sockets: tvu_receive_threads,
         num_tvu_retransmit_sockets: tvu_retransmit_threads,
         num_quic_endpoints,
+        vortexor_receiver_addr: tpu_vortexor_receiver_address,
     };
 
     let cluster_entrypoints = entrypoint_addrs
@@ -1246,8 +1240,6 @@ pub fn execute(
     snapshot_utils::remove_tmp_snapshot_archives(&full_snapshot_archives_dir);
     snapshot_utils::remove_tmp_snapshot_archives(&incremental_snapshot_archives_dir);
 
-    let identity_keypair = Arc::new(identity_keypair);
-
     let should_check_duplicate_instance = true;
     if !cluster_entrypoints.is_empty() {
         bootstrap::rpc_bootstrap(
@@ -1292,6 +1284,7 @@ pub fn execute(
         max_streams_per_ms,
         max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
         coalesce: tpu_coalesce,
+        num_threads: tpu_transaction_receive_threads,
         ..Default::default()
     };
 
@@ -1302,6 +1295,7 @@ pub fn execute(
         max_streams_per_ms,
         max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
         coalesce: tpu_coalesce,
+        num_threads: tpu_transaction_forward_receive_threads,
         ..Default::default()
     };
 
@@ -1310,6 +1304,7 @@ pub fn execute(
     let mut vote_quic_server_config = tpu_fwd_quic_server_config.clone();
     vote_quic_server_config.max_connections_per_peer = 1;
     vote_quic_server_config.max_unstaked_connections = 0;
+    vote_quic_server_config.num_threads = tpu_vote_transaction_receive_threads;
 
     let validator = match Validator::new(
         node,

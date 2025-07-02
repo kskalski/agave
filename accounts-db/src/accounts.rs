@@ -623,7 +623,7 @@ impl Accounts {
     }
 
     pub fn store_accounts_cached<'a>(&self, accounts: impl StorableAccounts<'a>) {
-        self.accounts_db.store_cached(accounts, None)
+        self.accounts_db.store_cached(accounts)
     }
 
     /// Add a slot to root.  Root slots cannot be purged
@@ -1240,7 +1240,6 @@ mod tests {
     }
 
     impl Accounts {
-        /// callers used to call store_uncached. But, this is not allowed anymore.
         pub fn store_for_tests(&self, slot: Slot, pubkey: &Pubkey, account: &AccountSharedData) {
             self.accounts_db.store_for_tests(slot, &[(pubkey, account)])
         }

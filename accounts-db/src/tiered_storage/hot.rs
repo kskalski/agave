@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        account_info::AccountInfo,
+        account_info::{AccountInfo, Offset},
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_file::{MatchAccountOwnerError, StoredAccountsInfo},
         append_vec::{IndexInfo, IndexInfoInner},
@@ -644,27 +644,39 @@ impl HotStorageReader {
 
     /// Iterate over all accounts and call `callback` with each account.
     ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfoWithoutData: the account itself, without account data
+    ///
     /// Note that account data is not read/passed to the callback.
     pub fn scan_accounts_without_data(
         &self,
-        mut callback: impl for<'local> FnMut(StoredAccountInfoWithoutData<'local>),
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
     ) -> TieredStorageResult<()> {
         for i in 0..self.footer.account_entry_count {
-            self.get_stored_account_without_data_callback(IndexOffset(i), &mut callback)?;
+            self.get_stored_account_without_data_callback(IndexOffset(i), |account| {
+                callback(AccountInfo::reduced_offset_to_offset(i), account)
+            })?;
         }
         Ok(())
     }
 
     /// Iterate over all accounts and call `callback` with each account.
     ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfo: the account itself, with account data
+    ///
     /// Prefer scan_accounts_without_data() when account data is not needed,
     /// as it can potentially read less and be faster.
     pub fn scan_accounts(
         &self,
-        mut callback: impl for<'local> FnMut(StoredAccountInfo<'local>),
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
     ) -> TieredStorageResult<()> {
         for i in 0..self.footer.account_entry_count {
-            self.get_stored_account_callback(IndexOffset(i), &mut callback)?;
+            self.get_stored_account_callback(IndexOffset(i), |account| {
+                callback(AccountInfo::reduced_offset_to_offset(i), account)
+            })?;
         }
         Ok(())
     }
@@ -690,8 +702,6 @@ impl HotStorageReader {
                         lamports,
                         offset: AccountInfo::reduced_offset_to_offset(i),
                         data_len: data_len as u64,
-                        executable: meta.flags().executable(),
-                        rent_epoch: meta.final_rent_epoch(account_block),
                     }
                 },
                 stored_size_aligned: stored_size(data_len),
@@ -1676,7 +1686,7 @@ mod tests {
         // verify everything
         let mut i = 0;
         hot_storage
-            .scan_accounts(|stored_account| {
+            .scan_accounts(|_offset, stored_account| {
                 storable_accounts.account_default_if_zero_lamport(i, |account| {
                     verify_test_account(
                         &stored_account,

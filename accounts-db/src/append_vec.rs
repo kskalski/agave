@@ -16,6 +16,7 @@ pub use meta::{AccountMeta, StoredMeta};
 use meta::{AccountMeta, StoredMeta};
 use {
     crate::{
+        account_info::Offset,
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_file::{
             AccountsFileError, InternalsForArchive, MatchAccountOwnerError, Result, StorageAccess,
@@ -32,7 +33,6 @@ use {
     memmap2::MmapMut,
     meta::StoredAccountNoData,
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
-    solana_clock::Epoch,
     solana_hash::Hash,
     solana_pubkey::Pubkey,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
@@ -99,6 +99,9 @@ pub enum AppendVecError {
 
     #[error("offset ({0}) is larger than file size ({1})")]
     OffsetOutOfBounds(usize, usize),
+
+    #[error("file size ({2}) and current length ({1}) do not match for '{0}'")]
+    SizeMismatch(PathBuf, usize, u64),
 }
 
 /// A slice whose contents are known to be valid.
@@ -139,8 +142,6 @@ pub(crate) struct IndexInfoInner {
     pub offset: usize,
     pub pubkey: Pubkey,
     pub lamports: u64,
-    pub rent_epoch: Epoch,
-    pub executable: bool,
     pub data_len: u64,
 }
 
@@ -441,6 +442,35 @@ impl AppendVec {
         }
 
         Ok((new, num_accounts))
+    }
+
+    /// Creates a new AppendVec for the underlying storage at `path`
+    ///
+    /// This version of `new()` may only be called when reconstructing storages as part of startup.
+    /// It trusts the snapshot's value for `current_len`, and relies on later index generation or
+    /// accounts verification to ensure it is valid.
+    pub fn new_for_startup(
+        path: impl Into<PathBuf>,
+        current_len: usize,
+        storage_access: StorageAccess,
+    ) -> Result<Self> {
+        let new = Self::new_from_file_unchecked(path, current_len, storage_access)?;
+
+        // The current_len is allowed to be either exactly the same as file_size, or
+        // u64-aligned-equivalent to file_size.  This is because `flush` and `shink` compute the
+        // required file size with *aligned* stored size per account, including the very last
+        // account.  So the file size may have padding to the next u64-alignment.
+        // For our usage, this is still safe as these padding bytes could never be used for an
+        // account.  This renders the `get_` and `scan_` functions safe.
+        if (current_len as u64 == new.file_size)
+            || (u64_align!(current_len) as u64 == new.file_size)
+        {
+            Ok(new)
+        } else {
+            Err(AccountsFileError::AppendVecError(
+                AppendVecError::SizeMismatch(new.path.clone(), current_len, new.file_size),
+            ))
+        }
     }
 
     /// Creates an appendvec from file without performing sanitize checks or counting the number of accounts
@@ -953,8 +983,6 @@ impl AppendVec {
                     lamports: account.lamports(),
                     offset: account.offset(),
                     data_len: account.data_len(),
-                    executable: account.executable(),
-                    rent_epoch: account.rent_epoch(),
                 },
             });
         });
@@ -962,12 +990,17 @@ impl AppendVec {
 
     /// Iterate over all accounts and call `callback` with each account.
     ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfoWithoutData: the account itself, without account data
+    ///
     /// Note that account data is not read/passed to the callback.
     pub fn scan_accounts_without_data(
         &self,
-        mut callback: impl for<'local> FnMut(StoredAccountInfoWithoutData<'local>),
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
     ) {
         self.scan_stored_accounts_no_data(|stored_account| {
+            let offset = stored_account.offset();
             let account = StoredAccountInfoWithoutData {
                 pubkey: stored_account.pubkey(),
                 lamports: stored_account.lamports(),
@@ -976,16 +1009,24 @@ impl AppendVec {
                 executable: stored_account.executable(),
                 rent_epoch: stored_account.rent_epoch(),
             };
-            callback(account);
+            callback(offset, account);
         })
     }
 
     /// Iterate over all accounts and call `callback` with each account.
     ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfo: the account itself, with account data
+    ///
     /// Prefer scan_accounts_without_data() when account data is not needed,
     /// as it can potentially read less and be faster.
-    pub fn scan_accounts(&self, mut callback: impl for<'local> FnMut(StoredAccountInfo<'local>)) {
+    pub fn scan_accounts(
+        &self,
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
+    ) {
         self.scan_accounts_stored_meta(|stored_account_meta| {
+            let offset = stored_account_meta.offset();
             let account = StoredAccountInfo {
                 pubkey: stored_account_meta.pubkey(),
                 lamports: stored_account_meta.lamports(),
@@ -994,7 +1035,7 @@ impl AppendVec {
                 executable: stored_account_meta.executable(),
                 rent_epoch: stored_account_meta.rent_epoch(),
             };
-            callback(account);
+            callback(offset, account);
         })
     }
 
@@ -2255,8 +2296,6 @@ pub mod tests {
                     assert_eq!(index_info.index_info.offset, *offset);
                     assert_eq!(index_info.index_info.pubkey, *pubkey);
                     assert_eq!(index_info.index_info.lamports, account.lamports());
-                    assert_eq!(index_info.index_info.rent_epoch, account.rent_epoch());
-                    assert_eq!(index_info.index_info.executable, account.executable());
                     assert_eq!(index_info.index_info.data_len, account.data().len() as u64);
 
                     i += 1;

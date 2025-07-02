@@ -1,11 +1,15 @@
 use {
-    crate::cli::{hash_validator, port_range_validator, port_validator, DefaultArgs},
-    clap::{App, Arg},
+    crate::{
+        cli::{hash_validator, port_range_validator, port_validator, DefaultArgs},
+        commands::{FromClapArgMatches, Result},
+    },
+    clap::{App, Arg, ArgMatches},
     solana_clap_utils::{
         hidden_unless_forced,
+        input_parsers::keypair_of,
         input_validators::{
-            is_keypair_or_ask_keyword, is_parsable, is_pow2, is_pubkey, is_pubkey_or_keypair,
-            is_slot, is_within_range, validate_cpu_ranges,
+            is_keypair_or_ask_keyword, is_non_zero, is_parsable, is_pow2, is_pubkey,
+            is_pubkey_or_keypair, is_slot, is_within_range, validate_cpu_ranges,
             validate_maximum_full_snapshot_archives_to_retain,
             validate_maximum_incremental_snapshot_archives_to_retain,
         },
@@ -15,17 +19,45 @@ use {
         banking_trace::DirByteLimit,
         validator::{BlockProductionMethod, BlockVerificationMethod, TransactionStructure},
     },
+    solana_keypair::Keypair,
     solana_ledger::use_snapshot_archives_at_startup,
     solana_runtime::snapshot_utils::{SnapshotVersion, SUPPORTED_ARCHIVE_COMPRESSION},
     solana_send_transaction_service::send_transaction_service::{
         MAX_BATCH_SEND_RATE_MS, MAX_TRANSACTION_BATCH_SIZE,
     },
+    solana_signer::Signer,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::str::FromStr,
 };
 
 const EXCLUDE_KEY: &str = "account-index-exclude-key";
 const INCLUDE_KEY: &str = "account-index-include-key";
+
+#[derive(Debug, PartialEq)]
+pub struct RunArgs {
+    pub identity_keypair: Keypair,
+    pub logfile: String,
+}
+
+impl FromClapArgMatches for RunArgs {
+    fn from_clap_arg_match(matches: &ArgMatches) -> Result<Self> {
+        let identity_keypair =
+            keypair_of(matches, "identity").ok_or(clap::Error::with_description(
+                "The --identity <KEYPAIR> argument is required",
+                clap::ErrorKind::ArgumentNotFound,
+            ))?;
+
+        let logfile = matches
+            .value_of("logfile")
+            .map(|s| s.into())
+            .unwrap_or_else(|| format!("agave-validator-{}.log", identity_keypair.pubkey()));
+
+        Ok(RunArgs {
+            identity_keypair,
+            logfile,
+        })
+    }
+}
 
 pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 'a> {
     app
@@ -126,7 +158,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .value_name("RPC_URL")
             .requires("entrypoint")
-            .conflicts_with_all(&["no_check_vote_account", "no_voting"])
+            .conflicts_with_all(&["no_voting"])
             .help(
                 "Sanity check vote account state at startup. The JSON RPC endpoint at RPC_URL \
                  must expose `--full-rpc-api`",
@@ -162,7 +194,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
     .arg(
         Arg::with_name("full_rpc_api")
             .long("full-rpc-api")
-            .conflicts_with("minimal_rpc_api")
             .takes_value(false)
             .help("Expose RPC methods for querying chain state and transaction history"),
     )
@@ -350,10 +381,8 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("HOST")
             .takes_value(true)
             .validator(solana_net_utils::is_host)
-            .help(
-                "Gossip DNS name or IP address for the validator to advertise in gossip \
-                 [default: ask --entrypoint, or 127.0.0.1 when --entrypoint is not provided]",
-            ),
+            .hidden(hidden_unless_forced())
+            .help("DEPRECATED: Use --bind-address instead."),
     )
     .arg(
         Arg::with_name("public_tpu_addr")
@@ -377,6 +406,15 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "Specify TPU Forwards address to advertise in gossip [default: ask \
                  --entrypoint or localhostwhen --entrypoint is not provided]",
             ),
+    )
+    .arg(
+        Arg::with_name("tpu_vortexor_receiver_address")
+            .long("tpu-vortexor-receiver-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .hidden(hidden_unless_forced())
+            .validator(solana_net_utils::is_host_port)
+            .help("TPU Vortexor Receiver address to which verified transaction packet will be forwarded."),
     )
     .arg(
         Arg::with_name("public_rpc_addr")
@@ -431,12 +469,13 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("NUMBER")
             .takes_value(true)
             .default_value(&default_args.incremental_snapshot_archive_interval_slots)
+            .validator(is_non_zero)
             .help("Number of slots between generating snapshots")
             .long_help(
                 "Number of slots between generating snapshots. \
                  If incremental snapshots are enabled, this sets the incremental snapshot interval. \
                  If incremental snapshots are disabled, this sets the full snapshot interval. \
-                 To disable all snapshot generation, see --no-snapshots.",
+                 Must be greater than zero.",
             ),
     )
     .arg(
@@ -445,10 +484,13 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("NUMBER")
             .takes_value(true)
             .default_value(&default_args.full_snapshot_archive_interval_slots)
+            .validator(is_non_zero)
             .help("Number of slots between generating full snapshots")
             .long_help(
-                "Number of slots between generating full snapshots. Must be a multiple of the \
-                 incremental snapshot interval. Only used when incremental snapshots are enabled.",
+                "Number of slots between generating full snapshots. \
+                 Only used when incremental snapshots are enabled. \
+                 Must be greater than the incremental snapshot interval. \
+                 Must be greater than zero.",
             ),
     )
     .arg(
@@ -904,8 +946,9 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .validator(solana_net_utils::is_host)
             .default_value(&default_args.bind_address)
-            .help("IP address to bind the validator ports"),
-    )
+            .multiple(true)
+            .help("Repeatable. IP addresses to bind the validator ports on. First is primary (used on startup), the rest may be switched to during operation."),
+        )
     .arg(
         Arg::with_name("rpc_bind_address")
             .long("rpc-bind-address")
@@ -1663,4 +1706,140 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 tpu-client-next is used by default.",
             ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl Default for RunArgs {
+        fn default() -> Self {
+            let identity_keypair = Keypair::new();
+            let logfile = format!("agave-validator-{}.log", identity_keypair.pubkey());
+
+            RunArgs {
+                identity_keypair,
+                logfile,
+            }
+        }
+    }
+
+    impl Clone for RunArgs {
+        fn clone(&self) -> Self {
+            RunArgs {
+                identity_keypair: self.identity_keypair.insecure_clone(),
+                logfile: self.logfile.clone(),
+            }
+        }
+    }
+
+    fn verify_args_struct_by_command(
+        default_args: &DefaultArgs,
+        args: Vec<&str>,
+        expected_args: RunArgs,
+    ) {
+        crate::commands::tests::verify_args_struct_by_command::<RunArgs>(
+            add_args(App::new("run_command"), default_args),
+            [&["run_command"], &args[..]].concat(),
+            expected_args,
+        );
+    }
+
+    #[test]
+    fn verify_args_struct_by_command_run_with_identity() {
+        let default_args = DefaultArgs::default();
+        let default_run_args = RunArgs::default();
+
+        // generate a keypair
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file = tmp_dir.path().join("id.json");
+        let keypair = default_run_args.identity_keypair.insecure_clone();
+        solana_keypair::write_keypair_file(&keypair, &file).unwrap();
+
+        let expected_args = RunArgs {
+            identity_keypair: keypair.insecure_clone(),
+            ..default_run_args
+        };
+
+        // short arg
+        {
+            verify_args_struct_by_command(
+                &default_args,
+                vec!["-i", file.to_str().unwrap()],
+                expected_args.clone(),
+            );
+        }
+
+        // long arg
+        {
+            verify_args_struct_by_command(
+                &default_args,
+                vec!["--identity", file.to_str().unwrap()],
+                expected_args.clone(),
+            );
+        }
+    }
+
+    fn verify_args_struct_by_command_run_with_identity_setup(
+        default_run_args: RunArgs,
+        args: Vec<&str>,
+        expected_args: RunArgs,
+    ) {
+        let default_args = DefaultArgs::default();
+
+        // generate a keypair
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file = tmp_dir.path().join("id.json");
+        let keypair = default_run_args.identity_keypair.insecure_clone();
+        solana_keypair::write_keypair_file(&keypair, &file).unwrap();
+
+        let args = [&["--identity", file.to_str().unwrap()], &args[..]].concat();
+        verify_args_struct_by_command(&default_args, args, expected_args);
+    }
+
+    #[test]
+    fn verify_args_struct_by_command_run_with_log() {
+        let default_run_args = RunArgs::default();
+
+        // default
+        {
+            let expected_args = RunArgs {
+                logfile: "agave-validator-".to_string()
+                    + &default_run_args.identity_keypair.pubkey().to_string()
+                    + ".log",
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args.clone(),
+                vec![],
+                expected_args,
+            );
+        }
+
+        // short arg
+        {
+            let expected_args = RunArgs {
+                logfile: "-".to_string(),
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args.clone(),
+                vec!["-o", "-"],
+                expected_args,
+            );
+        }
+
+        // long arg
+        {
+            let expected_args = RunArgs {
+                logfile: "custom_log.log".to_string(),
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args.clone(),
+                vec!["--log", "custom_log.log"],
+                expected_args,
+            );
+        }
+    }
 }

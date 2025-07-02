@@ -1,16 +1,18 @@
 use {
-    bzip2::bufread::BzDecoder,
+    crate::file_io::FilesCreator,
+    crossbeam_channel::Sender,
     log::*,
     rand::{thread_rng, Rng},
     solana_genesis_config::{GenesisConfig, DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE},
     std::{
         collections::HashMap,
         fs::{self, File},
-        io::{BufReader, Read},
+        io::{self, Read},
         path::{
             Component::{self, CurDir, Normal},
             Path, PathBuf,
         },
+        sync::Arc,
         time::Instant,
     },
     tar::{
@@ -44,6 +46,10 @@ const MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE: u64 = 4 * 1024 * 1024 * 1024 * 
 const MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT: u64 = 5_000_000;
 pub const MAX_GENESIS_ARCHIVE_UNPACKED_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
 const MAX_GENESIS_ARCHIVE_UNPACKED_COUNT: u64 = 100;
+
+// The buffer should be relatively large to accomodate for small files (each use up at least
+// one write-capacity sized chunk (1MB)) and write backlog waiting for file open to finish.
+const UNPACK_WRITE_BUF_SIZE: usize = 512 * 1024 * 1024;
 
 fn checked_total_size_sum(total_size: u64, entry_size: u64, limit_size: u64) -> Result<u64> {
     trace!(
@@ -86,25 +92,30 @@ pub enum UnpackPath<'a> {
 }
 
 fn unpack_archive<'a, A, C, D>(
-    archive: &mut Archive<A>,
+    mut archive: Archive<A>,
     apparent_limit_size: u64,
     actual_limit_size: u64,
     limit_count: u64,
-    mut entry_checker: C, // checks if entry is valid
-    entry_processor: D,   // processes entry after setting permissions
+    mut entry_checker: C,   // checks if entry is valid
+    file_path_processor: D, // processes file paths after writing
 ) -> Result<()>
 where
     A: Read,
     C: FnMut(&[&str], tar::EntryType) -> UnpackPath<'a>,
-    D: Fn(PathBuf),
+    D: FnMut(PathBuf),
 {
     let mut apparent_total_size: u64 = 0;
     let mut actual_total_size: u64 = 0;
     let mut total_count: u64 = 0;
 
     let mut total_entries = 0;
+    let mut open_dirs = Vec::new();
+
+    let mut files_creator =
+        crate::file_io::files_creator(file_path_processor, UNPACK_WRITE_BUF_SIZE)?;
+
     for entry in archive.entries()? {
-        let mut entry = entry?;
+        let entry = entry?;
         let path = entry.path()?;
         let path_str = path.display().to_string();
 
@@ -167,35 +178,63 @@ where
             // account_paths returned by `entry_checker`. We want to unpack into
             // account_path/<account> instead of account_path/accounts/<account> so we strip the
             // accounts/ prefix.
-            sanitize_path(&account, unpack_dir)
+            sanitize_path_and_open_dir(&account, unpack_dir, &mut open_dirs)
         } else {
-            sanitize_path(&path, unpack_dir)
+            sanitize_path_and_open_dir(&path, unpack_dir, &mut open_dirs)
         }?; // ? handles file system errors
-        let Some(entry_path) = entry_path else {
+        let Some((entry_path, open_dir)) = entry_path else {
             continue; // skip it
         };
 
-        let unpack = entry.unpack(&entry_path);
-        check_unpack_result(unpack.map(|_unpack| true)?, path_str)?;
-
-        // Sanitize permissions.
-        let mode = match entry.header().entry_type() {
-            GNUSparse | Regular => 0o644,
-            _ => 0o755,
-        };
-        set_perms(&entry_path, mode)?;
-
-        // Process entry after setting permissions
-        entry_processor(entry_path);
+        let unpack = unpack_entry(&mut files_creator, entry, entry_path, open_dir);
+        check_unpack_result(unpack.map(|_unpack| true)?, path_str).unwrap();
 
         total_entries += 1;
     }
+    files_creator.drain()?;
+    drop(open_dirs);
+
     info!("unpacked {} entries total", total_entries);
 
-    return Ok(());
+    Ok(())
+}
+
+fn unpack_entry<'a, R: Read>(
+    files_creator: &mut Box<dyn FilesCreator + 'a>,
+    mut entry: tar::Entry<'_, R>,
+    dst: PathBuf,
+    dst_open_dir: Arc<File>,
+) -> Result<tar::Unpacked> {
+    let mode = match entry.header().entry_type() {
+        GNUSparse | Regular => 0o644,
+        _ => 0o755,
+    };
+    match entry.header().entry_type() {
+        tar::EntryType::Directory
+        | tar::EntryType::Link
+        | tar::EntryType::Symlink
+        | tar::EntryType::GNULongName
+        | tar::EntryType::GNULongLink => {
+            let unpacked = entry.unpack(&dst)?;
+            // Sanitize permissions.
+            set_perms(&dst, mode)?;
+
+            if !entry.header().entry_type().is_dir() {
+                // Process file after setting permissions
+                files_creator.on_written(dst);
+            }
+
+            return Ok(unpacked);
+        }
+        _ => (),
+    }
+
+    files_creator.schedule_create_with_dir(dst, mode, dst_open_dir, &mut entry)?;
+
+    return Ok(tar::Unpacked::__Nonexhaustive);
 
     #[cfg(unix)]
-    fn set_perms(dst: &Path, mode: u32) -> std::io::Result<()> {
+    fn set_perms(dst: &Path, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let perm = fs::Permissions::from_mode(mode as _);
@@ -203,25 +242,24 @@ where
     }
 
     #[cfg(windows)]
-    fn set_perms(dst: &Path, _mode: u32) -> std::io::Result<()> {
-        let mut perm = fs::metadata(dst)?.permissions();
-        // This is OK for Windows, but clippy doesn't realize we're doing this
-        // only on Windows.
-        #[allow(clippy::permissions_set_readonly_false)]
-        perm.set_readonly(false);
-        fs::set_permissions(dst, perm)
+    fn set_perms(dst: &Path, _mode: u32) -> io::Result<()> {
+        super::file_io::set_file_readonly(dst, false)
     }
 }
 
 // return Err on file system error
-// return Some(path) if path is good
+// return Some((path, open_dir)) if path is good
 // return None if we should skip this file
-fn sanitize_path(entry_path: &Path, dst: &Path) -> Result<Option<PathBuf>> {
+fn sanitize_path_and_open_dir(
+    entry_path: &Path,
+    dst: &Path,
+    open_dirs: &mut Vec<(PathBuf, Arc<File>)>,
+) -> Result<Option<(PathBuf, Arc<File>)>> {
     // We cannot call unpack_in because it errors if we try to use 2 account paths.
     // So, this code is borrowed from unpack_in
     // ref: https://docs.rs/tar/*/tar/struct.Entry.html#method.unpack_in
     let mut file_dst = dst.to_path_buf();
-    const SKIP: Result<Option<PathBuf>> = Ok(None);
+    const SKIP: Result<Option<(PathBuf, Arc<File>)>> = Ok(None);
     {
         let path = entry_path;
         for part in path.components() {
@@ -253,14 +291,22 @@ fn sanitize_path(entry_path: &Path, dst: &Path) -> Result<Option<PathBuf>> {
         return SKIP;
     };
 
-    fs::create_dir_all(parent)?;
+    let open_dst_dir = match open_dirs.binary_search_by(|(key, _)| parent.cmp(key)) {
+        Err(insert_at) => {
+            fs::create_dir_all(parent)?;
 
-    // Here we are different than untar_in. The code for tar::unpack_in internally calling unpack is a little different.
-    // ignore return value here
-    validate_inside_dst(dst, parent)?;
-    let target = parent.join(entry_path.file_name().unwrap());
+            // Here we are different than untar_in. The code for tar::unpack_in internally calling unpack is a little different.
+            // ignore return value here
+            validate_inside_dst(dst, parent)?;
 
-    Ok(Some(target))
+            let opened_dir = Arc::new(File::open(parent)?);
+            open_dirs.insert(insert_at, (parent.to_path_buf(), opened_dir.clone()));
+            opened_dir
+        }
+        Ok(index) => open_dirs[index].1.clone(),
+    };
+
+    Ok(Some((file_dst, open_dst_dir)))
 }
 
 // copied from:
@@ -289,32 +335,17 @@ fn validate_inside_dst(dst: &Path, file_dst: &Path) -> Result<PathBuf> {
 /// Map from AppendVec file name to unpacked file system location
 pub type UnpackedAppendVecMap = HashMap<String, PathBuf>;
 
-// select/choose only 'index' out of each # of 'divisions' of total items.
-pub struct ParallelSelector {
-    pub index: usize,
-    pub divisions: usize,
-}
-
-impl ParallelSelector {
-    pub fn select_index(&self, index: usize) -> bool {
-        index % self.divisions == self.index
-    }
-}
-
 /// Unpacks snapshot and collects AppendVec file names & paths
 pub fn unpack_snapshot<A: Read>(
-    archive: &mut Archive<A>,
+    archive: Archive<A>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
-    parallel_selector: Option<ParallelSelector>,
 ) -> Result<UnpackedAppendVecMap> {
     let mut unpacked_append_vec_map = UnpackedAppendVecMap::new();
-
     unpack_snapshot_with_processors(
         archive,
         ledger_dir,
         account_paths,
-        parallel_selector,
         |file, path| {
             unpacked_append_vec_map.insert(file.to_string(), path.join("accounts").join(file));
         },
@@ -323,49 +354,44 @@ pub fn unpack_snapshot<A: Read>(
     .map(|_| unpacked_append_vec_map)
 }
 
-/// Unpacks snapshots and sends entry file paths through the `sender` channel
+/// Unpacks snapshot from (potentially partial) `archive` and
+/// sends entry file paths through the `sender` channel
 pub fn streaming_unpack_snapshot<A: Read>(
-    archive: &mut Archive<A>,
+    archive: Archive<A>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
-    parallel_selector: Option<ParallelSelector>,
-    sender: &crossbeam_channel::Sender<PathBuf>,
+    sender: &Sender<PathBuf>,
 ) -> Result<()> {
     unpack_snapshot_with_processors(
         archive,
         ledger_dir,
         account_paths,
-        parallel_selector,
         |_, _| {},
-        |entry_path_buf| {
-            if entry_path_buf.is_file() {
-                let result = sender.send(entry_path_buf);
-                if let Err(err) = result {
-                    panic!(
-                        "failed to send path '{}' from unpacker to rebuilder: {err}",
-                        err.0.display(),
-                    );
-                }
+        |file_path| {
+            let result = sender.send(file_path);
+            if let Err(err) = result {
+                panic!(
+                    "failed to send path '{}' from unpacker to rebuilder: {err}",
+                    err.0.display(),
+                );
             }
         },
     )
 }
 
 fn unpack_snapshot_with_processors<A, F, G>(
-    archive: &mut Archive<A>,
+    archive: Archive<A>,
     ledger_dir: &Path,
     account_paths: &[PathBuf],
-    parallel_selector: Option<ParallelSelector>,
     mut accounts_path_processor: F,
-    entry_processor: G,
+    file_path_processor: G,
 ) -> Result<()>
 where
     A: Read,
     F: FnMut(&str, &Path),
-    G: Fn(PathBuf),
+    G: FnMut(PathBuf),
 {
     assert!(!account_paths.is_empty());
-    let mut i = 0;
 
     unpack_archive(
         archive,
@@ -374,12 +400,6 @@ where
         MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT,
         |parts, kind| {
             if is_valid_snapshot_archive_entry(parts, kind) {
-                i += 1;
-                if let Some(parallel_selector) = &parallel_selector {
-                    if !parallel_selector.select_index(i - 1) {
-                        return UnpackPath::Ignore;
-                    }
-                };
                 if let ["accounts", file] = parts {
                     // Randomly distribute the accounts files about the available `account_paths`,
                     let path_index = thread_rng().gen_range(0..account_paths.len());
@@ -400,7 +420,7 @@ where
                 UnpackPath::Invalid
             }
         },
-        entry_processor,
+        file_path_processor,
     )
 }
 
@@ -494,13 +514,9 @@ pub fn unpack_genesis_archive(
 
     fs::create_dir_all(destination_dir)?;
     let tar_bz2 = File::open(archive_filename)?;
-    let tar = BzDecoder::new(BufReader::new(tar_bz2));
-    let mut archive = Archive::new(tar);
-    unpack_genesis(
-        &mut archive,
-        destination_dir,
-        max_genesis_archive_unpacked_size,
-    )?;
+    let tar = bzip2::read::BzDecoder::new(tar_bz2);
+    let archive = Archive::new(tar);
+    unpack_genesis(archive, destination_dir, max_genesis_archive_unpacked_size)?;
     info!(
         "Extracted {:?} in {:?}",
         archive_filename,
@@ -510,7 +526,7 @@ pub fn unpack_genesis_archive(
 }
 
 fn unpack_genesis<A: Read>(
-    archive: &mut Archive<A>,
+    archive: Archive<A>,
     unpack_dir: &Path,
     max_genesis_archive_unpacked_size: u64,
 ) -> Result<()> {
@@ -549,6 +565,7 @@ mod tests {
     use {
         super::*,
         assert_matches::assert_matches,
+        std::io::BufReader,
         tar::{Builder, Header},
     };
 
@@ -778,14 +795,14 @@ mod tests {
 
     fn with_finalize_and_unpack<C>(archive: tar::Builder<Vec<u8>>, checker: C) -> Result<()>
     where
-        C: Fn(&mut Archive<BufReader<&[u8]>>, &Path) -> Result<()>,
+        C: Fn(Archive<BufReader<&[u8]>>, &Path) -> Result<()>,
     {
         let data = archive.into_inner().unwrap();
         let reader = BufReader::new(&data[..]);
-        let mut archive: Archive<std::io::BufReader<&[u8]>> = Archive::new(reader);
+        let archive: Archive<BufReader<&[u8]>> = Archive::new(reader);
         let temp_dir = tempfile::TempDir::new().unwrap();
 
-        checker(&mut archive, temp_dir.path())?;
+        checker(archive, temp_dir.path())?;
         // Check that there is no bad permissions preventing deletion.
         let result = temp_dir.close();
         assert_matches!(result, Ok(()));
@@ -794,7 +811,7 @@ mod tests {
 
     fn finalize_and_unpack_snapshot(archive: tar::Builder<Vec<u8>>) -> Result<()> {
         with_finalize_and_unpack(archive, |a, b| {
-            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], None, |_, _| {}, |_| {})
+            unpack_snapshot_with_processors(a, b, &[PathBuf::new()], |_, _| {}, |_| {}).map(|_| ())
         })
     }
 
@@ -936,7 +953,7 @@ mod tests {
 
         let mut archive = Builder::new(Vec::new());
         archive.append(&header, data).unwrap();
-        with_finalize_and_unpack(archive, |unpacking_archive, path| {
+        with_finalize_and_unpack(archive, |mut unpacking_archive, path| {
             for entry in unpacking_archive.entries()? {
                 if !entry?.unpack_in(path)? {
                     return Err(UnpackError::Archive("failed!".to_string()));
@@ -1049,7 +1066,6 @@ mod tests {
                 ar,
                 tmp,
                 &[tmp.join("accounts_dest")],
-                None,
                 |_, _| {},
                 |path| assert_eq!(path, tmp.join("accounts_dest/123.456")),
             )

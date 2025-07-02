@@ -2,7 +2,7 @@
 use crate::append_vec::StoredAccountMeta;
 use {
     crate::{
-        account_info::AccountInfo,
+        account_info::{AccountInfo, Offset},
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_db::AccountsFileId,
         accounts_update_notifier_interface::AccountForGeyser,
@@ -86,6 +86,20 @@ impl AccountsFile {
     ) -> Result<(Self, usize)> {
         let (av, num_accounts) = AppendVec::new_from_file(path, current_len, storage_access)?;
         Ok((Self::AppendVec(av), num_accounts))
+    }
+
+    /// Creates a new AccountsFile for the underlying storage at `path`
+    ///
+    /// This version of `new()` may only be called when reconstructing storages as part of startup.
+    /// It trusts the snapshot's value for `current_len`, and relies on later index generation or
+    /// accounts verification to ensure it is valid.
+    pub fn new_for_startup(
+        path: impl Into<PathBuf>,
+        current_len: usize,
+        storage_access: StorageAccess,
+    ) -> Result<Self> {
+        let av = AppendVec::new_for_startup(path, current_len, storage_access)?;
+        Ok(Self::AppendVec(av))
     }
 
     /// true if this storage can possibly be appended to (independent of capacity check)
@@ -279,10 +293,14 @@ impl AccountsFile {
 
     /// Iterate over all accounts and call `callback` with each account.
     ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfoWithoutData: the account itself, without account data
+    ///
     /// Note that account data is not read/passed to the callback.
     pub fn scan_accounts_without_data(
         &self,
-        callback: impl for<'local> FnMut(StoredAccountInfoWithoutData<'local>),
+        callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
     ) {
         match self {
             Self::AppendVec(av) => av.scan_accounts_without_data(callback),
@@ -296,9 +314,16 @@ impl AccountsFile {
 
     /// Iterate over all accounts and call `callback` with each account.
     ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfo: the account itself, with account data
+    ///
     /// Prefer scan_accounts_without_data() when account data is not needed,
     /// as it can potentially read less and be faster.
-    pub fn scan_accounts(&self, callback: impl for<'local> FnMut(StoredAccountInfo<'local>)) {
+    pub fn scan_accounts(
+        &self,
+        callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
+    ) {
         match self {
             Self::AppendVec(av) => av.scan_accounts(callback),
             Self::TieredStorage(ts) => {
@@ -332,7 +357,7 @@ impl AccountsFile {
         &self,
         mut callback: impl for<'local> FnMut(AccountForGeyser<'local>),
     ) {
-        self.scan_accounts(|account| {
+        self.scan_accounts(|_offset, account| {
             let account_for_geyser = AccountForGeyser {
                 pubkey: account.pubkey(),
                 lamports: account.lamports(),
@@ -352,7 +377,7 @@ impl AccountsFile {
             Self::AppendVec(av) => av.calculate_stored_size(data_len),
             Self::TieredStorage(ts) => ts
                 .reader()
-                .expect("Reader must be initalized as stored size is specific to format")
+                .expect("Reader must be initialized as stored size is specific to format")
                 .calculate_stored_size(data_len),
         }
     }
