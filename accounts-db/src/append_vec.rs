@@ -1654,7 +1654,8 @@ pub mod tests {
             let mut count = 0;
             self.scan_stored_accounts_no_data(|_| {
                 count += 1;
-            });
+            })
+            .expect("must scan accounts storage");
             count
         }
     }
@@ -1730,7 +1731,8 @@ pub mod tests {
                 assert_eq!(&recovered, account);
                 assert_eq!(v.pubkey(), pubkey);
                 index += 1;
-            });
+            })
+            .expect("must scan accounts storage");
         }
     }
 
@@ -1777,7 +1779,8 @@ pub mod tests {
             let recovered = v.to_account_shared_data();
             assert_eq!(recovered, account.1);
             sample += 1;
-        });
+        })
+        .expect("must scan accounts storage");
         trace!("sequential read time: {} ms", now.elapsed().as_millis());
     }
 
@@ -2187,10 +2190,12 @@ pub mod tests {
             modify_fn,
             |append_vec, pubkeys, _account_offsets, _accounts| {
                 let mut i = 0;
-                append_vec.scan_pubkeys(|pubkey| {
-                    assert_eq!(pubkey, pubkeys.get(i).unwrap());
-                    i += 1;
-                });
+                append_vec
+                    .scan_pubkeys(|pubkey| {
+                        assert_eq!(pubkey, pubkeys.get(i).unwrap());
+                        i += 1;
+                    })
+                    .expect("must scan accounts storage");
                 assert_eq!(i, pubkeys.len());
             },
         )
@@ -2273,22 +2278,24 @@ pub mod tests {
             modify_fn,
             |append_vec, pubkeys, account_offsets, accounts| {
                 let mut i = 0;
-                append_vec.scan_stored_accounts_no_data(|stored_account| {
-                    let pubkey = pubkeys.get(i).unwrap();
-                    let account = accounts.get(i).unwrap();
-                    let offset = account_offsets.get(i).unwrap();
+                append_vec
+                    .scan_stored_accounts_no_data(|stored_account| {
+                        let pubkey = pubkeys.get(i).unwrap();
+                        let account = accounts.get(i).unwrap();
+                        let offset = account_offsets.get(i).unwrap();
 
-                    assert_eq!(
-                        stored_account.stored_size,
-                        aligned_stored_size(account.data().len()),
-                    );
-                    assert_eq!(stored_account.offset(), *offset);
-                    assert_eq!(stored_account.pubkey(), pubkey);
-                    assert_eq!(stored_account.lamports(), account.lamports());
-                    assert_eq!(stored_account.data_len(), account.data().len() as u64);
+                        assert_eq!(
+                            stored_account.stored_size,
+                            aligned_stored_size(account.data().len()),
+                        );
+                        assert_eq!(stored_account.offset(), *offset);
+                        assert_eq!(stored_account.pubkey(), pubkey);
+                        assert_eq!(stored_account.lamports(), account.lamports());
+                        assert_eq!(stored_account.data_len(), account.data().len() as u64);
 
-                    i += 1;
-                });
+                        i += 1;
+                    })
+                    .expect("must scan accounts storage");
                 assert_eq!(i, accounts.len());
             },
         )
