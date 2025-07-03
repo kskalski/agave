@@ -434,7 +434,7 @@ impl AppendVec {
         let path = path.into();
         let new = Self::new_from_file_unchecked(path, current_len, storage_access)?;
 
-        let (sanitized, num_accounts) = new.sanitize_layout_and_length();
+        let (sanitized, num_accounts) = new.sanitize_layout_and_length()?;
         if !sanitized {
             return Err(AccountsFileError::AppendVecError(
                 AppendVecError::IncorrectLayout(new.path.clone()),
@@ -544,7 +544,7 @@ impl AppendVec {
         Self::new_from_file_unchecked(path, file_size as usize, StorageAccess::default())
     }
 
-    fn sanitize_layout_and_length(&self) -> (bool, usize) {
+    fn sanitize_layout_and_length(&self) -> Result<(bool, usize)> {
         // This discards allocated accounts immediately after check at each loop iteration.
         //
         // This code should not reuse AppendVec.accounts() method as the current form or
@@ -560,13 +560,13 @@ impl AppendVec {
             }
             last_offset = account.offset() + account.stored_size();
             num_accounts += 1;
-        });
+        })?;
         if !matches {
-            return (false, num_accounts);
+            return Ok((false, num_accounts));
         }
         let aligned_current_len = u64_align!(self.current_len.load(Ordering::Acquire));
 
-        (last_offset == aligned_current_len, num_accounts)
+        Ok((last_offset == aligned_current_len, num_accounts))
     }
 
     /// Get a reference to the data at `offset` of `size` bytes if that slice
@@ -982,7 +982,7 @@ impl AppendVec {
     pub fn scan_accounts_without_data(
         &self,
         mut callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
-    ) {
+    ) -> Result<()> {
         self.scan_stored_accounts_no_data(|stored_account| {
             let offset = stored_account.offset();
             let account = StoredAccountInfoWithoutData {
@@ -1008,7 +1008,7 @@ impl AppendVec {
     pub fn scan_accounts(
         &self,
         mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
-    ) {
+    ) -> Result<()> {
         self.scan_accounts_stored_meta(|stored_account_meta| {
             let offset = stored_account_meta.offset();
             let account = StoredAccountInfo {
@@ -1031,7 +1031,7 @@ impl AppendVec {
     pub fn scan_accounts_stored_meta(
         &self,
         mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
-    ) {
+    ) -> Result<()> {
         match &self.backing {
             AppendVecFileBacking::Mmap(_mmap) => {
                 let mut offset = 0;
@@ -1060,7 +1060,7 @@ impl AppendVec {
                 // Buffer for account data that doesn't fit within the stack allocated buffer.
                 // This will be re-used for each account that doesn't fit within the stack allocated buffer.
                 let mut data_overflow_buffer = vec![];
-                while let Ok(BufferedReaderStatus::Success) = reader.read() {
+                while let BufferedReaderStatus::Success = reader.read()? {
                     let (offset, bytes_subset) = reader.get_offset_and_data();
                     let (meta, next) = Self::get_type::<StoredMeta>(bytes_subset, 0).unwrap();
                     let (account_meta, next) =
@@ -1133,6 +1133,7 @@ impl AppendVec {
                 }
             }
         }
+        Ok(())
     }
 
     /// Calculate the amount of storage required for an account with the passed
@@ -1198,14 +1199,17 @@ impl AppendVec {
     /// `data` is completely ignored, for example.
     /// Also, no references have to be maintained/returned from an iterator function.
     /// This fn can operate on a batch of data at once.
-    pub fn scan_pubkeys(&self, mut callback: impl FnMut(&Pubkey)) {
+    pub fn scan_pubkeys(&self, mut callback: impl FnMut(&Pubkey)) -> Result<()> {
         self.scan_stored_accounts_no_data(|account| {
             callback(account.pubkey());
-        });
+        })
     }
 
     /// Iterate over all accounts and call `callback` with the fixed sized portion of each account.
-    fn scan_stored_accounts_no_data(&self, mut callback: impl FnMut(StoredAccountNoData)) {
+    fn scan_stored_accounts_no_data(
+        &self,
+        mut callback: impl FnMut(StoredAccountNoData),
+    ) -> Result<()> {
         let self_len = self.len();
         match &self.backing {
             AppendVecFileBacking::Mmap(mmap) => {
@@ -1248,7 +1252,7 @@ impl AppendVec {
                     file,
                     mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>(),
                 );
-                while let Ok(BufferedReaderStatus::Success) = reader.read() {
+                while let BufferedReaderStatus::Success = reader.read()? {
                     let (offset, bytes) = reader.get_offset_and_data();
                     let (stored_meta, next) = Self::get_type::<StoredMeta>(bytes, 0).unwrap();
                     let (account_meta, _) = Self::get_type::<AccountMeta>(bytes, next).unwrap();
@@ -1274,6 +1278,7 @@ impl AppendVec {
                 }
             }
         }
+        Ok(())
     }
 
     /// Copy each account metadata, account and hash to the internal buffer.
