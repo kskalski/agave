@@ -11,7 +11,7 @@ pub mod test_utils;
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
 use crate::{
-    buffered_reader::ContiguousBufFileRead as _,
+    buffered_reader::ContiguousBufFileRead,
     io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader},
 };
 #[cfg(feature = "dev-context-only-utils")]
@@ -1066,16 +1066,13 @@ impl AppendVec {
             AppendVecFileBacking::File(file) => {
                 let self_len = self.len();
                 const BUFFER_SIZE: usize = PAGE_SIZE * 8;
-                let mut reader = BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(
-                    self_len,
-                    file,
-                    STORE_META_OVERHEAD,
-                );
+                let mut reader = BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(self_len, file);
+                reader.set_default_required_fill_buf_len(STORE_META_OVERHEAD);
                 // Buffer for account data that doesn't fit within the stack allocated buffer.
                 // This will be re-used for each account that doesn't fit within the stack allocated buffer.
                 let mut data_overflow_buffer = vec![];
                 loop {
-                    let offset = reader.get_offset();
+                    let offset = reader.get_file_offset();
                     let bytes = match reader.fill_buf() {
                         Ok([]) => break,
                         Ok(bytes) => ValidSlice::new(bytes),
@@ -1103,7 +1100,7 @@ impl AppendVec {
                         callback(account);
                         reader.consume(stored_size);
                     } else if STORE_META_OVERHEAD + data_len <= BUFFER_SIZE {
-                        reader.set_required_data_len(STORE_META_OVERHEAD + data_len);
+                        reader.set_next_required_fill_buf_len(STORE_META_OVERHEAD + data_len);
                     } else {
                         const MAX_CAPACITY: usize = MAX_PERMITTED_DATA_LENGTH as usize;
                         // 128KiB covers a reasonably large distribution of typical account sizes.
@@ -1267,13 +1264,12 @@ impl AppendVec {
             AppendVecFileBacking::File(file) => {
                 // Heuristic observed in benchmarking that maintains a reasonable balance between syscalls and data waste
                 const BUFFER_SIZE: usize = PAGE_SIZE * 4;
-                let mut reader = BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(
-                    self_len,
-                    file,
+                let mut reader = BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(self_len, file);
+                reader.set_default_required_fill_buf_len(
                     mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>(),
                 );
                 loop {
-                    let offset = reader.get_offset();
+                    let offset = reader.get_file_offset();
                     let bytes = match reader.fill_buf() {
                         Ok([]) => break,
                         Ok(bytes) => ValidSlice::new(bytes),
