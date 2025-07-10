@@ -229,14 +229,18 @@ impl<'a, B> SequentialFileReader<'a, B> {
 }
 
 impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead for SequentialFileReader<'a, B> {
-    fn get_offset(&self) -> usize {
+    fn get_file_offset(&self) -> usize {
         match self.inner.context().files.front() {
             Some(file) => file.current_offset,
             None => 0,
         }
     }
 
-    fn set_required_data_len(&mut self, _len: usize) {
+    fn set_default_required_fill_buf_len(&mut self, _len: usize) {
+        todo!()
+    }
+
+    fn set_next_required_fill_buf_len(&mut self, _len: usize) {
         todo!()
     }
 }
@@ -662,7 +666,7 @@ mod tests {
         // Read contents from the reader and verify length
         let all_read_data = read_as_vec(&mut reader);
         assert_eq!(all_read_data.len(), file_size);
-        assert_eq!(reader.get_offset(), file_size);
+        assert_eq!(reader.get_file_offset(), file_size);
 
         // Verify the contents
         for (i, byte) in all_read_data.iter().enumerate() {
@@ -828,18 +832,18 @@ mod tests {
         reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
 
         assert_eq!(512, reader.fill_buf().unwrap().len());
-        assert_eq!(0, reader.get_offset());
+        assert_eq!(0, reader.get_file_offset());
 
         reader.consume(40);
-        assert_eq!(40, reader.get_offset());
+        assert_eq!(40, reader.get_file_offset());
         assert_eq!(472, reader.fill_buf().unwrap().len());
 
         reader.consume(472);
-        assert_eq!(512, reader.get_offset());
+        assert_eq!(512, reader.get_file_offset());
         assert_eq!(88, reader.fill_buf().unwrap().len());
 
         reader.consume(88);
-        assert_eq!(600, reader.get_offset());
+        assert_eq!(600, reader.get_file_offset());
         assert_eq!(0, reader.fill_buf().unwrap().len());
     }
 }
