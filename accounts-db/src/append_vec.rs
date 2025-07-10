@@ -10,7 +10,10 @@ pub mod test_utils;
 // Used all over the accounts-db crate.  Probably should be minimized.
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
-use crate::io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader};
+use crate::{
+    buffered_reader::ContiguousBufFileRead as _,
+    io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader},
+};
 #[cfg(feature = "dev-context-only-utils")]
 pub use meta::{AccountMeta, StoredMeta};
 #[cfg(not(feature = "dev-context-only-utils"))]

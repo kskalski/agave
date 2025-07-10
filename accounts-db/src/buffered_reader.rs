@@ -57,6 +57,20 @@ impl<const N: usize> Backing for Stack<N> {
     }
 }
 
+pub(crate) trait ContiguousBufFileRead: BufRead {
+    /// Return file offset within `file` of the current consume position.
+    ///
+    /// The offset is corresponding to the start of buffer that will be returned
+    /// by the next `fill_buf` call.
+    fn get_offset(&self) -> usize;
+
+    /// Specify the amount of data required to available next time `fill_buf` is called.
+    ///
+    /// Note: This sets a one-time requirement for the next `fill_buf` call. After that call
+    /// the requirement is reset to default.
+    fn set_required_data_len(&mut self, len: usize);
+}
+
 /// read a file a large buffer at a time and provide access to a slice in that buffer
 pub struct BufferedReader<'a, T> {
     /// when we are next asked to read from file, start at this offset
@@ -98,10 +112,20 @@ impl<'a, T> BufferedReader<'a, T> {
             default_min_read_requirement,
         }
     }
+}
 
-    /// specify the amount of data required to read next time `read` is called
+impl<'a, T: Backing> ContiguousBufFileRead for BufferedReader<'a, T> {
     #[inline(always)]
-    pub fn set_required_data_len(&mut self, len: usize) {
+    fn get_offset(&self) -> usize {
+        if self.buf_valid_bytes.is_empty() {
+            self.file_offset_of_next_read
+        } else {
+            self.file_last_offset + self.buf_valid_bytes.start
+        }
+    }
+
+    #[inline(always)]
+    fn set_required_data_len(&mut self, len: usize) {
         self.read_requirements = Some(len);
     }
 }
@@ -137,19 +161,6 @@ where
         // reset this once we have checked that we had this much data once
         self.read_requirements = None;
         Ok(())
-    }
-
-    /// Return file offset within `file` of the current consume position.
-    ///
-    /// The offset is corresponding to the start of buffer that will be returned
-    /// by the next `fill_buf` call.
-    #[inline(always)]
-    pub fn get_offset(&'a self) -> usize {
-        if self.buf_valid_bytes.is_empty() {
-            self.file_offset_of_next_read
-        } else {
-            self.file_last_offset + self.buf_valid_bytes.start
-        }
     }
 }
 
@@ -221,7 +232,6 @@ pub fn large_file_buf_reader(
     path: impl AsRef<Path>,
     buf_size: usize,
 ) -> io::Result<Box<dyn BufRead>> {
-    let file = File::open(path)?;
     #[cfg(target_os = "linux")]
     if agave_io_uring::io_uring_supported() {
         use crate::io_uring::sequential_file_reader::SequentialFileReader;
