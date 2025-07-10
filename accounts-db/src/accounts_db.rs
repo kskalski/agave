@@ -7507,7 +7507,7 @@ impl AccountsDb {
                         }
                     }
 
-                    for (index, (slot, storage)) in slot_items.into_iter().enumerate() {
+                    for (index, (slot, storage)) in slot_items.iter().enumerate() {
                         let mut scan_time = Measure::start("scan");
                         log_status.report(index as u64);
                         let store_id = storage.id();

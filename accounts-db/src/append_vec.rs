@@ -11,7 +11,7 @@ pub mod test_utils;
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
 use crate::{
-    buffered_reader::ContiguousBufFileRead as _,
+    buffered_reader::ContiguousBufFileRead,
     io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader},
 };
 #[cfg(feature = "dev-context-only-utils")]
