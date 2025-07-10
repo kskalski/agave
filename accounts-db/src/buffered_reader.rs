@@ -282,7 +282,6 @@ pub fn large_file_buf_reader(
     path: impl AsRef<Path>,
     buf_size: usize,
 ) -> io::Result<Box<dyn BufRead>> {
-    let file = File::open(path)?;
     #[cfg(target_os = "linux")]
     if agave_io_uring::io_uring_supported() {
         use crate::io_uring::sequential_file_reader::SequentialFileReader;

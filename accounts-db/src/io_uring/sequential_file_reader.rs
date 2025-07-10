@@ -3,6 +3,7 @@ use {
         memory::{FixedIoBuffer, LargeBuffer},
         IO_PRIO_BE_HIGHEST,
     },
+    crate::buffered_reader::ContiguousBufFileRead,
     agave_io_uring::{Completion, Ring, RingOp},
     io_uring::{opcode, squeue, types, IoUring},
     std::{
@@ -227,13 +228,30 @@ impl<'a, B> SequentialFileReader<'a, B> {
     }
 }
 
+impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead for SequentialFileReader<'a, B> {
+    fn get_offset(&self) -> usize {
+        match self.inner.context().files.front() {
+            Some(file) => file.current_offset,
+            None => 0,
+        }
+    }
+
+    fn set_required_data_len(&mut self, _len: usize) {
+        todo!()
+    }
+}
+
 /// Holds the state of a single file being read.
 struct FileState {
     raw_fd: RawFd,
     /// Limit file offset to read up to.
     read_limit: Option<usize>,
     /// Offset of the next byte to read from file
-    offset: usize,
+    next_read_offset: usize,
+    /// File offset of the next `fill_buf()` buffer available to consume
+    current_offset: usize,
+    /// Position within the current buffer to return at next `fill_buf()`
+    current_buf_pos: usize,
     /// Index of `state.buffers` to consume data from (if file is already being read)
     current_buf_index: Option<usize>,
 }
@@ -243,7 +261,9 @@ impl FileState {
         Self {
             raw_fd,
             read_limit,
-            offset: 0,
+            next_read_offset: 0,
+            current_offset: 0,
+            current_buf_pos: 0,
             current_buf_index: None,
         }
     }
@@ -257,9 +277,11 @@ impl FileState {
     /// `Full` state and can be consumed (once `self.current_buf_index` points to it).
     fn next_read_op(&mut self, index: usize, bufs: &mut [ReadBufState]) -> Option<ReadOp> {
         let Self {
+            current_offset: _,
+            current_buf_pos: _,
             current_buf_index,
             raw_fd,
-            offset,
+            next_read_offset: offset,
             read_limit,
         } = self;
         let left_to_read = if let Some(limit_offset) = read_limit {
@@ -315,8 +337,16 @@ impl SequentialFileReaderState {
         self.current_buf_index().map(|idx| &self.buffers[idx])
     }
 
-    fn current_buf_mut(&mut self) -> Option<&mut ReadBufState> {
-        self.current_buf_index().map(|idx| &mut self.buffers[idx])
+    fn current_file_and_buf(&self) -> Option<(&FileState, &ReadBufState)> {
+        self.files
+            .front()
+            .and_then(|f| f.current_buf_index.map(|idx| (f, &self.buffers[idx])))
+    }
+
+    fn current_file_and_buf_mut(&mut self) -> Option<(&mut FileState, &mut ReadBufState)> {
+        self.files
+            .front_mut()
+            .and_then(|f| f.current_buf_index.map(|idx| (f, &mut self.buffers[idx])))
     }
 
     /// Returns the next read operation for the reader.
@@ -380,13 +410,14 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         let _have_data = loop {
             let state = self.inner.context_mut();
-            let first_file = state.files.front_mut();
-            let Some(buf_index) = first_file.and_then(|f| f.current_buf_index.as_mut()) else {
+            let num_bufs = state.buffers.len();
+            let Some((current_file, current_buf)) = state.current_file_and_buf_mut() else {
                 return Ok(&[]);
             };
-            match &mut state.buffers[*buf_index] {
-                ReadBufState::Full { buf, pos, eof_pos } => {
-                    if *pos < buf.len() && eof_pos.is_none_or(|eof| *pos < eof) {
+            match current_buf {
+                ReadBufState::Full { buf, eof_pos } => {
+                    let pos = current_file.current_buf_pos;
+                    if pos < buf.len() && eof_pos.is_none_or(|eof| pos < eof) {
                         // We have some data available.
                         break true;
                     }
@@ -396,10 +427,13 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
                         return Ok(&[]);
                     }
                     // We have finished consuming this buffer - reset its state.
-                    state.buffers[*buf_index].transition_to_uninit();
+                    current_buf.transition_to_uninit();
 
                     // Next `fill_buf` will use subsequent buffer.
-                    *buf_index = (*buf_index + 1) % state.buffers.len();
+                    if let Some(idx) = current_file.current_buf_index.as_mut() {
+                        *idx = (*idx + 1) % num_bufs
+                    }
+                    current_file.current_buf_pos = 0;
 
                     // A buffer was freed, so try to queue up next read.
                     if let Some(op) = state.next_read_op() {
@@ -426,18 +460,34 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
         }
 
         // At this point we must have data or be at EOF.
-        match self.inner.context().current_buf().unwrap() {
-            ReadBufState::Full { buf, pos, eof_pos } => Ok(buf.slice_range(*pos, eof_pos)),
+        match self.inner.context().current_file_and_buf().unwrap() {
+            (file_state, ReadBufState::Full { buf, eof_pos }) => {
+                Ok(buf.slice_range(file_state.current_buf_pos, eof_pos))
+            }
             // after the loop above we either have some data or we must be at EOF
             _ => unreachable!(),
         }
     }
 
     fn consume(&mut self, amt: usize) {
-        match self.inner.context_mut().current_buf_mut() {
-            None => (),
-            Some(ReadBufState::Full { pos, .. }) => *pos += amt,
-            _ => assert_eq!(amt, 0),
+        let state = self.inner.context_mut();
+        let Some(file_state) = state.files.front_mut() else {
+            return;
+        };
+        file_state.current_offset += amt;
+        if let Some(buf_index) = file_state.current_buf_index {
+            match &mut state.buffers[buf_index] {
+                ReadBufState::Full { buf, .. } => {
+                    debug_assert!(
+                        file_state.current_buf_pos + amt <= buf.len(),
+                        "consume beyond buffer not supported"
+                    );
+                    file_state.current_buf_pos += amt;
+                }
+                _ => (),
+            };
+        } else {
+            file_state.next_read_offset = file_state.current_offset;
         }
     }
 }
@@ -453,7 +503,6 @@ enum ReadBufState {
     /// The buffer is filled and ready to be consumed.
     Full {
         buf: FixedIoBuffer,
-        pos: usize,
         eof_pos: Option<usize>,
     },
 }
@@ -575,7 +624,6 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
         } else {
             reader_state.buffers[reader_buf_index] = ReadBufState::Full {
                 buf,
-                pos: 0,
                 eof_pos: (last_read_len == 0 || is_last_read).then_some(total_read_len),
             };
         }
@@ -613,6 +661,7 @@ mod tests {
         // Read contents from the reader and verify length
         let all_read_data = read_as_vec(&mut reader);
         assert_eq!(all_read_data.len(), file_size);
+        assert_eq!(reader.get_offset(), file_size);
 
         // Verify the contents
         for (i, byte) in all_read_data.iter().enumerate() {
@@ -653,9 +702,8 @@ mod tests {
         io::Write::write_all(&mut temp_file, &[0xa, 0xb, 0xc]).unwrap();
         temp_file.rewind().unwrap();
 
-        let buf = vec![0; 1024];
         {
-            let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+            let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
             reader.add_file_ref(&temp_file.as_file(), Some(3)).unwrap();
             assert_eq!(read_as_vec(&mut reader), &[0xa, 0xb, 0xc]);
         }
@@ -670,8 +718,7 @@ mod tests {
         let mut temp2 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
 
-        let buf = vec![0; 1024];
-        let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+        let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
 
         let f1 = File::open(temp1.path()).unwrap();
         let f2 = File::open(temp2.path()).unwrap();
@@ -692,8 +739,7 @@ mod tests {
         let mut temp2 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
 
-        let buf = vec![0; 1024];
-        let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+        let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
         reader.add_file_ref(temp1.as_file(), Some(2)).unwrap();
         reader.add_file_ref(temp2.as_file(), Some(3)).unwrap();
         reader.add_file_ref(temp1.as_file(), Some(4)).unwrap();
@@ -719,8 +765,7 @@ mod tests {
         let mut temp2 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp2, &pattern[1000..]).unwrap();
 
-        let buf = vec![0; 1024];
-        let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+        let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
         reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
         reader.add_file_ref(temp2.as_file(), Some(1000)).unwrap();
         reader.add_file_ref(temp1.as_file(), Some(2010)).unwrap();
@@ -744,8 +789,7 @@ mod tests {
         let mut temp2 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp2, &pattern[1000..]).unwrap();
 
-        let buf = vec![0; 1024];
-        let mut reader = SequentialFileReader::with_buffer(buf, 512).unwrap();
+        let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
         reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
         assert_eq!(read_as_vec(&mut reader), &pattern[..1990]);
         reader.move_to_next_file().unwrap();
@@ -771,5 +815,30 @@ mod tests {
             reader.move_to_next_file().unwrap();
         }
         assert_eq!(read_as_vec(&mut reader), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_get_offset() {
+        let pattern = (0..600).map(|i| i as u8).collect::<Vec<_>>();
+        let mut temp1 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp1, &pattern).unwrap();
+
+        let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
+        reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
+
+        assert_eq!(512, reader.fill_buf().unwrap().len());
+        assert_eq!(0, reader.get_offset());
+
+        reader.consume(40);
+        assert_eq!(40, reader.get_offset());
+        assert_eq!(472, reader.fill_buf().unwrap().len());
+
+        reader.consume(472);
+        assert_eq!(512, reader.get_offset());
+        assert_eq!(88, reader.fill_buf().unwrap().len());
+
+        reader.consume(88);
+        assert_eq!(600, reader.get_offset());
+        assert_eq!(0, reader.fill_buf().unwrap().len());
     }
 }
