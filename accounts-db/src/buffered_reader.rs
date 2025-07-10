@@ -124,12 +124,7 @@ impl<'a, T> BufferedReader<'a, T> {
     /// `buffer_size`: how much to try to read at a time
     /// `file_len_valid`: # bytes that are valid in the file, may be less than overall file len
     /// `default_min_read_requirement`: make sure we always have this much data available if we're asked to read
-    pub fn new(
-        backing: T,
-        file_len_valid: usize,
-        file: &'a File,
-        default_min_read_requirement: usize,
-    ) -> Self {
+    pub fn new(backing: T, file_len_valid: usize, file: &'a File) -> Self {
         Self {
             file_offset_of_next_read: 0,
             buf: backing,
@@ -233,34 +228,12 @@ where
         // and lifetime is tied to self.
         unsafe { &self.buf.as_slice()[self.buf_valid_bytes.clone()] }
     }
-
-    /// Return file offset within `file` of the current consume position.
-    ///
-    /// The offset is corresponding to the start of buffer that will be returned
-    /// by the next `fill_buf` call.
-    #[inline(always)]
-    pub fn get_offset(&'a self) -> usize {
-        if self.buf_valid_bytes.is_empty() {
-            self.file_offset_of_next_read
-        } else {
-            self.file_last_offset + self.buf_valid_bytes.start
-        }
-    }
 }
 
 impl<'a, const N: usize> BufferedReader<'a, Stack<N>> {
     /// create a new buffered reader with a stack-allocated buffer
-    pub fn new_stack(
-        file_len_valid: usize,
-        file: &'a File,
-        default_min_read_requirement: usize,
-    ) -> Self {
-        BufferedReader::new(
-            Stack::new(),
-            file_len_valid,
-            file,
-            default_min_read_requirement,
-        )
+    pub fn new_stack(file_len_valid: usize, file: &'a File) -> Self {
+        BufferedReader::new(Stack::new(), file_len_valid, file)
     }
 }
 
