@@ -16,7 +16,10 @@ use {
         fs::File,
         io::{self, Read},
         mem,
-        os::{fd::AsRawFd, unix::ffi::OsStrExt as _},
+        os::{
+            fd::{AsRawFd, RawFd},
+            unix::ffi::OsStrExt as _,
+        },
         path::PathBuf,
         pin::Pin,
         ptr,
@@ -119,8 +122,8 @@ impl<'a, B: AsMut<[u8]>> IoUringFileCreator<'a, B> {
         unsafe { FixedIoBuffer::register(buffer, &ring)? };
 
         // Those are fixed file descriptor slots - OpenAt will active them by index
-        let fds = vec![-1; MAX_OPEN_FILES];
-        ring.register_files(&fds)?;
+        // let fds = vec![-1; MAX_OPEN_FILES];
+        //  ring.register_files(&fds)?;
 
         Ok(Self {
             ring,
@@ -202,12 +205,12 @@ impl<B> IoUringFileCreator<'_, B> {
             let len = src.read(buf.as_mut())?;
             if len == 0 {
                 file.eof = true;
-
+                let fd = file.fd;
                 state.buffers.push_front(buf);
                 if file.is_completed() {
                     (state.file_complete)(mem::take(&mut file.path));
                     self.ring
-                        .push(FileCreatorOp::Close(CloseOp::new(file_key)))?;
+                        .push(FileCreatorOp::Close(CloseOp::new(file_key, fd)))?;
                 }
                 break;
             }
@@ -216,6 +219,7 @@ impl<B> IoUringFileCreator<'_, B> {
             if file.completed_open {
                 let op = WriteOp {
                     file_key,
+                    fd: file.fd,
                     offset,
                     buf,
                     write_len: len,
@@ -272,9 +276,10 @@ impl<'a> FileCreatorState<'a> {
     }
 
     /// Returns write backlog that needs to be submitted to IO ring
-    fn mark_file_opened(&mut self, file_key: usize) -> BacklogVec {
+    fn mark_file_opened(&mut self, file_key: usize, fd: RawFd) -> BacklogVec {
         let file = &mut self.files[file_key];
         file.completed_open = true;
+        file.fd = fd;
         self.open_fds += 1;
         if self.buffers.len() * 2 > self.buffers.capacity() {
             self.stats.large_buf_headroom_count += 1;
@@ -357,9 +362,9 @@ impl OpenOp {
         opcode::OpenAt::new(at_dir_fd, self.path_bytes.as_ptr() as _)
             .flags(O_CREAT | O_TRUNC | O_NOFOLLOW | O_WRONLY | O_NOATIME | O_NONBLOCK)
             .mode(self.mode)
-            .file_index(Some(
-                types::DestinationSlot::try_from_slot_target(self.file_key as u32).unwrap(),
-            ))
+            // .file_index(Some(
+            //     types::DestinationSlot::try_from_slot_target(self.file_key as u32).unwrap(),
+            // ))
             .build()
     }
 
@@ -371,13 +376,14 @@ impl OpenOp {
     where
         Self: Sized,
     {
-        res?;
+        let fd = res?;
 
-        let backlog = ring.context_mut().mark_file_opened(self.file_key);
+        let backlog = ring.context_mut().mark_file_opened(self.file_key, fd);
         for (buf, offset, len) in backlog {
             let op = WriteOp {
                 file_key: self.file_key,
                 offset,
+                fd,
                 buf,
                 write_len: len,
             };
@@ -392,15 +398,16 @@ impl OpenOp {
 #[derive(Debug)]
 struct CloseOp {
     file_key: usize,
+    fd: RawFd,
 }
 
 impl<'a> CloseOp {
-    fn new(file_key: usize) -> Self {
-        Self { file_key }
+    fn new(file_key: usize, fd: RawFd) -> Self {
+        Self { file_key, fd }
     }
 
     fn entry(&mut self) -> squeue::Entry {
-        opcode::Close::new(types::Fixed(self.file_key as u32)).build()
+        opcode::Close::new(types::Fd(self.fd)).build()
     }
 
     fn complete(
@@ -420,6 +427,7 @@ impl<'a> CloseOp {
 #[derive(Debug)]
 struct WriteOp {
     file_key: usize,
+    fd: RawFd,
     offset: usize,
     buf: FixedIoBuffer,
     write_len: usize,
@@ -428,14 +436,15 @@ struct WriteOp {
 impl<'a> WriteOp {
     fn entry(&mut self) -> squeue::Entry {
         let WriteOp {
-            file_key,
+            file_key: _,
+            fd,
             offset,
             buf,
             write_len,
         } = self;
 
         opcode::WriteFixed::new(
-            types::Fixed(*file_key as u32),
+            types::Fd(*fd),
             buf.as_mut_ptr(),
             *write_len as u32,
             buf.io_buf_index()
@@ -444,6 +453,7 @@ impl<'a> WriteOp {
         .offset(*offset as u64)
         .ioprio(IO_PRIO_BE_HIGHEST)
         .build()
+        .flags(io_uring::squeue::Flags::ASYNC)
     }
 
     fn complete(
@@ -459,6 +469,7 @@ impl<'a> WriteOp {
         let WriteOp {
             file_key,
             offset: _,
+            fd,
             ref mut buf,
             write_len,
         } = self;
@@ -471,7 +482,7 @@ impl<'a> WriteOp {
             .context_mut()
             .mark_write_completed(*file_key, *write_len, buf)
         {
-            ring.push(FileCreatorOp::Close(CloseOp::new(*file_key)));
+            ring.push(FileCreatorOp::Close(CloseOp::new(*file_key, *fd)));
         }
 
         Ok(())
@@ -516,6 +527,7 @@ type PendingWrite = (FixedIoBuffer, usize, usize);
 struct PendingFile {
     path: PathBuf,
     completed_open: bool,
+    fd: RawFd,
     backlog: BacklogVec,
     eof: bool,
     writes_started: usize,
@@ -527,6 +539,7 @@ impl PendingFile {
         Self {
             path,
             completed_open: false,
+            fd: -1,
             backlog: SmallVec::new(),
             writes_started: 0,
             writes_completed: 0,
