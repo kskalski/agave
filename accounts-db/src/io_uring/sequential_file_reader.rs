@@ -119,19 +119,6 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
             _phantom: PhantomData,
         })
     }
-
-    fn wait_current_buf_done_reading(&mut self) -> Result<(), io::Error> {
-        Ok(loop {
-            self.inner.process_completions()?;
-            match self.inner.context().current_buf().unwrap() {
-                ReadBufState::Full { .. } => break,
-                ReadBufState::Uninit(_) => unreachable!("should be initialized"),
-                // Still no data, wait for more completions, but submit in case the SQPOLL
-                // thread is asleep and there are queued entries in the submission queue.
-                ReadBufState::Reading => self.inner.submit()?,
-            }
-        })
-    }
 }
 
 impl<'a, B> SequentialFileReader<'a, B> {
@@ -240,8 +227,10 @@ impl<'a, B> SequentialFileReader<'a, B> {
         Ok(())
     }
 
-    fn rotate_empty_buffers(&mut self) -> Result<bool, io::Error> {
-        let may_have_data = loop {
+    fn wait_current_buf_full(&mut self) -> Result<bool, io::Error> {
+        let have_data = loop {
+            self.inner.process_completions()?;
+
             let state = self.inner.context_mut();
             let num_bufs = state.buffers.len();
             let Some((current_file, current_buf)) = state.current_file_and_buf_mut() else {
@@ -271,15 +260,19 @@ impl<'a, B> SequentialFileReader<'a, B> {
                     if let Some(op) = state.next_read_op() {
                         self.inner.push(op)?;
                     }
-
-                    // Move to the next buffer and check again whether we have data.
-                    continue;
                 }
-                ReadBufState::Reading => break true,
+
+                ReadBufState::Reading => {
+                    // Still no data, wait for more completions, but submit in case the SQPOLL
+                    // thread is asleep and there are queued entries in the submission queue.
+                    self.inner.submit()?
+                }
+
                 ReadBufState::Uninit(_) => unreachable!("should be initialized"),
             }
+            // Move to the next buffer and check again whether we have data.
         };
-        Ok(may_have_data)
+        Ok(have_data)
     }
 }
 
@@ -300,10 +293,9 @@ impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
 
 impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if !self.rotate_empty_buffers()? {
+        if !self.wait_current_buf_full()? {
             return Ok(&[]);
         }
-        self.wait_current_buf_done_reading()?;
 
         // At this point we must have data or be at EOF.
         Ok(self.inner.context().current_buf().unwrap().as_slice())
