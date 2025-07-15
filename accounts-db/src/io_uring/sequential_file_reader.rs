@@ -227,38 +227,59 @@ impl<'a, B> SequentialFileReader<'a, B> {
         Ok(())
     }
 
-    fn wait_current_buf_full(&mut self) -> Result<bool, io::Error> {
-        let have_data = loop {
+    fn wait_buffers_have_bytes(&mut self, required_len: usize) -> io::Result<usize> {
+        let mut available_len = 0;
+        let mut peek_buf_index = 0;
+        loop {
             self.inner.process_completions()?;
 
             let state = self.inner.context_mut();
             let num_bufs = state.buffers.len();
-            let Some((current_file, current_buf)) = state.current_file_and_buf_mut() else {
+            let Some((current_file, peeked_buf)) =
+                state.current_file_and_nth_buf_mut(peek_buf_index)
+            else {
                 // No file is being read, no data will be available.
-                break false;
+                break;
             };
-            match current_buf {
-                ReadBufState::Full { pos, buf, eof_pos } => {
-                    if *pos < buf.len() && eof_pos.is_none_or(|eof| *pos < eof) {
-                        // We have some data available.
-                        break true;
-                    }
+            match peeked_buf {
+                ReadBufState::Full {
+                    pos,
+                    eof_pos: Some(eof),
+                    ..
+                } => {
+                    // Last filled buf for the whole file (until `move_to_next_file` is called),
+                    // available data only up to the limit.
+                    available_len += *eof - *pos;
+                    break;
+                }
 
-                    if eof_pos.is_some() {
-                        // Last filled buf for the whole file (until `move_to_next_file` is called).
-                        break false;
+                ReadBufState::Full { pos, buf, .. } => {
+                    let in_buf_len = buf.len() - *pos;
+                    if in_buf_len > 0 {
+                        available_len += in_buf_len;
+                        // No limit within buffer, all data before its end is available.
+                        if available_len >= required_len {
+                            break;
+                        } else {
+                            peek_buf_index += 1;
+                            continue;
+                        }
                     }
-                    // We have finished consuming this buffer - reset its state.
-                    current_buf.transition_to_uninit();
+                    // This buffer is already consumed.
 
-                    // Next `fill_buf` will use subsequent buffer.
-                    if let Some(idx) = current_file.current_buf_index.as_mut() {
-                        *idx = (*idx + 1) % num_bufs
-                    }
+                    if peek_buf_index == 0 {
+                        // First empty buffer can be immediately rotated - reset its state.
+                        peeked_buf.transition_to_uninit();
 
-                    // A buffer was freed, so try to queue up next read.
-                    if let Some(op) = state.next_read_op() {
-                        self.inner.push(op)?;
+                        // Update file state such that it points to subsequent buffer.
+                        if let Some(idx) = current_file.current_buf_index.as_mut() {
+                            *idx = (*idx + 1) % num_bufs
+                        }
+
+                        // A buffer was freed, so try to queue up next read.
+                        if let Some(op) = state.next_read_op() {
+                            self.inner.push(op)?;
+                        }
                     }
                 }
 
@@ -271,8 +292,8 @@ impl<'a, B> SequentialFileReader<'a, B> {
                 ReadBufState::Uninit(_) => unreachable!("should be initialized"),
             }
             // Move to the next buffer and check again whether we have data.
-        };
-        Ok(have_data)
+        }
+        Ok(available_len)
     }
 }
 
@@ -293,21 +314,26 @@ impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
 
 impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if !self.wait_current_buf_full()? {
+        if self.wait_buffers_have_bytes(1)? == 0 {
             return Ok(&[]);
         }
-
-        // At this point we must have data or be at EOF.
         Ok(self.inner.context().current_buf().unwrap().as_slice())
     }
 
-    fn consume(&mut self, amt: usize) {
+    fn consume(&mut self, mut amt: usize) {
         let state = self.inner.context_mut();
-        let Some((current_file, current_buf)) = state.current_file_and_buf_mut() else {
-            return;
-        };
-        current_file.current_offset += amt;
-        current_buf.consume(amt);
+        let mut consume_buf_index = 0;
+        while amt > 0 {
+            let Some((current_file, current_buf)) =
+                state.current_file_and_nth_buf_mut(consume_buf_index)
+            else {
+                return;
+            };
+            let consumed = current_buf.consume(amt);
+            current_file.current_offset += consumed;
+            amt -= consumed;
+            consume_buf_index += 1;
+        }
     }
 }
 
@@ -319,8 +345,16 @@ impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead<'a> for SequentialFileReader<'a, 
         }
     }
 
-    fn fill_buf_required(&mut self, _required_len: usize) -> io::Result<&[u8]> {
-        todo!()
+    fn fill_buf_required(&mut self, required_len: usize) -> io::Result<&[u8]> {
+        let available_len = self.wait_buffers_have_bytes(required_len)?;
+        if available_len == 0 {
+            // No fragmentary data is available, this is EOF / read limit.
+            return Ok(&[]);
+        }
+        if available_len < required_len {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(self.inner.context().current_buf().unwrap().as_slice())
     }
 
     fn fill_buf_required_or_overflow<'b>(
@@ -354,10 +388,15 @@ impl SequentialFileReaderState {
         self.current_buf_index().map(|idx| &self.buffers[idx])
     }
 
-    fn current_file_and_buf_mut(&mut self) -> Option<(&mut FileState, &mut ReadBufState)> {
-        self.files
-            .front_mut()
-            .and_then(|f| f.current_buf_index.map(|idx| (f, &mut self.buffers[idx])))
+    fn current_file_and_nth_buf_mut(
+        &mut self,
+        nth: usize,
+    ) -> Option<(&mut FileState, &mut ReadBufState)> {
+        let num_bufs = self.buffers.len();
+        self.files.front_mut().and_then(|f| {
+            f.current_buf_index
+                .map(|idx| (f, &mut self.buffers[(idx + nth) % num_bufs]))
+        })
     }
 
     /// Returns the next read operation for the reader.
@@ -514,14 +553,12 @@ impl ReadBufState {
         }
     }
 
-    fn consume(&mut self, amt: usize) {
+    fn consume(&mut self, amt: usize) -> usize {
         match self {
-            Self::Full { pos, buf, .. } => {
-                debug_assert!(
-                    *pos + amt <= buf.len(),
-                    "consume beyond buffer not supported"
-                );
-                *pos += amt;
+            Self::Full { pos, buf, eof_pos } => {
+                let consumed = (eof_pos.unwrap_or(buf.len()) - *pos).min(amt);
+                *pos += consumed;
+                consumed
             }
             Self::Uninit(_) | Self::Reading => {
                 unreachable!("must call consume only on full buffer")
