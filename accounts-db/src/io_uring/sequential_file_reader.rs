@@ -119,6 +119,19 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
             _phantom: PhantomData,
         })
     }
+
+    fn wait_current_buf_done_reading(&mut self) -> Result<(), io::Error> {
+        Ok(loop {
+            self.inner.process_completions()?;
+            match self.inner.context().current_buf().unwrap() {
+                ReadBufState::Full { .. } => break,
+                ReadBufState::Uninit(_) => unreachable!("should be initialized"),
+                // Still no data, wait for more completions, but submit in case the SQPOLL
+                // thread is asleep and there are queued entries in the submission queue.
+                ReadBufState::Reading => self.inner.submit()?,
+            }
+        })
+    }
 }
 
 impl<'a, B> SequentialFileReader<'a, B> {
@@ -153,6 +166,29 @@ impl<'a, B> SequentialFileReader<'a, B> {
     #[allow(unused)]
     pub fn add_file_ref(&mut self, file: &'a File, limit_len: Option<usize>) -> io::Result<()> {
         self.add_file_by_fd(file.as_raw_fd(), limit_len)
+    }
+
+    /// Caller must ensure that the file is not closed while the reader is using it.
+    fn add_file_by_fd(&mut self, fd: RawFd, limit_len: Option<usize>) -> io::Result<()> {
+        let state = self.inner.context_mut();
+
+        state.files.push_back(FileState::new(fd, limit_len));
+
+        if state.all_buffers_used() {
+            // Just added file to backlog, no reads can be started yet.
+            return Ok(());
+        }
+
+        // There are free buffers, so we can start reading the new file.
+        state.next_read_file_index = Some(state.next_read_file_index.map_or(0, |idx| idx + 1));
+
+        // Start reading as many buffers as necessary for queued files.
+        while let Some(op) = self.inner.context_mut().next_read_op() {
+            self.inner.push(op)?;
+        }
+        // Make sure work is started in case submission queue is large and we
+        // never submitted work when adding buffers.
+        self.inner.submit()
     }
 
     /// When reading multiple files, this method moves the reader to the next file.
@@ -204,44 +240,48 @@ impl<'a, B> SequentialFileReader<'a, B> {
         Ok(())
     }
 
-    /// Caller must ensure that the file is not closed while the reader is using it.
-    fn add_file_by_fd(&mut self, fd: RawFd, limit_len: Option<usize>) -> io::Result<()> {
-        let state = self.inner.context_mut();
+    fn rotate_empty_buffers(&mut self) -> Result<bool, io::Error> {
+        let may_have_data = loop {
+            let state = self.inner.context_mut();
+            let num_bufs = state.buffers.len();
+            let Some((current_file, current_buf)) = state.current_file_and_buf_mut() else {
+                // No file is being read, no data will be available.
+                break false;
+            };
+            match current_buf {
+                ReadBufState::Full { buf, eof_pos } => {
+                    let pos = current_file.current_buf_pos;
+                    if pos < buf.len() && eof_pos.is_none_or(|eof| pos < eof) {
+                        // We have some data available.
+                        break true;
+                    }
 
-        state.files.push_back(FileState::new(fd, limit_len));
+                    if eof_pos.is_some() {
+                        // Last filled buf for the whole file (until `move_to_next_file` is called).
+                        break false;
+                    }
+                    // We have finished consuming this buffer - reset its state.
+                    current_buf.transition_to_uninit();
 
-        if state.all_buffers_used() {
-            // Just added file to backlog, no reads can be started yet.
-            return Ok(());
-        }
+                    // Next `fill_buf` will use subsequent buffer.
+                    if let Some(idx) = current_file.current_buf_index.as_mut() {
+                        *idx = (*idx + 1) % num_bufs
+                    }
+                    current_file.current_buf_pos = 0;
 
-        // There are free buffers, so we can start reading the new file.
-        state.next_read_file_index = Some(state.next_read_file_index.map_or(0, |idx| idx + 1));
+                    // A buffer was freed, so try to queue up next read.
+                    if let Some(op) = state.next_read_op() {
+                        self.inner.push(op)?;
+                    }
 
-        // Start reading as many buffers as necessary for queued files.
-        while let Some(op) = self.inner.context_mut().next_read_op() {
-            self.inner.push(op)?;
-        }
-        // Make sure work is started in case submission queue is large and we
-        // never submitted work when adding buffers.
-        self.inner.submit()
-    }
-}
-
-impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead for SequentialFileReader<'a, B> {
-    fn get_file_offset(&self) -> usize {
-        match self.inner.context().files.front() {
-            Some(file) => file.current_offset,
-            None => 0,
-        }
-    }
-
-    fn set_default_required_fill_buf_len(&mut self, _len: usize) {
-        todo!()
-    }
-
-    fn set_next_required_fill_buf_len(&mut self, _len: usize) {
-        todo!()
+                    // Move to the next buffer and check again whether we have data.
+                    continue;
+                }
+                ReadBufState::Reading => break true,
+                ReadBufState::Uninit(_) => unreachable!("should be initialized"),
+            }
+        };
+        Ok(may_have_data)
     }
 }
 
@@ -412,56 +452,10 @@ impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
 
 impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        let _have_data = loop {
-            let state = self.inner.context_mut();
-            let num_bufs = state.buffers.len();
-            let Some((current_file, current_buf)) = state.current_file_and_buf_mut() else {
-                return Ok(&[]);
-            };
-            match current_buf {
-                ReadBufState::Full { buf, eof_pos } => {
-                    let pos = current_file.current_buf_pos;
-                    if pos < buf.len() && eof_pos.is_none_or(|eof| pos < eof) {
-                        // We have some data available.
-                        break true;
-                    }
-
-                    if eof_pos.is_some() {
-                        // Last filled buf for the whole file (until `move_to_next_file` is called).
-                        return Ok(&[]);
-                    }
-                    // We have finished consuming this buffer - reset its state.
-                    current_buf.transition_to_uninit();
-
-                    // Next `fill_buf` will use subsequent buffer.
-                    if let Some(idx) = current_file.current_buf_index.as_mut() {
-                        *idx = (*idx + 1) % num_bufs
-                    }
-                    current_file.current_buf_pos = 0;
-
-                    // A buffer was freed, so try to queue up next read.
-                    if let Some(op) = state.next_read_op() {
-                        self.inner.push(op)?;
-                    }
-
-                    // Move to the next buffer and check again whether we have data.
-                    continue;
-                }
-                ReadBufState::Uninit(_) => unreachable!("should be initialized"),
-                _ => break false,
-            }
-        };
-
-        loop {
-            self.inner.process_completions()?;
-            match self.inner.context().current_buf().unwrap() {
-                ReadBufState::Full { .. } => break,
-                ReadBufState::Uninit(_) => unreachable!("should be initialized"),
-                // Still no data, wait for more completions, but submit in case the SQPOLL
-                // thread is asleep and there are queued entries in the submission queue.
-                ReadBufState::Reading => self.inner.submit()?,
-            }
+        if !self.rotate_empty_buffers()? {
+            return Ok(&[]);
         }
+        self.wait_current_buf_done_reading()?;
 
         // At this point we must have data or be at EOF.
         match self.inner.context().current_file_and_buf().unwrap() {
@@ -496,6 +490,30 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     }
 }
 
+impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead<'a> for SequentialFileReader<'a, B> {
+    fn get_file_offset(&self) -> usize {
+        match self.inner.context().files.front() {
+            Some(file) => file.current_offset,
+            None => 0,
+        }
+    }
+
+    fn fill_buf_required(&mut self, _required_len: usize) -> io::Result<&[u8]> {
+        todo!()
+    }
+
+    fn fill_buf_required_or_overflow<'b>(
+        &'b mut self,
+        _required_len: usize,
+        _overflow_buffer: &'b mut Vec<u8>,
+    ) -> io::Result<&'b [u8]>
+    where
+        'a: 'b,
+    {
+        todo!()
+    }
+}
+
 #[derive(Debug)]
 enum ReadBufState {
     /// The buffer is pending submission to read queue (on initialization and
@@ -507,6 +525,7 @@ enum ReadBufState {
     /// The buffer is filled and ready to be consumed.
     Full {
         buf: FixedIoBuffer,
+        /// Position in `buf` at which 0-sized read (or required read limit) was reached
         eof_pos: Option<usize>,
     },
 }
