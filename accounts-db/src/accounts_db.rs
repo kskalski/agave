@@ -183,8 +183,6 @@ pub(crate) struct ShrinkCollectAliveSeparatedByRefs<'a> {
 pub struct VerifyAccountsHashAndLamportsConfig<'a> {
     /// bank ancestors
     pub ancestors: &'a Ancestors,
-    /// true to verify hash calculation
-    pub test_hash_calculation: bool,
     /// epoch_schedule
     pub epoch_schedule: &'a EpochSchedule,
     /// epoch
@@ -803,10 +801,13 @@ impl LoadedAccountAccessor<'_> {
                 // was still in the storage map. This means even if the storage entry is removed
                 // from the storage map after we grabbed the storage entry, the recycler should not
                 // reset the storage entry until we drop the reference to the storage entry.
-                maybe_storage_entry.accounts.get_account_shared_data(*offset).expect(
-                    "If a storage entry was found in the storage map, it must not have been reset \
-                     yet",
-                )
+                maybe_storage_entry
+                    .accounts
+                    .get_account_shared_data(*offset)
+                    .expect(
+                        "If a storage entry was found in the storage map, it must not have been \
+                         reset yet",
+                    )
             }
             _ => self.check_and_get_loaded_account(|loaded_account| loaded_account.take_account()),
         }
@@ -2105,8 +2106,8 @@ impl AccountsDb {
                 } else {
                     // a pubkey we were planning to remove is not removing all stores that contain the account
                     debug!(
-                        "calc_delete_dependencies(), pubkey: {pubkey}, slot list len: {}, \
-                         ref count: {ref_count}, slot list: {slot_list:?}",
+                        "calc_delete_dependencies(), pubkey: {pubkey}, slot list len: {}, ref \
+                         count: {ref_count}, slot list: {slot_list:?}",
                         slot_list.len(),
                     );
                 }
@@ -3679,9 +3680,9 @@ impl AccountsDb {
                         // entry for `pubkey`. Log a warning for now. In future,
                         // we will panic when this happens.
                         warn!(
-                        "pubkey {pubkey} in slot {slot} was NOT found in accounts index during \
-                         shrink"
-                    );
+                            "pubkey {pubkey} in slot {slot} was NOT found in accounts index \
+                             during shrink"
+                        );
                         datapoint_warn!(
                             "accounts_db-shink_pubkey_missing_from_index",
                             ("store_slot", slot, i64),
@@ -4304,11 +4305,15 @@ impl AccountsDb {
             ancestors,
             bank_id,
             |pubkey, (account_info, slot)| {
-                let account_slot = self
-                    .get_account_accessor(slot, pubkey, &account_info.storage_location())
-                    .get_loaded_account(|loaded_account| {
+                let mut account_accessor =
+                    self.get_account_accessor(slot, pubkey, &account_info.storage_location());
+
+                let account_slot = match account_accessor {
+                    LoadedAccountAccessor::Cached(None) => None,
+                    _ => account_accessor.get_loaded_account(|loaded_account| {
                         (pubkey, loaded_account.take_account(), slot)
-                    });
+                    }),
+                };
                 scan_func(account_slot)
             },
             config,
@@ -7952,9 +7957,13 @@ impl AccountsDb {
 
             // sanity check that stored_size is not larger than the u64 aligned size of the accounts files.
             // Note that the stored_size is aligned, so it can be larger than the size of the accounts file.
-            assert!(info.stored_size <= u64_align!(storage.accounts.len()),
-                "Stored size ({}) is larger than the size of the accounts file ({}) for store_id: {}",
-                info.stored_size, storage.accounts.len(), store_id
+            assert!(
+                info.stored_size <= u64_align!(storage.accounts.len()),
+                "Stored size ({}) is larger than the size of the accounts file ({}) for store_id: \
+                 {}",
+                info.stored_size,
+                storage.accounts.len(),
+                store_id
             );
         }
         // zero_lamport_pubkeys are candidates for cleaning. So add them to uncleaned_pubkeys
@@ -8540,15 +8549,17 @@ impl AccountsDb {
         #[allow(clippy::stable_sort_primitive)]
         alive_roots.sort();
         info!("{}: accounts_index alive_roots: {:?}", label, alive_roots,);
-        let full_pubkey_range = Pubkey::from([0; 32])..=Pubkey::from([0xff; 32]);
-
         self.accounts_index.account_maps.iter().for_each(|map| {
-            for (pubkey, account_entry) in map.items(&full_pubkey_range) {
-                info!("  key: {} ref_count: {}", pubkey, account_entry.ref_count(),);
-                info!(
-                    "      slots: {:?}",
-                    *account_entry.slot_list.read().unwrap()
-                );
+            for pubkey in map.keys() {
+                self.accounts_index.get_and_then(&pubkey, |account_entry| {
+                    if let Some(account_entry) = account_entry {
+                        let list_r = &account_entry.slot_list.read().unwrap();
+                        info!(" key: {} ref_count: {}", pubkey, account_entry.ref_count(),);
+                        info!("      slots: {:?}", list_r);
+                    }
+                    let add_to_in_mem_cache = false;
+                    (add_to_in_mem_cache, ())
+                });
             }
         });
     }
@@ -8864,7 +8875,6 @@ impl<'a> VerifyAccountsHashAndLamportsConfig<'a> {
     ) -> Self {
         Self {
             ancestors,
-            test_hash_calculation: true,
             epoch_schedule,
             epoch,
             ignore_mismatch: false,

@@ -203,7 +203,10 @@ pub trait DiskIndexValue:
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ScanError {
-    #[error("Node detected it replayed bad version of slot {slot:?} with id {bank_id:?}, thus the scan on said slot was aborted")]
+    #[error(
+        "Node detected it replayed bad version of slot {slot:?} with id {bank_id:?}, thus the \
+         scan on said slot was aborted"
+    )]
     SlotRemoved { slot: Slot, bank_id: BankId },
     #[error("scan aborted: {0}")]
     Aborted(String),
@@ -727,24 +730,30 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         let mut iterator_elapsed = 0;
         let mut iterator_timer = Measure::start("iterator_elapsed");
 
-        for pubkey_list in self.iter(range.as_ref(), returns_items) {
+        for pubkeys in self.iter(range.as_ref(), returns_items) {
             iterator_timer.stop();
             iterator_elapsed += iterator_timer.as_us();
-            for (pubkey, list) in pubkey_list {
+            for pubkey in pubkeys {
                 num_keys_iterated += 1;
-                let mut read_lock_timer = Measure::start("read_lock");
-                let list_r = &list.slot_list.read().unwrap();
-                read_lock_timer.stop();
-                read_lock_elapsed += read_lock_timer.as_us();
-                let mut latest_slot_timer = Measure::start("latest_slot");
-                if let Some(index) = self.latest_slot(Some(ancestors), list_r, max_root) {
-                    latest_slot_timer.stop();
-                    latest_slot_elapsed += latest_slot_timer.as_us();
-                    let mut load_account_timer = Measure::start("load_account");
-                    func(&pubkey, (&list_r[index].1, list_r[index].0));
-                    load_account_timer.stop();
-                    load_account_elapsed += load_account_timer.as_us();
-                }
+                self.get_and_then(&pubkey, |entry| {
+                    if let Some(list) = entry {
+                        let mut read_lock_timer = Measure::start("read_lock");
+                        let list_r = &list.slot_list.read().unwrap();
+                        read_lock_timer.stop();
+                        read_lock_elapsed += read_lock_timer.as_us();
+                        let mut latest_slot_timer = Measure::start("latest_slot");
+                        if let Some(index) = self.latest_slot(Some(ancestors), list_r, max_root) {
+                            latest_slot_timer.stop();
+                            latest_slot_elapsed += latest_slot_timer.as_us();
+                            let mut load_account_timer = Measure::start("load_account");
+                            func(&pubkey, (&list_r[index].1, list_r[index].0));
+                            load_account_timer.stop();
+                            load_account_elapsed += load_account_timer.as_us();
+                        }
+                    }
+                    let add_to_in_mem_cache = false;
+                    (add_to_in_mem_cache, ())
+                });
                 if config.is_aborted() {
                     return;
                 }
@@ -1152,7 +1161,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                             AccountsIndexScanResult::UnrefLog0 => {
                                 let old_ref = locked_entry.unref();
                                 if old_ref != 1 {
-                                    info!("Unexpected unref {pubkey} with {old_ref} {:?}, expect old_ref to be 1", locked_entry.slot_list.read().unwrap());
+                                    info!(
+                                        "Unexpected unref {pubkey} with {old_ref} {:?}, expect \
+                                         old_ref to be 1",
+                                        locked_entry.slot_list.read().unwrap()
+                                    );
                                     datapoint_warn!(
                                         "accounts_db-unexpected-unref-zero",
                                         ("old_ref", old_ref, i64),
@@ -1181,25 +1194,28 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                         .unwrap()
                         .get_internal(pubkey, internal_callback);
                 }
-                ScanFilter::OnlyAbnormal | ScanFilter::OnlyAbnormalWithVerify | ScanFilter::OnlyAbnormalTest => {
-                    let found = lock
-                        .as_ref()
-                        .unwrap()
-                        .get_only_in_mem(pubkey, false, |mut entry| {
-                            if entry.is_some() && matches!(filter, ScanFilter::OnlyAbnormalTest) {
-
-                               let local_entry = entry.unwrap();
-                                if local_entry.ref_count() == 1 && local_entry.slot_list.read().unwrap().len() == 1 {
-                                    // Account was found in memory, but is a single ref single slot account
-                                    // For testing purposes, return None as this can be treated like
-                                    // a normal account that was flushed to storage.
-                                    entry = None;
+                ScanFilter::OnlyAbnormal
+                | ScanFilter::OnlyAbnormalWithVerify
+                | ScanFilter::OnlyAbnormalTest => {
+                    let found =
+                        lock.as_ref()
+                            .unwrap()
+                            .get_only_in_mem(pubkey, false, |mut entry| {
+                                if entry.is_some() && matches!(filter, ScanFilter::OnlyAbnormalTest)
+                                {
+                                    let local_entry = entry.unwrap();
+                                    if local_entry.ref_count() == 1
+                                        && local_entry.slot_list.read().unwrap().len() == 1
+                                    {
+                                        // Account was found in memory, but is a single ref single slot account
+                                        // For testing purposes, return None as this can be treated like
+                                        // a normal account that was flushed to storage.
+                                        entry = None;
+                                    }
                                 }
-
-                            }
-                            internal_callback(entry);
-                            entry.is_some()
-                        });
+                                internal_callback(entry);
+                                entry.is_some()
+                            });
                     if !found && matches!(filter, ScanFilter::OnlyAbnormalWithVerify) {
                         lock.as_ref().unwrap().get_internal(pubkey, |entry| {
                             assert!(entry.is_some(), "{pubkey}, entry: {entry:?}");

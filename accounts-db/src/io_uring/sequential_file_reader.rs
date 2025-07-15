@@ -228,7 +228,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
     }
 }
 
-impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead for SequentialFileReader<'a, B> {
+impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead<'a> for SequentialFileReader<'a, B> {
     fn get_file_offset(&self) -> usize {
         match self.inner.context().files.front() {
             Some(file) => file.current_offset,
@@ -236,11 +236,18 @@ impl<'a, B: AsMut<[u8]>> ContiguousBufFileRead for SequentialFileReader<'a, B> {
         }
     }
 
-    fn set_default_required_fill_buf_len(&mut self, _len: usize) {
+    fn fill_buf_required(&mut self, _required_len: usize) -> io::Result<&[u8]> {
         todo!()
     }
 
-    fn set_next_required_fill_buf_len(&mut self, _len: usize) {
+    fn fill_buf_required_or_overflow<'b>(
+        &'b mut self,
+        _required_len: usize,
+        _overflow_buffer: &'b mut Vec<u8>,
+    ) -> io::Result<&'b [u8]>
+    where
+        'a: 'b,
+    {
         todo!()
     }
 }

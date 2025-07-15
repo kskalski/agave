@@ -34,6 +34,7 @@ Release channels have their own copy of this changelog:
 
 #### Changes
 * `--transaction-structure view` is now the default.
+* The default full snapshot interval is now 100,000 slots.
 
 ## 2.3.0
 

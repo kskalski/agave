@@ -140,7 +140,7 @@ fn do_inspect(file: impl AsRef<Path>, verbose: bool) -> Result<(), String> {
     let mut num_accounts = Saturating(0usize);
     let mut stored_accounts_size = Saturating(0);
     let mut lamports = Saturating(0);
-    let mut r_reader = SequentialFileReader::new().unwrap();
+    let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
     storage.scan_accounts_stored_meta(&mut r_reader, |account| {
         if verbose {
             println!("{account:?}");
@@ -222,7 +222,7 @@ fn do_search(
         let storage = ManuallyDrop::new(storage);
 
         let file_name = Path::new(file.file_name().expect("path is a file"));
-        let mut r_reader = SequentialFileReader::new().unwrap();
+        let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
 
         storage.scan_accounts_stored_meta(&mut r_reader, |account| {
             if addresses.contains(account.pubkey()) {
