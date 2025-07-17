@@ -1097,7 +1097,8 @@ impl AppendVec {
                             let next_cap = data_len
                                 .next_power_of_two()
                                 .clamp(MIN_CAPACITY, MAX_CAPACITY);
-                            data_overflow_buffer.reserve_exact(next_cap - capacity);
+                            data_overflow_buffer
+                                .reserve_exact(next_cap - data_overflow_buffer.len());
                             // SAFETY: We only write to the uninitialized portion of the buffer via `copy_from_slice` and `read_into_buffer`.
                             // Later, we ensure we only read from the initialized portion of the buffer.
                             unsafe {
