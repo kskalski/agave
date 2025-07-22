@@ -6,6 +6,8 @@ use {
             AccountHash, CalcAccountsHashConfig, CalculateHashIntermediate, HashStats,
         },
         active_stats::ActiveStatItem,
+        append_vec,
+        buffered_reader::RequiredLenBufFileRead,
         cache_hash_data::{CacheHashData, CacheHashDataFileReference},
         pubkey_bins::PubkeyBinCalculator24,
         sorted_storages::SortedStorages,
@@ -329,6 +331,7 @@ impl AccountsDb {
                     )) => {
                         let mut scanner = scanner.clone();
                         let mut init_accum = true;
+                        let mut reader = append_vec::new_scan_full_accounts_buffer();
                         // load from cache failed, so create the cache file for this chunk
                         for (slot, storage) in snapshot_storages.iter_range(&range_this_chunk) {
                             let ancient = slot < oldest_non_ancient_slot_for_identification;
@@ -341,8 +344,12 @@ impl AccountsDb {
                                 }
                                 scanner.set_slot(slot, ancient, storage);
 
-                                Self::scan_single_account_storage(storage, &mut scanner)
-                                    .expect("must scan accounts storage");
+                                Self::scan_single_account_storage(
+                                    &mut reader,
+                                    storage,
+                                    &mut scanner,
+                                )
+                                .expect("must scan accounts storage");
                             });
                             if ancient {
                                 stats
@@ -375,14 +382,15 @@ impl AccountsDb {
     }
 
     /// iterate over a single storage, calling scanner on each item
-    fn scan_single_account_storage<S>(
-        storage: &AccountStorageEntry,
+    fn scan_single_account_storage<'a, S>(
+        reader: &mut impl RequiredLenBufFileRead<'a>,
+        storage: &'a AccountStorageEntry,
         scanner: &mut S,
     ) -> Result<(), AccountsFileError>
     where
         S: AppendVecScan,
     {
-        storage.accounts.scan_accounts(|_offset, account| {
+        storage.accounts.scan_accounts(reader, |_offset, account| {
             if scanner.filter(account.pubkey()) {
                 scanner.found_account(&LoadedAccount::Stored(account))
             }
