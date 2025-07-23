@@ -752,7 +752,7 @@ mod tests {
 
         {
             let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-            reader.add_file_ref(&temp_file.as_file(), Some(3)).unwrap();
+            reader.add_file_ref(temp_file.as_file(), Some(3)).unwrap();
             assert_eq!(read_as_vec(&mut reader), &[0xa, 0xb, 0xc]);
         }
         // Independently we can also read from the file directly
