@@ -23,11 +23,8 @@ mod scan_account_storage;
 pub mod stats;
 pub mod tests;
 
-use std::fs::File;
-
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
-use crate::io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader};
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
@@ -1185,10 +1182,6 @@ impl AccountStorageEntry {
 
     pub fn id(&self) -> AccountsFileId {
         self.id
-    }
-
-    pub fn get_file(&self) -> Option<(&File, usize)> {
-        self.accounts.get_file()
     }
 
     pub fn flush(&self) -> Result<(), AccountsFileError> {
@@ -2377,10 +2370,9 @@ impl AccountsDb {
                 return;
             }
             if let Some(storage) = self.storage.get_slot_storage_entry(slot) {
-                let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
                 storage
                     .accounts
-                    .scan_accounts(&mut r_reader, |_offset, account| {
+                    .scan_accounts(|_offset, account| {
                         let pk = account.pubkey();
                         match pubkey_refcount.entry(*pk) {
                             dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
@@ -4269,8 +4261,7 @@ impl AccountsDb {
                     })
                 }
                 ScanAccountStorageData::DataRefForStorage => {
-                    let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
-                    storage.scan_accounts(&mut r_reader, |_offset, account| {
+                    storage.scan_accounts(|_offset, account| {
                         let account_without_data = StoredAccountInfoWithoutData::new_from(&account);
                         storage_scan_func(retval, &account_without_data, Some(account.data));
                     })
@@ -6010,10 +6001,9 @@ impl AccountsDb {
         let mut lt_hash = storages
             .par_iter()
             .fold(LtHash::identity, |mut accum, storage| {
-                let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
                 storage
                     .accounts
-                    .scan_accounts(&mut r_reader, |_offset, account| {
+                    .scan_accounts(|_offset, account| {
                         let account_lt_hash = Self::lt_hash_account(&account, account.pubkey());
                         accum.mix_in(&account_lt_hash.0);
                     })
@@ -7327,7 +7317,6 @@ impl AccountsDb {
         slot: Slot,
         store_id: AccountsFileId,
         storage_info: &StorageSizeAndCountMap,
-        r_reader: &mut SequentialFileReader<LargeBuffer>,
     ) -> SlotIndexGenerationInfo {
         if storage.accounts.get_account_data_lens(&[0]).is_empty() {
             return SlotIndexGenerationInfo::default();
@@ -7362,7 +7351,7 @@ impl AccountsDb {
 
             if secondary {
                 // WITH secondary indexes -- scan accounts WITH account data
-                storage.accounts.scan_accounts(r_reader, |offset, account| {
+                storage.accounts.scan_accounts(|offset, account| {
                     let data_len = account.data.len() as u64;
                     let stored_size_aligned =
                         storage.accounts.calculate_stored_size(data_len as usize);
@@ -7452,10 +7441,10 @@ impl AccountsDb {
         should_calculate_duplicates_lt_hash: bool,
     ) -> IndexGenerationInfo {
         let mut total_time = Measure::start("generate_index");
-        let mut slot_items = self.storage.all_items();
-        slot_items.sort_unstable_by_key(|(slot, _)| *slot);
+        let mut slots = self.storage.all_slots();
+        slots.sort_unstable();
         if let Some(limit) = limit_load_slot_count_from_snapshot {
-            slot_items.truncate(limit); // get rid of the newer slots and keep just the older
+            slots.truncate(limit); // get rid of the newer slots and keep just the older
         }
         let accounts_data_len = AtomicU64::new(0);
 
@@ -7473,7 +7462,7 @@ impl AccountsDb {
             }
             let storage_info = StorageSizeAndCountMap::default();
             let total_processed_slots_across_all_threads = AtomicU64::new(0);
-            let outer_slots_len = slot_items.len();
+            let outer_slots_len = slots.len();
             let threads = num_cpus::get();
             let chunk_size = (outer_slots_len / (std::cmp::max(1, threads.saturating_sub(1)))) + 1; // approximately 400k slots in a snapshot
             let mut index_time = Measure::start("index");
@@ -7481,15 +7470,14 @@ impl AccountsDb {
             let total_including_duplicates = AtomicU64::new(0);
             let all_accounts_are_zero_lamports_slots = AtomicU64::new(0);
             let mut all_zeros_slots = Mutex::new(Vec::<(Slot, Arc<AccountStorageEntry>)>::new());
-            let scan_time: u64 = slot_items
+            let scan_time: u64 = slots
                 .par_chunks(chunk_size)
-                .map(|slot_items| {
+                .map(|slots| {
                     let mut log_status = MultiThreadProgress::new(
                         &total_processed_slots_across_all_threads,
                         2,
                         outer_slots_len as u64,
                     );
-                    let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
                     let mut scan_time_sum = 0;
                     let mut all_accounts_are_zero_lamports_slots_inner = 0;
                     let mut all_zeros_slots_inner = vec![];
@@ -7500,16 +7488,13 @@ impl AccountsDb {
                     let mut local_num_did_not_exist = 0;
                     let mut local_num_existed_in_mem = 0;
                     let mut local_num_existed_on_disk = 0;
-
-                    for (_, storage) in slot_items {
-                        if let Some((file, storage_len)) = storage.get_file() {
-                            r_reader.add_file_ref(file, Some(storage_len)).unwrap();
-                        }
-                    }
-
-                    for (index, (slot, storage)) in slot_items.iter().enumerate() {
+                    for (index, slot) in slots.iter().enumerate() {
                         let mut scan_time = Measure::start("scan");
                         log_status.report(index as u64);
+                        let Some(storage) = self.storage.get_slot_storage_entry(*slot) else {
+                            // no storage at this slot, no information to pull out
+                            continue;
+                        };
                         let store_id = storage.id();
 
                         scan_time.stop();
@@ -7532,7 +7517,6 @@ impl AccountsDb {
                                 *slot,
                                 store_id,
                                 &storage_info,
-                                &mut r_reader,
                             );
 
                             local_num_did_not_exist += num_did_not_exist;
@@ -7680,7 +7664,7 @@ impl AccountsDb {
                     .load(Ordering::Relaxed),
                 populate_duplicate_keys_us,
                 total_including_duplicates: total_including_duplicates.load(Ordering::Relaxed),
-                total_slots: slot_items.len() as u64,
+                total_slots: slots.len() as u64,
                 all_accounts_are_zero_lamports_slots: all_accounts_are_zero_lamports_slots
                     .load(Ordering::Relaxed),
                 ..GenerateIndexTimings::default()
@@ -7803,7 +7787,7 @@ impl AccountsDb {
 
             if pass == 0 {
                 // Need to add these last, otherwise older updates will be cleaned
-                for (root, _) in &slot_items {
+                for root in &slots {
                     self.accounts_index.add_root(*root);
                 }
 
@@ -8237,10 +8221,9 @@ impl AccountsDb {
     pub fn sizes_of_accounts_in_storage_for_tests(&self, slot: Slot) -> Vec<usize> {
         let mut sizes = Vec::default();
         if let Some(storage) = self.storage.get_slot_storage_entry(slot) {
-            let mut r_reader = SequentialFileReader::with_capacity(2 << 20).unwrap();
             storage
                 .accounts
-                .scan_accounts_stored_meta(&mut r_reader, |account| {
+                .scan_accounts_stored_meta(|account| {
                     sizes.push(account.stored_size());
                 })
                 .expect("must scan accounts storage");
