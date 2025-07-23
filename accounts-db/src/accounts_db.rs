@@ -7461,7 +7461,7 @@ impl AccountsDb {
                                 num_existed_on_disk,
                             } = self.generate_index_for_slot(
                                 &mut reader,
-                                &storage,
+                                storage,
                                 slot,
                                 store_id,
                                 &storage_info,
@@ -7474,7 +7474,7 @@ impl AccountsDb {
                             accounts_data_len_sum += accounts_data_len_this_slot;
                             if all_accounts_are_zero_lamports {
                                 all_accounts_are_zero_lamports_slots_inner += 1;
-                                all_zeros_slots_inner.push((slot, Arc::clone(&storage)));
+                                all_zeros_slots_inner.push((slot, Arc::clone(storage)));
                             }
                             local_zero_lamport_pubkeys.append(&mut zero_lamport_pubkeys_this_slot);
 
