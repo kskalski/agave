@@ -60,9 +60,11 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
     /// Initially the reader is idle and starts reading after the first file is added.
     /// # Example:
     /// ```
+    /// use solana_accounts_db::io_uring::SequentialFileReader;
+    ///
     /// let mut buffer = vec![0; 4096];
     /// let mut reader = SequentialFileReader::with_buffer(buffer, 1024);
-    /// let file = File::open("example.txt").unwrap();
+    /// let file = std::fs::File::open("example.txt").unwrap();
     /// reader.add_file(file).unwrap();
     /// assert!(!reader.fill_buf().unwrap().is_empty());
     /// ```
