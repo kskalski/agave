@@ -6023,12 +6023,16 @@ impl AccountsDb {
         storages: &[Arc<AccountStorageEntry>],
         duplicates_lt_hash: &DuplicatesLtHash,
     ) -> AccountsLtHash {
-        let chunk_size = accounts_scan_par_chunk_size(storages.len());
         let mut lt_hash = storages
-            .par_chunks(chunk_size)
-            .fold(LtHash::identity, |mut accum, storages| {
-                let mut reader = append_vec::new_full_accounts_scan_buffer();
-                storages.iter().for_each(|storage| {
+            .par_iter()
+            .fold(
+                || {
+                    (
+                        LtHash::identity(),
+                        append_vec::new_full_accounts_scan_buffer(),
+                    )
+                },
+                |(mut accum, mut reader), storage| {
                     let obsolete_accounts = storage.get_obsolete_accounts(None);
                     storage
                         .accounts
@@ -6041,13 +6045,22 @@ impl AccountsDb {
                             }
                         })
                         .expect("must scan accounts storage");
-                });
-                accum
-            })
-            .reduce(LtHash::identity, |mut accum, elem| {
-                accum.mix_in(&elem);
-                accum
-            });
+                    (accum, reader)
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        LtHash::identity(),
+                        append_vec::new_full_accounts_scan_buffer(),
+                    )
+                },
+                |mut accum, (elem, _)| {
+                    accum.0.mix_in(&elem);
+                    accum
+                },
+            )
+            .0;
 
         if self.mark_obsolete_accounts {
             // If `mark_obsolete_accounts` is true, then none if the duplicate accounts were
