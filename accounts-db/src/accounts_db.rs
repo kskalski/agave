@@ -2391,7 +2391,7 @@ impl AccountsDb {
         storages
             .par_chunks(accounts_scan_par_chunk_size(storages.len()))
             .for_each(|storages| {
-                let mut reader = append_vec::new_scan_full_accounts_buffer();
+                let mut reader = append_vec::new_full_accounts_scan_buffer();
                 storages.iter().for_each(|storage| {
                     let slot = storage.slot();
                     storage
@@ -4285,7 +4285,7 @@ impl AccountsDb {
                     })
                 }
                 ScanAccountStorageData::DataRefForStorage => {
-                    let mut reader = append_vec::new_scan_full_accounts_buffer();
+                    let mut reader = append_vec::new_full_accounts_scan_buffer();
                     storage.scan_accounts(&mut reader, |_offset, account| {
                         let account_without_data = StoredAccountInfoWithoutData::new_from(&account);
                         storage_scan_func(retval, &account_without_data, Some(account.data));
@@ -6027,7 +6027,7 @@ impl AccountsDb {
         let mut lt_hash = storages
             .par_chunks(chunk_size)
             .fold(LtHash::identity, |mut accum, storages| {
-                let mut reader = append_vec::new_scan_full_accounts_buffer();
+                let mut reader = append_vec::new_full_accounts_scan_buffer();
                 storages.iter().for_each(|storage| {
                     let obsolete_accounts = storage.get_obsolete_accounts(None);
                     storage
@@ -7436,7 +7436,7 @@ impl AccountsDb {
                     let mut local_num_did_not_exist = 0;
                     let mut local_num_existed_in_mem = 0;
                     let mut local_num_existed_on_disk = 0;
-                    let mut reader = append_vec::new_scan_full_accounts_buffer();
+                    let mut reader = append_vec::new_full_accounts_scan_buffer();
                     for (index, storage) in storages.iter().enumerate() {
                         let mut scan_time = Measure::start("scan");
                         log_status.report(index as u64);
