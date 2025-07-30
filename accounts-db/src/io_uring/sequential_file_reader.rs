@@ -120,17 +120,17 @@ impl<'a, B> SequentialFileReader<'a, B> {
             .custom_flags(libc::O_NOATIME)
             .open(path)?;
         let len = file.metadata()?.len() as usize;
-        self.add_file(file, Some(len))
+        self.add_file(file, len)
     }
 
     /// Add `file` to read. Starts reading the file as soon as a buffer is available.
-    /// The read finishes when EOF is reached or `limit_len` bytes are read (if specified).
+    /// The read finishes when EOF is reached or `read_limit` bytes are read.
     /// Multiple files can be added to the reader and they will be read-ahead in FIFO order.
     ///
     /// Reader takes ownership of the file and will drop it after it's done reading
     /// and `move_to_next_file` is called.
-    pub fn add_file(&mut self, file: File, limit_len: Option<usize>) -> io::Result<()> {
-        self.add_file_by_fd(file.as_raw_fd(), limit_len)?;
+    pub fn add_file(&mut self, file: File, read_limit: usize) -> io::Result<()> {
+        self.add_file_by_fd(file.as_raw_fd(), read_limit)?;
         self.owned_files.push_back(file);
         Ok(())
     }
@@ -140,15 +140,15 @@ impl<'a, B> SequentialFileReader<'a, B> {
     ///
     /// Lifetime of reference is tied to the reader's lifetime.
     #[allow(unused)]
-    pub fn add_file_ref(&mut self, file: &'a File, limit_len: Option<usize>) -> io::Result<()> {
-        self.add_file_by_fd(file.as_raw_fd(), limit_len)
+    pub fn add_file_ref(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+        self.add_file_by_fd(file.as_raw_fd(), read_limit)
     }
 
     /// Caller must ensure that the file is not closed while the reader is using it.
-    fn add_file_by_fd(&mut self, fd: RawFd, limit_len: Option<usize>) -> io::Result<()> {
+    fn add_file_by_fd(&mut self, fd: RawFd, read_limit: usize) -> io::Result<()> {
         let state = self.state_mut();
 
-        state.files.push_back(FileState::new(fd, limit_len));
+        state.files.push_back(FileState::new(fd, read_limit));
 
         if state.all_buffers_used() {
             // Just added file to backlog, no reads can be started yet.
@@ -173,38 +173,47 @@ impl<'a, B> SequentialFileReader<'a, B> {
     pub fn move_to_next_file(&mut self) -> io::Result<()> {
         let state = self.state_mut();
 
-        let Some(file_state) = state.files.pop_front() else {
+        let Some(mut file_state) = state.files.pop_front() else {
             return Ok(());
         };
         if let Some(next_file_index) = state.next_read_file_index.as_mut() {
             state.next_read_file_index = next_file_index.checked_sub(1);
-        }
-
-        if let Some(buf_index) = file_state.current_buf_index {
-            let current_buf = &mut state.buffers[buf_index];
-            assert!(current_buf.seen_eof(), "must fully read file first");
-
-            current_buf.transition_to_uninit();
-        }
-
-        if file_state.read_limit.is_none() {
-            // This was unlimited file read, so no other files are queued,
-            // but some ops might still be in-flight, drain them.
-            self.inner.drain()?;
-            let state = self.state_mut();
-            state.reset_buffers();
-            if !state.files.is_empty() {
+            if state.next_read_file_index.is_none() && !state.files.is_empty() {
                 state.next_read_file_index = Some(0);
             }
         }
 
+        while let Some(buf_index) = file_state.current_buf_index {
+            self.inner.process_completions()?;
+            let state = self.state_mut();
+            let current_buf = &mut state.buffers[buf_index];
+            if current_buf.is_reading() {
+                // Still no data, wait for more completions, but submit in case the SQPOLL
+                // thread is asleep and there are queued entries in the submission queue.
+                self.inner.submit()?;
+                continue;
+            }
+            current_buf.transition_to_uninit();
+
+            let next_buf_index = (buf_index + 1) % state.buffers.len();
+            file_state.current_buf_index = if state.next_read_buf_index == next_buf_index {
+                None
+            } else {
+                Some(next_buf_index)
+            };
+        }
+
         // Start reading as many buffers as necessary for queued files.
+        let mut was_op_pushed = false;
         while let Some(op) = self.state_mut().next_read_op() {
             self.inner.push(op)?;
+            was_op_pushed = true;
         }
-        // Make sure work is started in case submission queue is large and we
-        // never submitted work when adding buffers.
-        self.inner.submit()?;
+        if was_op_pushed {
+            // Make sure work is started in case submission queue is large and we
+            // never submitted work when adding buffers.
+            self.inner.submit()?;
+        }
 
         if self
             .owned_files
@@ -409,19 +418,13 @@ impl SequentialFileReaderState {
     fn all_buffers_used(&mut self) -> bool {
         self.buffers[self.next_read_buf_index].is_used()
     }
-
-    fn reset_buffers(&mut self) {
-        self.buffers
-            .iter_mut()
-            .for_each(|buf| buf.transition_to_uninit());
-    }
 }
 
 /// Holds the state of a single file being read.
 struct FileState {
     raw_fd: RawFd,
     /// Limit file offset to read up to.
-    read_limit: Option<usize>,
+    read_limit: usize,
     /// Offset of the next byte to read from file
     next_read_offset: usize,
     /// File offset of the next `fill_buf()` buffer available to consume
@@ -433,7 +436,7 @@ struct FileState {
 }
 
 impl FileState {
-    fn new(raw_fd: RawFd, read_limit: Option<usize>) -> Self {
+    fn new(raw_fd: RawFd, read_limit: usize) -> Self {
         Self {
             raw_fd,
             read_limit,
@@ -464,14 +467,10 @@ impl FileState {
             next_read_offset: offset,
             read_limit,
         } = self;
-        let left_to_read = if let Some(limit_offset) = read_limit {
-            if *limit_offset <= *offset {
-                return None;
-            }
-            *limit_offset - *offset
-        } else {
-            usize::MAX
-        };
+        let left_to_read = read_limit.saturating_sub(*offset);
+        if left_to_read == 0 {
+            return None;
+        }
 
         let buf = bufs[index].transition_to_reading();
 
@@ -525,11 +524,8 @@ impl ReadBufState {
         matches!(self, ReadBufState::Full { .. })
     }
 
-    fn seen_eof(&self) -> bool {
-        match self {
-            Self::Full { eof_pos, .. } => eof_pos.is_some(),
-            Self::Uninit(_) | Self::Reading => false,
-        }
+    fn is_reading(&self) -> bool {
+        matches!(self, ReadBufState::Reading)
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -565,7 +561,7 @@ impl ReadBufState {
     fn transition_to_uninit(&mut self) {
         match self {
             Self::Uninit(_) => (),
-            Self::Reading => unreachable!("cannot reset a buffer that is pending read"),
+            Self::Reading => unreachable!("cannot reset a buffer that has pending read"),
             Self::Full { buf, .. } => {
                 *self = ReadBufState::Uninit(mem::replace(buf, FixedIoBuffer::empty()));
             }
@@ -698,7 +694,7 @@ mod tests {
         let buf = vec![0; backing_buffer_size];
         let mut reader = SequentialFileReader::with_buffer(buf, read_capacity).unwrap();
         reader
-            .add_file(File::open(temp_file.path()).unwrap(), None)
+            .add_file(File::open(temp_file.path()).unwrap(), usize::MAX)
             .unwrap();
 
         // Read contents from the reader and verify length
@@ -747,7 +743,7 @@ mod tests {
 
         {
             let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-            reader.add_file_ref(temp_file.as_file(), Some(3)).unwrap();
+            reader.add_file_ref(temp_file.as_file(), 3).unwrap();
             assert_eq!(read_as_vec(&mut reader), &[0xa, 0xb, 0xc]);
         }
         // Independently we can also read from the file directly
@@ -765,8 +761,8 @@ mod tests {
 
         let f1 = File::open(temp1.path()).unwrap();
         let f2 = File::open(temp2.path()).unwrap();
-        reader.add_file(f1, None).unwrap();
-        reader.add_file(f2, None).unwrap();
+        reader.add_file(f1, usize::MAX).unwrap();
+        reader.add_file(f2, usize::MAX).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
 
@@ -783,10 +779,10 @@ mod tests {
         io::Write::write_all(&mut temp2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(2)).unwrap();
-        reader.add_file_ref(temp2.as_file(), Some(3)).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(4)).unwrap();
-        reader.add_file_ref(temp2.as_file(), Some(5)).unwrap();
+        reader.add_file_ref(temp1.as_file(), 2).unwrap();
+        reader.add_file_ref(temp2.as_file(), 3).unwrap();
+        reader.add_file_ref(temp1.as_file(), 4).unwrap();
+        reader.add_file_ref(temp2.as_file(), 5).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb]);
 
@@ -809,9 +805,9 @@ mod tests {
         io::Write::write_all(&mut temp2, &pattern[1000..]).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
-        reader.add_file_ref(temp2.as_file(), Some(1000)).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(2010)).unwrap();
+        reader.add_file_ref(temp1.as_file(), 1990).unwrap();
+        reader.add_file_ref(temp2.as_file(), 1000).unwrap();
+        reader.add_file_ref(temp1.as_file(), 2010).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), &pattern[..1990]);
 
@@ -833,24 +829,24 @@ mod tests {
         io::Write::write_all(&mut temp2, &pattern[1000..]).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
+        reader.add_file_ref(temp1.as_file(), 1990).unwrap();
         assert_eq!(read_as_vec(&mut reader), &pattern[..1990]);
         reader.move_to_next_file().unwrap();
 
         for _ in 0..10 {
-            reader.add_file_ref(temp2.as_file(), Some(1000)).unwrap();
+            reader.add_file_ref(temp2.as_file(), 1000).unwrap();
             assert_eq!(read_as_vec(&mut reader), &pattern[1000..]);
             reader.move_to_next_file().unwrap();
 
-            reader.add_file_ref(temp1.as_file(), Some(2010)).unwrap();
+            reader.add_file_ref(temp1.as_file(), 2010).unwrap();
             assert_eq!(read_as_vec(&mut reader), &pattern[..2000]);
             reader.move_to_next_file().unwrap();
         }
         assert_eq!(read_as_vec(&mut reader), Vec::<u8>::new());
 
         for _ in 0..10 {
-            reader.add_file_ref(temp2.as_file(), Some(1000)).unwrap();
-            reader.add_file_ref(temp1.as_file(), Some(2010)).unwrap();
+            reader.add_file_ref(temp2.as_file(), 1000).unwrap();
+            reader.add_file_ref(temp1.as_file(), 2010).unwrap();
 
             assert_eq!(read_as_vec(&mut reader), &pattern[1000..]);
             reader.move_to_next_file().unwrap();
@@ -867,7 +863,7 @@ mod tests {
         io::Write::write_all(&mut temp1, &pattern).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(1990)).unwrap();
+        reader.add_file_ref(temp1.as_file(), 1990).unwrap();
 
         assert_eq!(512, reader.fill_buf().unwrap().len());
         assert_eq!(0, reader.get_file_offset());
@@ -892,7 +888,7 @@ mod tests {
         io::Write::write_all(&mut temp1, &pattern).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 2048], 512).unwrap();
-        reader.add_file_ref(temp1.as_file(), Some(5990)).unwrap();
+        reader.add_file_ref(temp1.as_file(), 5990).unwrap();
 
         assert_eq!(reader.fill_buf().unwrap(), &pattern[..512]);
         assert_eq!(0, reader.get_file_offset());
