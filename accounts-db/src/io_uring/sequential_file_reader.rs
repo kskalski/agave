@@ -57,16 +57,6 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
     /// The reader will execute multiple `read_capacity` sized reads in parallel to fill the buffer.
     ///
     /// Initially the reader is idle and starts reading after the first file is added.
-    /// # Example:
-    /// ```
-    /// use solana_accounts_db::io_uring::SequentialFileReader;
-    ///
-    /// let mut buffer = vec![0; 4096];
-    /// let mut reader = SequentialFileReader::with_buffer(buffer, 1024);
-    /// let file = std::fs::File::open("example.txt").unwrap();
-    /// reader.add_file(file).unwrap();
-    /// assert!(!reader.fill_buf().unwrap().is_empty());
-    /// ```
     pub fn with_buffer(mut buffer: B, read_capacity: usize) -> io::Result<Self> {
         // Let submission queue hold half of buffers before we explicitly syscall
         // to submit them for reading.
@@ -236,6 +226,9 @@ impl<'a, B> SequentialFileReader<'a, B> {
                 // No file is being read, no data will be available.
                 break false;
             };
+            if current_file.left_to_consume > 0 && current_buf.is_full() {
+                current_file.left_to_consume = current_buf.consume(current_file.left_to_consume);
+            }
             match current_buf {
                 ReadBufState::Full { pos, buf, eof_pos } => {
                     if *pos < buf.len() && eof_pos.is_none_or(|eof| *pos < eof) {
@@ -308,23 +301,15 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
         Ok(self.state().current_buf().unwrap().as_slice())
     }
 
-    fn consume(&mut self, mut amt: usize) {
-        let num_buffers = self.state().buffers.len();
-        while amt > 0 {
-            let Some((current_file, current_buf)) = self.state_mut().current_file_and_buf_mut()
-            else {
-                return;
-            };
-            current_file.current_offset += amt;
-            let remaining = current_buf.consume(amt);
-            if remaining > 0 {
-                current_file
-                    .current_buf_index
-                    .as_mut()
-                    .map(|i| *i = (*i + 1) % num_buffers);
-            }
-            amt = remaining;
-        }
+    fn consume(&mut self, amt: usize) {
+        let Some((current_file, current_buf)) = self.state_mut().current_file_and_buf_mut() else {
+            return;
+        };
+        current_file.current_offset += amt;
+        let remaining = current_buf.consume(amt);
+        // Keep track of any bytes left to consume beyond current buffer, they will be accounted for
+        // during next `fill_buf` call.
+        current_file.left_to_consume += remaining;
     }
 }
 
@@ -473,6 +458,7 @@ impl FileState {
     fn next_read_op(&mut self, index: usize, bufs: &mut [ReadBufState]) -> Option<ReadOp> {
         let Self {
             current_offset: _,
+            left_to_consume: _,
             current_buf_index,
             raw_fd,
             next_read_offset: offset,
@@ -535,6 +521,10 @@ impl ReadBufState {
         matches!(self, ReadBufState::Reading | ReadBufState::Full { .. })
     }
 
+    fn is_full(&self) -> bool {
+        matches!(self, ReadBufState::Full { .. })
+    }
+
     fn seen_eof(&self) -> bool {
         match self {
             Self::Full { eof_pos, .. } => eof_pos.is_some(),
@@ -551,6 +541,9 @@ impl ReadBufState {
         }
     }
 
+    /// Move position in buffer by `amt`, but only up to the buffer size and eof position
+    ///
+    /// Returns the amount of bytes that were not possible to consume.
     fn consume(&mut self, amt: usize) -> usize {
         match self {
             Self::Full { pos, buf, eof_pos } => {
@@ -901,11 +894,21 @@ mod tests {
         let mut reader = SequentialFileReader::with_buffer(vec![0; 2048], 512).unwrap();
         reader.add_file_ref(temp1.as_file(), Some(5990)).unwrap();
 
-        assert_eq!(512, reader.fill_buf().unwrap().len());
+        assert_eq!(reader.fill_buf().unwrap(), &pattern[..512]);
         assert_eq!(0, reader.get_file_offset());
 
         reader.consume(600);
         assert_eq!(600, reader.get_file_offset());
-        assert_eq!(400, reader.fill_buf().unwrap().len());
+        assert_eq!(reader.fill_buf().unwrap(), &pattern[600..1024]);
+
+        reader.consume(400);
+        assert_eq!(1000, reader.get_file_offset());
+        assert_eq!(reader.fill_buf().unwrap(), &pattern[1000..1024]);
+
+        reader.consume(25);
+        assert_eq!(reader.fill_buf().unwrap(), &pattern[1025..1536]);
+
+        reader.consume(2000);
+        assert_eq!(reader.fill_buf().unwrap(), &pattern[3025..3072]);
     }
 }
