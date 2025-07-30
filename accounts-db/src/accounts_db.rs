@@ -5703,7 +5703,6 @@ impl AccountsDb {
         storages: &[Arc<AccountStorageEntry>],
         duplicates_lt_hash: &DuplicatesLtHash,
     ) -> AccountsLtHash {
-        let chunk_size = accounts_scan_par_chunk_size(storages.len());
         // Randomized order works well with rayon work splitting, since we only care about
         // uniform distribution of total work size per batch (other ordering strategies might be
         // useful for optimizing disk read sizes and buffers usage in a single IO queue).
