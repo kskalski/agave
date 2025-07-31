@@ -355,7 +355,7 @@ pub(crate) trait FileBufRead<'a>: BufRead {
 }
 
 impl<'a, B: AsMut<[u8]>> FileBufRead<'a> for SequentialFileReader<'a, B> {
-    fn set_file(&mut self, file: &'a File, _read_limit: usize) -> io::Result<()> {
+    fn set_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
         while self
             .state()
             .files
@@ -363,6 +363,9 @@ impl<'a, B: AsMut<[u8]>> FileBufRead<'a> for SequentialFileReader<'a, B> {
             .is_some_and(|file_state| !file_state.is_same_file(file))
         {
             self.move_to_next_file()?;
+        }
+        if self.state().files.is_empty() {
+            self.add_file_ref(file, read_limit)?;
         }
         Ok(())
     }
