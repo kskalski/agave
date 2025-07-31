@@ -233,7 +233,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
         Ok(())
     }
 
-    fn wait_current_buf_full(&mut self) -> Result<bool, io::Error> {
+    fn wait_current_buf_full(&mut self) -> io::Result<bool> {
         let have_data = loop {
             self.inner.process_completions()?;
 
@@ -320,24 +320,27 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
 
         // At this point we must have data or be at EOF.
         let (current_file, current_buf) = self.state().current_file_and_buf().unwrap();
-        Ok(&current_buf.as_slice()[current_file.current_buf_pos..])
+        Ok(current_buf.slice_from(current_file.current_buf_pos))
     }
 
     fn consume(&mut self, amt: usize) {
+        if amt == 0 {
+            return;
+        }
         let Some((current_file, current_buf)) = self.state_mut().current_file_and_buf_mut() else {
             return;
         };
         current_file.current_offset += amt;
 
-        let full_buf_len = current_buf.full_buf_len();
-        let current_buf_available_len = full_buf_len - current_file.current_buf_pos;
-        if amt <= current_buf_available_len {
+        let buf_len = current_buf.available_len();
+        let unconsumed_buf_len = buf_len - current_file.current_buf_pos;
+        if amt <= unconsumed_buf_len {
             current_file.current_buf_pos += amt;
         } else {
-            current_file.current_buf_pos = full_buf_len;
+            current_file.current_buf_pos = buf_len;
             // Keep track of any bytes left to consume beyond current buffer, they will be accounted for
             // during next `fill_buf` call.
-            current_file.left_to_consume += amt - current_buf_available_len;
+            current_file.left_to_consume += amt - unconsumed_buf_len;
         }
     }
 }
@@ -560,13 +563,14 @@ impl ReadBufState {
         matches!(self, ReadBufState::Reading)
     }
 
-    fn as_slice(&self) -> &[u8] {
+    fn slice_from(&self, start_pos: usize) -> &[u8] {
         match self {
             Self::Full { buf, eof_pos } => {
                 let limit = eof_pos
                     .inspect(|limit| assert!(*limit <= buf.len()))
-                    .unwrap_or(buf.len());
-                unsafe { slice::from_raw_parts(buf.as_ptr(), limit) }
+                    .unwrap_or(buf.len())
+                    .saturating_sub(start_pos);
+                unsafe { slice::from_raw_parts(buf.as_ptr().add(start_pos), limit) }
             }
             Self::Uninit(_) | Self::Reading => {
                 unreachable!("must call as_slice only on full buffer")
@@ -574,11 +578,12 @@ impl ReadBufState {
         }
     }
 
-    fn full_buf_len(&mut self) -> usize {
+    /// Returns buffer length up to the limit or EOF if any of them were reached.
+    fn available_len(&mut self) -> usize {
         match self {
             Self::Full { buf, eof_pos } => eof_pos.unwrap_or(buf.len()),
             Self::Uninit(_) | Self::Reading => {
-                unreachable!("can check len only for full buffer")
+                unreachable!("can check len only for full buffer {:?}", self)
             }
         }
     }
