@@ -16,6 +16,7 @@ use {
             unix::fs::OpenOptionsExt,
         },
         path::Path,
+        slice,
     },
 };
 
@@ -243,11 +244,15 @@ impl<'a, B> SequentialFileReader<'a, B> {
                 break false;
             };
             if current_file.left_to_consume > 0 && current_buf.is_full() {
-                current_file.left_to_consume = current_buf.consume(current_file.left_to_consume);
+                let consumed = (current_buf.full_buf_len() - current_file.current_buf_pos)
+                    .min(current_file.left_to_consume);
+                current_file.left_to_consume -= consumed;
+                current_file.current_buf_pos += consumed;
             }
             match current_buf {
-                ReadBufState::Full { pos, buf, eof_pos } => {
-                    if *pos < buf.len() && eof_pos.is_none_or(|eof| *pos < eof) {
+                ReadBufState::Full { buf, eof_pos } => {
+                    let buf_pos = current_file.current_buf_pos;
+                    if buf_pos < buf.len() && eof_pos.is_none_or(|eof| buf_pos < eof) {
                         // We have some data available.
                         break true;
                     }
@@ -260,9 +265,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
                     current_buf.transition_to_uninit();
 
                     // Next `fill_buf` will use subsequent buffer.
-                    if let Some(idx) = current_file.current_buf_index.as_mut() {
-                        *idx = (*idx + 1) % num_bufs
-                    }
+                    current_file.move_to_next_buf(num_bufs);
 
                     // A buffer was freed, so try to queue up next read.
                     if let Some(op) = state.next_read_op() {
@@ -314,7 +317,8 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
         }
 
         // At this point we must have data or be at EOF.
-        Ok(self.state().current_buf().unwrap().as_slice())
+        let (current_file, current_buf) = self.state().current_file_and_buf().unwrap();
+        Ok(&current_buf.as_slice()[current_file.current_buf_pos..])
     }
 
     fn consume(&mut self, amt: usize) {
@@ -322,10 +326,17 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
             return;
         };
         current_file.current_offset += amt;
-        let remaining = current_buf.consume(amt);
-        // Keep track of any bytes left to consume beyond current buffer, they will be accounted for
-        // during next `fill_buf` call.
-        current_file.left_to_consume += remaining;
+
+        let full_buf_len = current_buf.full_buf_len();
+        let current_buf_available_len = full_buf_len - current_file.current_buf_pos;
+        if amt <= current_buf_available_len {
+            current_file.current_buf_pos += amt;
+        } else {
+            current_file.current_buf_pos = full_buf_len;
+            // Keep track of any bytes left to consume beyond current buffer, they will be accounted for
+            // during next `fill_buf` call.
+            current_file.left_to_consume += amt - current_buf_available_len;
+        }
     }
 }
 
@@ -381,10 +392,14 @@ impl SequentialFileReaderState {
         self.files.front().and_then(|f| f.current_buf_index)
     }
 
-    fn current_buf(&self) -> Option<&ReadBufState> {
-        self.current_buf_index().map(|idx| &self.buffers[idx])
+    /// Get references to current file state and buffer it is using for consumption.
+    fn current_file_and_buf(&self) -> Option<(&FileState, &ReadBufState)> {
+        self.files
+            .front()
+            .and_then(|f| f.current_buf_index.map(|idx| (f, &self.buffers[idx])))
     }
 
+    /// Get mutable references to current file state and buffer it is using for consumption.
     fn current_file_and_buf_mut(&mut self) -> Option<(&mut FileState, &mut ReadBufState)> {
         self.files
             .front_mut()
@@ -438,6 +453,8 @@ struct FileState {
     current_offset: usize,
     /// Index of `state.buffers` to consume data from (if file is already being read)
     current_buf_index: Option<usize>,
+    /// Position in buffer (pointed by `current_buf_index`) to consume data from
+    current_buf_pos: usize,
     /// Amount of bytes left to consume from buffers before returning actual by
     left_to_consume: usize,
 }
@@ -450,12 +467,20 @@ impl FileState {
             next_read_offset: 0,
             current_offset: 0,
             current_buf_index: None,
+            current_buf_pos: 0,
             left_to_consume: 0,
         }
     }
 
     fn is_same_file(&self, file: &File) -> bool {
         self.raw_fd == file.as_raw_fd()
+    }
+
+    fn move_to_next_buf(&mut self, num_bufs: usize) {
+        if let Some(idx) = self.current_buf_index.as_mut() {
+            *idx = (*idx + 1) % num_bufs
+        }
+        self.current_buf_pos = 0;
     }
 
     /// Create a new read operation into the `bufs[index]` buffer and update file state.
@@ -469,6 +494,7 @@ impl FileState {
         let Self {
             current_offset: _,
             left_to_consume: _,
+            current_buf_pos: _,
             current_buf_index,
             raw_fd,
             next_read_offset: offset,
@@ -514,10 +540,8 @@ enum ReadBufState {
     Reading,
     /// The buffer is filled and ready to be consumed.
     Full {
-        /// Position in `buf` where the file using it can start filling from
-        pos: usize,
         buf: FixedIoBuffer,
-        /// Position in `buf` at which 0-sized read (or required read limit) was reached
+        /// Position in `buf` at which 0-sized read (or requested read limit) was reached
         eof_pos: Option<usize>,
     },
 }
@@ -537,29 +561,23 @@ impl ReadBufState {
 
     fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Full { pos, buf, eof_pos } => buf.slice_range(*pos, eof_pos),
+            Self::Full { buf, eof_pos } => {
+                let limit = eof_pos
+                    .inspect(|limit| assert!(*limit <= buf.len()))
+                    .unwrap_or(buf.len());
+                unsafe { slice::from_raw_parts(buf.as_ptr(), limit) }
+            }
             Self::Uninit(_) | Self::Reading => {
                 unreachable!("must call as_slice only on full buffer")
             }
         }
     }
 
-    /// Move position in buffer by `amt`, but only up to the buffer size and eof position
-    ///
-    /// Returns the amount of bytes that were not possible to consume.
-    fn consume(&mut self, amt: usize) -> usize {
+    fn full_buf_len(&mut self) -> usize {
         match self {
-            Self::Full { pos, buf, eof_pos } => {
-                let cur_buf_amt = eof_pos.unwrap_or(buf.len()) - *pos;
-                if cur_buf_amt > amt {
-                    *pos += amt;
-                    return 0;
-                }
-                *pos += cur_buf_amt;
-                amt - cur_buf_amt
-            }
+            Self::Full { buf, eof_pos } => eof_pos.unwrap_or(buf.len()),
             Self::Uninit(_) | Self::Reading => {
-                unreachable!("must call consume only on full buffer")
+                unreachable!("can check len only for full buffer")
             }
         }
     }
@@ -668,7 +686,6 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
             completion.push(op);
         } else {
             reader_state.buffers[reader_buf_index] = ReadBufState::Full {
-                pos: 0,
                 buf,
                 eof_pos: (last_read_len == 0 || is_last_read).then_some(total_read_len),
             };

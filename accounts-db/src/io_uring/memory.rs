@@ -177,18 +177,14 @@ impl FixedIoBuffer {
         self.size
     }
 
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
     /// Safety: while just returning without dereferencing a pointer is safe, this is marked unsafe
     /// so that the callers are encouraged to reason about the lifetime of the buffer.
     pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
-    }
-
-    pub fn slice_range(&self, pos: usize, limit: &Option<usize>) -> &[u8] {
-        let limit = limit
-            .inspect(|limit| assert!(*limit <= self.size))
-            .unwrap_or(self.size);
-        assert!(pos <= limit);
-        unsafe { slice::from_raw_parts(self.ptr.byte_add(pos), limit - pos) }
     }
 
     /// The index of the fixed buffer in the ring. See register_buffers().
@@ -210,12 +206,6 @@ impl FixedIoBuffer {
             })
             .collect::<Vec<_>>();
         unsafe { ring.register_buffers(&iovecs) }
-    }
-}
-
-impl AsRef<[u8]> for FixedIoBuffer {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr, self.size) }
     }
 }
 
