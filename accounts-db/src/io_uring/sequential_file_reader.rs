@@ -243,14 +243,16 @@ impl<'a, B> SequentialFileReader<'a, B> {
                 // No file is being read, no data will be available.
                 break false;
             };
-            if current_file.left_to_consume > 0 && current_buf.is_full() {
-                let consumed = (current_buf.full_buf_len() - current_file.current_buf_pos)
-                    .min(current_file.left_to_consume);
-                current_file.left_to_consume -= consumed;
-                current_file.current_buf_pos += consumed;
-            }
             match current_buf {
                 ReadBufState::Full { buf, eof_pos } => {
+                    if current_file.left_to_consume > 0 {
+                        let consumed = (eof_pos.unwrap_or(buf.len())
+                            - current_file.current_buf_pos)
+                            .min(current_file.left_to_consume);
+                        current_file.left_to_consume -= consumed;
+                        current_file.current_buf_pos += consumed;
+                    }
+
                     let buf_pos = current_file.current_buf_pos;
                     if buf_pos < buf.len() && eof_pos.is_none_or(|eof| buf_pos < eof) {
                         // We have some data available.
@@ -552,10 +554,6 @@ enum ReadBufState {
 impl ReadBufState {
     fn is_used(&self) -> bool {
         matches!(self, ReadBufState::Reading | ReadBufState::Full { .. })
-    }
-
-    fn is_full(&self) -> bool {
-        matches!(self, ReadBufState::Full { .. })
     }
 
     fn is_reading(&self) -> bool {
