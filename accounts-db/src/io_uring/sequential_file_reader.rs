@@ -297,15 +297,13 @@ impl<'a, B> SequentialFileReader<'a, B> {
     }
 }
 
-// BufRead requires Read, but we never really use the Read interface.
 impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let available = self.fill_buf()?;
-        if available.is_empty() {
-            return Ok(0); // EOF.
-        }
-
         let bytes_to_read = available.len().min(buf.len());
+        if bytes_to_read == 0 {
+            return Ok(0); // EOF or empty `buf`
+        }
         buf[..bytes_to_read].copy_from_slice(&available[..bytes_to_read]);
         self.consume(bytes_to_read);
         Ok(bytes_to_read)
