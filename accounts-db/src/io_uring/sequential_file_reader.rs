@@ -177,12 +177,19 @@ impl<'a, B> SequentialFileReader<'a, B> {
             return Ok(());
         };
         if let Some(next_file_index) = state.next_read_file_index.as_mut() {
+            // Since file was removed from front, all indices are shifted by one
             state.next_read_file_index = next_file_index.checked_sub(1);
+            // When file being read was the removed file, move to the next file
             if state.next_read_file_index.is_none() && !state.files.is_empty() {
                 state.next_read_file_index = Some(0);
             }
         }
+        let sentinel_buf_index = state
+            .current_buf_index()
+            .or(file_state.current_buf_index)
+            .unwrap_or_default();
 
+        // Reclaim current and all subsequent unread buffers of removed file as uninitialized.
         while let Some(buf_index) = file_state.current_buf_index {
             self.inner.process_completions()?;
             let state = self.state_mut();
@@ -196,7 +203,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
             current_buf.transition_to_uninit();
 
             let next_buf_index = (buf_index + 1) % state.buffers.len();
-            file_state.current_buf_index = if state.next_read_buf_index == next_buf_index {
+            file_state.current_buf_index = if sentinel_buf_index == next_buf_index {
                 None
             } else {
                 Some(next_buf_index)
@@ -673,7 +680,7 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, std::io::Seek, tempfile::NamedTempFile};
+    use {super::*, std::io::Seek, tempfile::NamedTempFile, test_case::test_case};
 
     fn read_as_vec(mut reader: impl Read) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -765,10 +772,14 @@ mod tests {
         reader.add_file(f2, usize::MAX).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
-
         reader.move_to_next_file().unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
+        reader.move_to_next_file().unwrap();
+
+        let f1 = File::open(temp1.path()).unwrap();
+        reader.add_file(f1, usize::MAX).unwrap();
+        assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
     }
 
     #[test]
@@ -785,26 +796,70 @@ mod tests {
         reader.add_file_ref(temp2.as_file(), 5).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb]);
-
         reader.move_to_next_file().unwrap();
+
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf]);
-
         reader.move_to_next_file().unwrap();
+
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
-
         reader.move_to_next_file().unwrap();
+
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
+
+        reader.add_file_ref(temp2.as_file(), 4).unwrap();
+        reader.add_file_ref(temp1.as_file(), 2).unwrap();
+        reader.move_to_next_file().unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
+        reader.move_to_next_file().unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb]);
     }
 
-    #[test]
-    fn test_multiple_medium_limited_files() {
+    #[test_case(2048, 512)]
+    #[test_case(256, 128)]
+    #[test_case(32, 2)]
+    fn test_multiple_limited_and_unlimited_files(buffer_size: usize, read_size: usize) {
+        let mut temp1 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp1, &[0xa, 0xb, 0xc, 0xd]).unwrap();
+        let mut temp2 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp2, &[0x10, 0x11, 0x12, 0x13, 0x14]).unwrap();
+
+        let mut reader =
+            SequentialFileReader::with_buffer(vec![0; buffer_size], read_size).unwrap();
+        reader.add_file_ref(temp1.as_file(), 2).unwrap();
+        reader.add_file_ref(temp2.as_file(), usize::MAX).unwrap();
+        reader.add_file_ref(temp1.as_file(), 3).unwrap();
+        reader.add_file_ref(temp2.as_file(), 4).unwrap();
+        reader.add_file_ref(temp1.as_file(), usize::MAX).unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb]);
+        reader.move_to_next_file().unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0x10, 0x11, 0x12, 0x13, 0x14]);
+        reader.move_to_next_file().unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
+        reader.move_to_next_file().unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0x10, 0x11, 0x12, 0x13]);
+        reader.move_to_next_file().unwrap();
+
+        assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc, 0xd]);
+    }
+
+    #[test_case(2048, 512)]
+    #[test_case(256, 128)]
+    #[test_case(256, 32)]
+    fn test_multiple_medium_limited_files(buffer_size: usize, read_size: usize) {
         let pattern = (0..2000).map(|i| i as u8).collect::<Vec<_>>();
         let mut temp1 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp1, &pattern).unwrap();
         let mut temp2 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp2, &pattern[1000..]).unwrap();
 
-        let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
+        let mut reader =
+            SequentialFileReader::with_buffer(vec![0; buffer_size], read_size).unwrap();
         reader.add_file_ref(temp1.as_file(), 1990).unwrap();
         reader.add_file_ref(temp2.as_file(), 1000).unwrap();
         reader.add_file_ref(temp1.as_file(), 2010).unwrap();
