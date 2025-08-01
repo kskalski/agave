@@ -215,15 +215,8 @@ impl<'a, B> SequentialFileReader<'a, B> {
         }
 
         // Start reading as many buffers as necessary for queued files.
-        let mut was_op_pushed = false;
         while let Some(op) = self.state_mut().next_read_op() {
             self.inner.push(op)?;
-            was_op_pushed = true;
-        }
-        if was_op_pushed {
-            // Make sure work is started in case submission queue is large and we
-            // never submitted work when adding buffers.
-            self.inner.submit()?;
         }
 
         if self
