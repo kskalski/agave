@@ -1,3 +1,5 @@
+use std::fs::File;
+
 #[cfg(feature = "dev-context-only-utils")]
 use crate::append_vec::{self, StoredAccountMeta};
 use {
@@ -290,6 +292,14 @@ impl AccountsFile {
         match self {
             Self::AppendVec(av) => av.path(),
             Self::TieredStorage(ts) => ts.path(),
+        }
+    }
+
+    /// Return the path of the underlying account file.
+    pub fn get_file(&self) -> Option<(&File, usize)> {
+        match self {
+            Self::AppendVec(av) => Some((av.file(), av.len())),
+            Self::TieredStorage(_) => None,
         }
     }
 

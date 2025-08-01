@@ -300,6 +300,10 @@ impl<R: BufRead> BufReaderWithOverflow<R> {
             overflow_max_capacity,
         }
     }
+
+    pub fn inner_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
 }
 
 impl<R: BufRead> io::Read for BufReaderWithOverflow<R> {

@@ -5703,28 +5703,36 @@ impl AccountsDb {
         storages: &[Arc<AccountStorageEntry>],
         duplicates_lt_hash: &DuplicatesLtHash,
     ) -> AccountsLtHash {
+        let chunk_size = 16.max(storages.len() / 10 / 6);
         // Randomized order works well with rayon work splitting, since we only care about
         // uniform distribution of total work size per batch (other ordering strategies might be
         // useful for optimizing disk read sizes and buffers usage in a single IO queue).
         let storages = AccountStoragesOrderer::with_random_order(storages);
         let mut lt_hash = storages
-            .par_iter()
+            .par_chunks(chunk_size)
             .map_init(
-                || Box::new(append_vec::new_full_accounts_scan_reader()),
-                |reader, storage| {
+                || Box::new(append_vec::new_full_accounts_scan_io_reader()),
+                |reader, storages| {
+                    for st in &storages {
+                        if let Some((file, read_limit)) = st.accounts.get_file() {
+                            reader.inner_mut().add_file(file, read_limit).unwrap();
+                        }
+                    }
                     let mut accum = LtHash::identity();
-                    let obsolete_accounts = storage.get_obsolete_accounts(None);
-                    storage
-                        .accounts
-                        .scan_accounts(reader.as_mut(), |offset, account| {
-                            // Obsolete accounts were not included in the original hash, so they should not be added here
-                            if !obsolete_accounts.contains(&(offset, account.data.len())) {
-                                let account_lt_hash =
-                                    Self::lt_hash_account(&account, account.pubkey());
-                                accum.mix_in(&account_lt_hash.0);
-                            }
-                        })
-                        .expect("must scan accounts storage");
+                    for storage in storages {
+                        let obsolete_accounts = storage.get_obsolete_accounts(None);
+                        storage
+                            .accounts
+                            .scan_accounts(reader.as_mut(), |offset, account| {
+                                // Obsolete accounts were not included in the original hash, so they should not be added here
+                                if !obsolete_accounts.contains(&(offset, account.data.len())) {
+                                    let account_lt_hash =
+                                        Self::lt_hash_account(&account, account.pubkey());
+                                    accum.mix_in(&account_lt_hash.0);
+                                }
+                            })
+                            .expect("must scan accounts storage");
+                    }
                     accum
                 },
             )

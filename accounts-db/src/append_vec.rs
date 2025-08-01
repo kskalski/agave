@@ -10,10 +10,12 @@ pub mod test_utils;
 // Used all over the accounts-db crate.  Probably should be minimized.
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
+use crate::io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader};
 #[cfg(feature = "dev-context-only-utils")]
 pub use meta::{AccountMeta, StoredMeta};
 #[cfg(not(feature = "dev-context-only-utils"))]
 use meta::{AccountMeta, StoredMeta};
+
 use {
     crate::{
         account_info::Offset,
@@ -217,6 +219,21 @@ pub(crate) fn new_full_accounts_scan_reader<'a>() -> impl RequiredLenBufFileRead
     const BUFFER_SIZE: usize = PAGE_SIZE * 8;
     BufReaderWithOverflow::new(
         BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(),
+        MIN_CAPACITY,
+        MAX_CAPACITY,
+    )
+}
+
+/// Create a reusable buffered reader tuned for full accounts' storage scan.
+pub(crate) fn new_full_accounts_scan_io_reader<'a>(
+) -> BufReaderWithOverflow<SequentialFileReader<'a, LargeBuffer>> {
+    // 128KiB covers a reasonably large distribution of typical account sizes.
+    // In a recent sample, 99.98% of accounts' data lengths were less than or equal to 128KiB.
+    const MIN_CAPACITY: usize = 1024 * 128;
+    const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
+    const BUFFER_SIZE: usize = 16 * 1024 * 1024;
+    BufReaderWithOverflow::new(
+        SequentialFileReader::with_capacity(BUFFER_SIZE).unwrap(),
         MIN_CAPACITY,
         MAX_CAPACITY,
     )
@@ -963,6 +980,16 @@ impl AppendVec {
     /// Returns the path to the file where the data is stored
     pub fn path(&self) -> &Path {
         self.path.as_path()
+    }
+
+    /// Returns the path to the file where the data is stored
+    pub fn file(&self) -> &File {
+        match self.backing {
+            AppendVecFileBacking::File(ref file) => file,
+            AppendVecFileBacking::Mmap(_) => {
+                panic!("Memory-backed AppendVec does not have a file")
+            }
+        }
     }
 
     /// help with the math of offsets when navigating the on-disk layout in an AppendVec.

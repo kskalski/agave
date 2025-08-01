@@ -4,7 +4,10 @@ use {
     crate::accounts_db::{AccountStorageEntry, AccountsFileId},
     dashmap::DashMap,
     rand::seq::SliceRandom,
-    rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    rayon::{
+        iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+        slice::ParallelSlice,
+    },
     solana_clock::Slot,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap},
     std::{
@@ -353,6 +356,18 @@ impl<'a> AccountStoragesOrderer<'a> {
 
     pub fn par_iter(&'a self) -> impl IndexedParallelIterator<Item = &'a AccountStorageEntry> + 'a {
         self.indices.par_iter().map(|i| self.storages[*i].as_ref())
+    }
+
+    pub fn par_chunks(
+        &'a self,
+        chunk_size: usize,
+    ) -> impl IndexedParallelIterator<Item = Vec<&'a AccountStorageEntry>> + 'a {
+        self.indices.par_chunks(chunk_size).map(|chunk| {
+            chunk
+                .iter()
+                .map(|i| self.storages[*i].as_ref())
+                .collect::<Vec<_>>()
+        })
     }
 }
 
