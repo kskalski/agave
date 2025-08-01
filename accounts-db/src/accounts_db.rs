@@ -5724,15 +5724,16 @@ impl AccountsDb {
                         let mut reader = append_vec::new_full_accounts_scan_io_reader();
                         let mut chunk = VecDeque::with_capacity(64);
                         let mut accum = LtHash::identity();
+                        let mut c_index = 0;
                         loop {
-                            if chunk.len() < 32 {
-                                loop {
-                                    let index = current_index.fetch_add(1, Ordering::Relaxed);
-                                    if index >= storages.len() {
+                            if chunk.len() < chunk.capacity() / 2 && c_index < storages.len() {
+                                while chunk.len() < chunk.capacity() {
+                                    c_index = current_index.fetch_add(1, Ordering::Relaxed);
+                                    if c_index >= storages.len() {
                                         break;
                                     }
-                                    if let Some((a, b)) = storages[index].accounts.get_file() {
-                                        chunk.push_back(index);
+                                    if let Some((a, b)) = storages[c_index].accounts.get_file() {
+                                        chunk.push_back(c_index);
                                         reader.inner_mut().add_file(a, b).unwrap();
                                     }
                                 }
