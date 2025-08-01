@@ -48,7 +48,13 @@ impl SequentialFileReader<'_, LargeBuffer> {
     /// Create a new `SequentialFileReader` using internally allocated buffer
     /// of specified `buf_size` and default read size.
     pub fn with_capacity(buf_size: usize) -> io::Result<Self> {
-        Self::with_buffer(LargeBuffer::new(buf_size), DEFAULT_READ_SIZE)
+        Self::with_capacity_and_read_size(buf_size, DEFAULT_READ_SIZE)
+    }
+
+    /// Create a new `SequentialFileReader` using internally allocated buffer
+    /// of specified `buf_size` and default read size.
+    pub fn with_capacity_and_read_size(buf_size: usize, read_capacity: usize) -> io::Result<Self> {
+        Self::with_buffer(LargeBuffer::new(buf_size), read_capacity)
     }
 }
 
