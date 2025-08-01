@@ -31,7 +31,7 @@ use {
         account_info::{AccountInfo, Offset, StorageLocation},
         account_storage::{
             stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
-            AccountStorage, AccountStorageStatus, AccountStoragesOrderer, ShrinkInProgress,
+            AccountStorage, AccountStorageStatus, ShrinkInProgress,
         },
         accounts_cache::{AccountsCache, CachedAccount, SlotCache},
         accounts_db::stats::{
@@ -5695,35 +5695,62 @@ impl AccountsDb {
         // uniform distribution of total work size per batch (other ordering strategies might be
         // useful for optimizing disk read sizes and buffers usage in a single IO queue).
         let storages = AccountStoragesOrderer::with_random_order(storages);
-        let mut lt_hash = storages
-            .par_iter()
-            .fold(
-                || Box::new((LtHash::identity(), append_vec::new_scan_accounts_reader())),
-                |mut state, storage| {
-                    let (ref mut accum, ref mut reader) = state.as_mut();
-                    // Function is calculating the accounts_lt_hash from all accounts in the
-                    // storages as of startup_slot. This means that any accounts marked obsolete at a
-                    // slot newer than startup_slot should be included in the accounts_lt_hash
-                    let obsolete_accounts = storage.get_obsolete_accounts(Some(startup_slot));
-                    storage
-                        .accounts
-                        .scan_accounts(reader, |offset, account| {
-                            // Obsolete accounts were not included in the original hash, so they should not be added here
-                            if !obsolete_accounts.contains(&(offset, account.data.len())) {
-                                let account_lt_hash =
-                                    Self::lt_hash_account(&account, account.pubkey());
-                                accum.mix_in(&account_lt_hash.0);
+        let current_index = Arc::new(AtomicUsize::new(0));
+        let mut lt_hash = std::thread::scope(|s| {
+            let handles = (0..6)
+                .map(|_| {
+                    let current_index = current_index.clone();
+                    s.spawn(move || {
+                        let mut reader = append_vec::new_full_accounts_scan_io_reader();
+                        let mut chunk = VecDeque::with_capacity(64);
+                        let mut accum = LtHash::identity();
+                        loop {
+                            if chunk.len() < 32 {
+                                loop {
+                                    let index = current_index.fetch_add(1, Ordering::Relaxed);
+                                    if index >= storages.len() {
+                                        break;
+                                    }
+                                    if let Some((a, b)) = storages[index].accounts.get_file() {
+                                        chunk.push_back(index);
+                                        reader.inner_mut().add_file(a, b).unwrap();
+                                    }
+                                }
                             }
-                        })
-                        .expect("must scan accounts storage");
-                    state
+
+                            let Some(index) = chunk.pop_front() else {
+                                return accum;
+                            };
+                            let storage = &storages[index];
+
+                            // Function is calculating the accounts_lt_hash from all accounts in the
+                            // storages as of startup_slot. This means that any accounts marked obsolete at a
+                            // slot newer than startup_slot should be included in the accounts_lt_hash
+                            let obsolete_accounts =
+                                storage.get_obsolete_accounts(Some(startup_slot));
+                            storage
+                                .accounts
+                                .scan_accounts(reader, |offset, account| {
+                                    // Obsolete accounts were not included in the original hash, so they should not be added here
+                                    if !obsolete_accounts.contains(&(offset, account.data.len())) {
+                                        let account_lt_hash =
+                                            Self::lt_hash_account(&account, account.pubkey());
+                                        accum.mix_in(&account_lt_hash.0);
+                                    }
+                                })
+                                .expect("must scan accounts storage");
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles.into_iter().map(|h| h.join().unwrap()).fold(
+                LtHash::identity(),
+                |mut acc, hash| {
+                    acc.mix_in(&hash);
+                    acc
                 },
             )
-            .map(|elem| elem.0)
-            .reduce(LtHash::identity, |mut accum, elem| {
-                accum.mix_in(&elem);
-                accum
-            });
+        });
 
         if self.mark_obsolete_accounts {
             // If `mark_obsolete_accounts` is true, then none if the duplicate accounts were
