@@ -10,10 +10,12 @@ pub mod test_utils;
 // Used all over the accounts-db crate.  Probably should be minimized.
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
+use crate::io_uring::{memory::LargeBuffer, sequential_file_reader::SequentialFileReader};
 #[cfg(feature = "dev-context-only-utils")]
 pub use meta::{AccountMeta, StoredMeta};
 #[cfg(not(feature = "dev-context-only-utils"))]
 use meta::{AccountMeta, StoredMeta};
+
 use {
     crate::{
         account_info::Offset,
@@ -949,6 +951,16 @@ impl AppendVec {
     /// Returns the path to the file where the data is stored
     pub fn path(&self) -> &Path {
         self.path.as_path()
+    }
+
+    /// Returns the path to the file where the data is stored
+    pub fn file(&self) -> &File {
+        match self.backing {
+            AppendVecFileBacking::File(ref file) => file,
+            AppendVecFileBacking::Mmap(_) => {
+                panic!("Memory-backed AppendVec does not have a file")
+            }
+        }
     }
 
     /// help with the math of offsets when navigating the on-disk layout in an AppendVec.
