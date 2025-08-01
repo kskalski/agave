@@ -37,6 +37,8 @@ pub struct SequentialFileReader<'a, B> {
     // to the buffer and operates on file descriptors of files that are assumed to be open.
     inner: Ring<SequentialFileReaderState, ReadOp>,
     owned_files: VecDeque<File>,
+    /// Marker to skip checking kernel queue if already filled buffer wasn't yet consumed
+    has_filled_buf: bool,
     /// Owned buffer used (chunked into `FixedIoBuffer` items) across lifespan of `inner`
     /// (should get dropped last)
     _backing_buffer: B,
@@ -105,6 +107,7 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
         Ok(Self {
             inner,
             owned_files: VecDeque::new(),
+            has_filled_buf: false,
             _backing_buffer: backing_buffer,
             _phantom: PhantomData,
         })
@@ -226,11 +229,15 @@ impl<'a, B> SequentialFileReader<'a, B> {
         {
             self.owned_files.pop_front();
         }
+        self.has_filled_buf = false;
         Ok(())
     }
 
-    fn wait_current_buf_full(&mut self) -> io::Result<bool> {
-        let have_data = loop {
+    fn wait_current_buf_full(&mut self) -> io::Result<()> {
+        if self.has_filled_buf {
+            return Ok(());
+        }
+        self.has_filled_buf = loop {
             self.inner.process_completions()?;
 
             let state = self.state_mut();
@@ -281,7 +288,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
             }
             // Move to the next buffer and check again whether we have data.
         };
-        Ok(have_data)
+        Ok(())
     }
 
     fn state(&self) -> &SequentialFileReaderState {
@@ -308,7 +315,9 @@ impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
 
 impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if !self.wait_current_buf_full()? {
+        self.wait_current_buf_full()?;
+
+        if !self.has_filled_buf {
             return Ok(&[]);
         }
 
@@ -336,6 +345,7 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
             // during next `fill_buf` call.
             current_file.left_to_consume += amt - unconsumed_buf_len;
         }
+        self.has_filled_buf = amt < unconsumed_buf_len;
     }
 }
 
@@ -457,7 +467,8 @@ struct FileState {
     current_buf_index: Option<usize>,
     /// Position in buffer (pointed by `current_buf_index`) to consume data from
     current_buf_pos: usize,
-    /// Amount of bytes left to consume from buffers before returning actual by
+    /// Amount of bytes left to consume from next buffer(s) before returning them in `fill_buf()`.
+    /// This is necessary to handle `consume()` calls beyond the current buffer.
     left_to_consume: usize,
 }
 
