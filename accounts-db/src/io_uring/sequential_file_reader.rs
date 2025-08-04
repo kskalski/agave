@@ -1074,7 +1074,7 @@ mod tests {
         let mut temp1 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp1, &[0xa, 0xb, 0xc]).unwrap();
         let mut temp2 = NamedTempFile::new().unwrap();
-        io::Write::write_all(&mut temp2, &[0xa, 0xb, 0xc]).unwrap();
+        io::Write::write_all(&mut temp2, &[0xd, 0xe, 0xf]).unwrap();
 
         let mut readers =
             SequentialFileReader::multiple_with_capacity_and_read_size(2, 1 << 20, 1 << 10)
@@ -1082,6 +1082,6 @@ mod tests {
         readers[0].add_file(temp1.as_file(), 3).unwrap();
         readers[1].add_file(temp2.as_file(), 3).unwrap();
         assert_eq!(read_as_vec(&mut readers[0]), vec![0xa, 0xb, 0xc]);
-        assert_eq!(read_as_vec(&mut readers[1]), vec![0xa, 0xb, 0xc]);
+        assert_eq!(read_as_vec(&mut readers[1]), vec![0xd, 0xe, 0xf]);
     }
 }

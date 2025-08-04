@@ -7409,7 +7409,7 @@ fn ensure_chunk_filled<'a>(
     current_index: &AtomicUsize,
     chunk: &mut VecDeque<&'a AccountStorageEntry>,
 ) -> usize {
-    let num_filled = if chunk.len() ^ (chunk.capacity() / 2) == 0 {
+    let num_filled = if chunk.is_empty() || chunk.len() == chunk.capacity() / 2 == 0 {
         let num_missing_items = chunk.capacity() - chunk.len();
         let consume_index = current_index.fetch_add(num_missing_items, Ordering::Relaxed);
         let consume_range = consume_index..storages.len().min(consume_index + num_missing_items);
