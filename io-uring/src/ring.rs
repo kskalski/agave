@@ -86,6 +86,7 @@ impl<T, E: RingOp<T>> Ring<T, E> {
         }
         let key = self.entries.insert(op);
         let entry = self.entries.get_mut(key).unwrap().entry();
+        println!("new entry {}", key);
         let entry = entry.user_data(key as u64);
         // Safety: the entry is stored in self.entries and guaranteed to be valid for the lifetime
         // of the operation. E implementations must still ensure that the entry
@@ -148,6 +149,7 @@ impl<T, E: RingOp<T>> Ring<T, E> {
         let mut new_entries = smallvec![];
         while let Some(cqe) = completion.next() {
             let completed_key = cqe.user_data() as usize;
+            println!("completed key {}", completed_key);
             let entry = self.entries.get_mut(completed_key).unwrap();
             let result = entry.result(cqe.result());
             let mut comp_ctx = Completion {

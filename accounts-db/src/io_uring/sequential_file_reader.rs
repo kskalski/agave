@@ -59,10 +59,12 @@ impl SequentialFileReader<'_, LargeBuffer> {
         read_capacity: usize,
     ) -> io::Result<Vec<Self>> {
         let reader_buf_size = total_buf_size / num_readers;
-        let ring = Self::create_ring(reader_buf_size / read_capacity, 1)?;
+        let ring = Self::create_ring(reader_buf_size / read_capacity, 1, None)?;
         let mut readers = Vec::with_capacity(num_readers);
         for _ in 1..num_readers {
-            let ring = unsafe { IoUring::from_fd(ring.as_raw_fd(), ring.params().clone())? };
+            let ring =
+                Self::create_ring(reader_buf_size / read_capacity, 1, Some(ring.as_raw_fd()))
+                    .unwrap();
             let reader =
                 Self::with_buffer_and_ring(LargeBuffer::new(reader_buf_size), read_capacity, ring)?;
             readers.push(reader);
@@ -70,6 +72,25 @@ impl SequentialFileReader<'_, LargeBuffer> {
         let reader =
             Self::with_buffer_and_ring(LargeBuffer::new(reader_buf_size), read_capacity, ring)?;
         readers.push(reader);
+
+        // unsafe {
+        //     FixedIoBuffer::register_many(
+        //         readers.iter().map(|r| r._backing_buffer.as_ref()).collect(),
+        //         &readers[0].inner,
+        //     )?
+        // };
+        // readers[1]
+        //     .inner
+        //     .context_mut()
+        //     .buffers
+        //     .iter_mut()
+        //     .for_each(|buf| match buf {
+        //         ReadBufState::Uninit(fixed_io_buffer) => {
+        //             fixed_io_buffer.io_buf_index.as_mut().map(|i| *i += 1);
+        //         }
+        //         ReadBufState::Reading => todo!(),
+        //         ReadBufState::Full { .. } => todo!(),
+        //     });
         Ok(readers)
     }
 }
@@ -82,17 +103,32 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
     ///
     /// Initially the reader is idle and starts reading after the first file is added.
     pub fn with_buffer(mut buffer: B, read_capacity: usize) -> io::Result<Self> {
-        let ring = Self::create_ring(buffer.as_mut().len() / read_capacity, MAX_IOWQ_WORKERS)?;
-        Self::with_buffer_and_ring(buffer, read_capacity, ring)
+        let ring = Self::create_ring(
+            buffer.as_mut().len() / read_capacity,
+            MAX_IOWQ_WORKERS,
+            None,
+        )?;
+        let this = Self::with_buffer_and_ring(buffer, read_capacity, ring)?;
+        // Safety: kernel holds unsafe pointers to `buffer`, struct field declaration order
+        // guarantees that the ring is destroyed before `_backing_buffer` is dropped.
+        //        unsafe { FixedIoBuffer::register(this._backing_buffer.as_mut(), &this.inner)? };
+        Ok(this)
     }
 
-    pub fn create_ring(num_buffers: usize, num_workers: u32) -> io::Result<IoUring> {
+    pub fn create_ring(
+        num_buffers: usize,
+        num_workers: u32,
+        attach_existing_fd: Option<RawFd>,
+    ) -> io::Result<IoUring> {
         // Let submission queue hold half of buffers before we explicitly syscall
         // to submit them for reading.
         let ring_qsize = (num_buffers / 2).max(1) as u32;
-        let ring = IoUring::builder()
-            .setup_sqpoll(SQPOLL_IDLE_TIMEOUT)
-            .build(ring_qsize)?;
+        let mut ring = IoUring::builder();
+        ring.setup_sqpoll(SQPOLL_IDLE_TIMEOUT);
+        if let Some(fd) = attach_existing_fd {
+            ring.setup_attach_wq(fd);
+        }
+        let ring = ring.build(ring_qsize)?;
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).
         ring.submitter()
@@ -126,8 +162,6 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
             },
         );
 
-        // Safety: kernel holds unsafe pointers to `buffer`, struct field declaration order
-        // guarantees that the ring is destroyed before `_backing_buffer` is dropped.
         unsafe { FixedIoBuffer::register(buffer, &inner)? };
 
         Ok(Self {
@@ -1033,5 +1067,21 @@ mod tests {
 
         reader.set_file(temp2.as_file(), 4).unwrap();
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
+    }
+
+    #[test]
+    fn test_multiple_readers() {
+        let mut temp1 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp1, &[0xa, 0xb, 0xc]).unwrap();
+        let mut temp2 = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut temp2, &[0xa, 0xb, 0xc]).unwrap();
+
+        let mut readers =
+            SequentialFileReader::multiple_with_capacity_and_read_size(2, 1 << 20, 1 << 10)
+                .unwrap();
+        readers[0].add_file(temp1.as_file(), 3).unwrap();
+        readers[1].add_file(temp2.as_file(), 3).unwrap();
+        assert_eq!(read_as_vec(&mut readers[0]), vec![0xa, 0xb, 0xc]);
+        assert_eq!(read_as_vec(&mut readers[1]), vec![0xa, 0xb, 0xc]);
     }
 }

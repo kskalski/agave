@@ -141,7 +141,7 @@ impl DerefMut for PageAlignedMemory {
 pub(super) struct FixedIoBuffer {
     ptr: *mut u8,
     size: usize,
-    io_buf_index: Option<u16>,
+    pub io_buf_index: Option<u16>,
 }
 
 unsafe impl Send for FixedIoBuffer {}
@@ -208,6 +208,25 @@ impl FixedIoBuffer {
                 iov_base: buf.as_ptr() as _,
                 iov_len: buf.len(),
             })
+            .collect::<Vec<_>>();
+        unsafe { ring.register_buffers(&iovecs) }
+    }
+
+    #[allow(unused)]
+    pub unsafe fn register_many<S, E: RingOp<S>>(
+        buffers: Vec<&[u8]>,
+        ring: &Ring<S, E>,
+    ) -> io::Result<()> {
+        //adjust_ulimit_memlock(buffer.len())?;
+        let iovecs = buffers
+            .into_iter()
+            .map(|buffer| {
+                buffer.chunks(FIXED_BUFFER_LEN).map(|buf| libc::iovec {
+                    iov_base: buf.as_ptr() as _,
+                    iov_len: buf.len(),
+                })
+            })
+            .flatten()
             .collect::<Vec<_>>();
         unsafe { ring.register_buffers(&iovecs) }
     }
