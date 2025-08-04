@@ -71,6 +71,8 @@ pub struct PageAlignedMemory {
     len: usize,
 }
 
+unsafe impl Send for PageAlignedMemory {}
+
 impl PageAlignedMemory {
     fn alloc_huge_table(memory_size: usize) -> Result<Self, AllocError> {
         let page_size = Self::page_size();
@@ -141,6 +143,8 @@ pub(super) struct FixedIoBuffer {
     size: usize,
     io_buf_index: Option<u16>,
 }
+
+unsafe impl Send for FixedIoBuffer {}
 
 impl FixedIoBuffer {
     pub const fn empty() -> Self {

@@ -5697,10 +5697,11 @@ impl AccountsDb {
         let storages = AccountStoragesOrderer::with_random_order(storages);
         let current_index = Arc::new(AtomicUsize::new(0));
         let mut lt_hash = std::thread::scope(|s| {
-            let handles = (0..6)
-                .map(|_| {
-                    s.spawn(|| {
-                        let mut reader = append_vec::new_full_accounts_scan_io_reader();
+            let readers = append_vec::new_full_accounts_scan_io_readers(6);
+            let handles = readers
+                .into_iter()
+                .map(|mut reader| {
+                    s.spawn(move || {
                         let mut chunk = VecDeque::with_capacity(64);
                         let mut accum = LtHash::identity();
                         loop {

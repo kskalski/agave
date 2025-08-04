@@ -52,6 +52,26 @@ impl SequentialFileReader<'_, LargeBuffer> {
     pub fn with_capacity(buf_size: usize) -> io::Result<Self> {
         Self::with_buffer(LargeBuffer::new(buf_size), DEFAULT_READ_SIZE)
     }
+
+    pub fn multiple_with_capacity_and_read_size(
+        num_readers: usize,
+        total_buf_size: usize,
+        read_capacity: usize,
+    ) -> io::Result<Vec<Self>> {
+        let reader_buf_size = total_buf_size / num_readers;
+        let ring = Self::create_ring(reader_buf_size / read_capacity, 1)?;
+        let mut readers = Vec::with_capacity(num_readers);
+        for _ in 1..num_readers {
+            let ring = unsafe { IoUring::from_fd(ring.as_raw_fd(), ring.params().clone())? };
+            let reader =
+                Self::with_buffer_and_ring(LargeBuffer::new(reader_buf_size), read_capacity, ring)?;
+            readers.push(reader);
+        }
+        let reader =
+            Self::with_buffer_and_ring(LargeBuffer::new(reader_buf_size), read_capacity, ring)?;
+        readers.push(reader);
+        Ok(readers)
+    }
 }
 
 impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
@@ -62,24 +82,29 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
     ///
     /// Initially the reader is idle and starts reading after the first file is added.
     pub fn with_buffer(mut buffer: B, read_capacity: usize) -> io::Result<Self> {
+        let ring = Self::create_ring(buffer.as_mut().len() / read_capacity, MAX_IOWQ_WORKERS)?;
+        Self::with_buffer_and_ring(buffer, read_capacity, ring)
+    }
+
+    pub fn create_ring(num_buffers: usize, num_workers: u32) -> io::Result<IoUring> {
         // Let submission queue hold half of buffers before we explicitly syscall
         // to submit them for reading.
-        let ring_qsize = (buffer.as_mut().len() / read_capacity / 2).max(1) as u32;
+        let ring_qsize = (num_buffers / 2).max(1) as u32;
         let ring = IoUring::builder()
             .setup_sqpoll(SQPOLL_IDLE_TIMEOUT)
             .build(ring_qsize)?;
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).
         ring.submitter()
-            .register_iowq_max_workers(&mut [MAX_IOWQ_WORKERS, 1])?;
-        Self::with_buffer_and_ring(buffer, ring, read_capacity)
+            .register_iowq_max_workers(&mut [num_workers, 1])?;
+        Ok(ring)
     }
 
     /// Create a new `SequentialFileReader` using a custom ring instance.
     fn with_buffer_and_ring(
         mut backing_buffer: B,
-        ring: IoUring,
         read_capacity: usize,
+        ring: IoUring,
     ) -> io::Result<Self> {
         let buffer = backing_buffer.as_mut();
         assert!(buffer.len() >= read_capacity, "buffer too small");

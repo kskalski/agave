@@ -1351,6 +1351,43 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
     )
 }
 
+/// Create a reusable buffered reader tuned for full accounts' storage scan.
+#[allow(unused)]
+pub(crate) fn new_full_accounts_scan_io_reader<'a>(
+) -> BufReaderWithOverflow<SequentialFileReader<'a, LargeBuffer>> {
+    // 128KiB covers a reasonably large distribution of typical account sizes.
+    // In a recent sample, 99.98% of accounts' data lengths were less than or equal to 128KiB.
+    const MIN_CAPACITY: usize = 1024 * 128;
+    const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
+    const BUFFER_SIZE: usize = 16 * 1024 * 1024;
+    BufReaderWithOverflow::new(
+        SequentialFileReader::with_capacity_and_read_size(BUFFER_SIZE, MIN_CAPACITY).unwrap(),
+        MIN_CAPACITY,
+        MAX_CAPACITY,
+    )
+}
+
+/// Create a reusable buffered reader tuned for full accounts' storage scan.
+pub(crate) fn new_full_accounts_scan_io_readers<'a>(
+    num_readers: usize,
+) -> Vec<BufReaderWithOverflow<SequentialFileReader<'a, LargeBuffer>>> {
+    // 128KiB covers a reasonably large distribution of typical account sizes.
+    // In a recent sample, 99.98% of accounts' data lengths were less than or equal to 128KiB.
+    const MIN_CAPACITY: usize = 1024 * 128;
+    const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
+    const BUFFER_SIZE: usize = 128 * 1024 * 1024;
+    let readers = SequentialFileReader::multiple_with_capacity_and_read_size(
+        num_readers,
+        BUFFER_SIZE,
+        MIN_CAPACITY,
+    )
+    .unwrap();
+    readers
+        .into_iter()
+        .map(|reader| BufReaderWithOverflow::new(reader, MIN_CAPACITY, MAX_CAPACITY))
+        .collect()
+}
+
 /// The per-account hash, stored in the AppendVec.
 ///
 /// This field is now obsolete, but it still lives in the file format.
