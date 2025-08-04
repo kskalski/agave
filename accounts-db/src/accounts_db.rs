@@ -5699,30 +5699,24 @@ impl AccountsDb {
         let mut lt_hash = std::thread::scope(|s| {
             let handles = (0..6)
                 .map(|_| {
-                    let current_index = current_index.clone();
-                    s.spawn(move || {
+                    s.spawn(|| {
                         let mut reader = append_vec::new_full_accounts_scan_io_reader();
                         let mut chunk = VecDeque::with_capacity(64);
                         let mut accum = LtHash::identity();
-                        let mut c_index = 0;
                         loop {
-                            if chunk.len() < chunk.capacity() / 2 && c_index < storages.len() {
-                                while chunk.len() < chunk.capacity() {
-                                    c_index = current_index.fetch_add(1, Ordering::Relaxed);
-                                    if c_index >= storages.len() {
-                                        break;
-                                    }
-                                    if let Some((a, b)) = storages[c_index].accounts.get_file() {
-                                        chunk.push_back(c_index);
+                            let num_filled =
+                                ensure_chunk_filled(storages, &current_index, &mut chunk);
+                            if num_filled > 0 {
+                                for storage in chunk.range(chunk.len() - num_filled..) {
+                                    if let Some((a, b)) = storage.accounts.get_file() {
                                         reader.inner_mut().add_file(a, b).unwrap();
                                     }
                                 }
                             }
 
-                            let Some(index) = chunk.pop_front() else {
+                            let Some(storage) = chunk.pop_front() else {
                                 return accum;
                             };
-                            let storage = &storages[index];
 
                             // Function is calculating the accounts_lt_hash from all accounts in the
                             // storages as of startup_slot. This means that any accounts marked obsolete at a
@@ -7407,6 +7401,25 @@ impl AccountsDb {
             );
         }
     }
+}
+
+fn ensure_chunk_filled<'a>(
+    storages: &'a [Arc<AccountStorageEntry>],
+    current_index: &AtomicUsize,
+    chunk: &mut VecDeque<&'a AccountStorageEntry>,
+) -> usize {
+    let num_filled = if chunk.len() ^ (chunk.capacity() / 2) == 0 {
+        let num_missing_items = chunk.capacity() - chunk.len();
+        let consume_index = current_index.fetch_add(num_missing_items, Ordering::Relaxed);
+        let consume_range = consume_index..storages.len().min(consume_index + num_missing_items);
+        for index in consume_range.clone() {
+            chunk.push_back(storages[index].as_ref());
+        }
+        consume_range.len()
+    } else {
+        0
+    };
+    num_filled
 }
 
 #[derive(Debug, Copy, Clone)]
