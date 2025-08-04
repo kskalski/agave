@@ -1375,10 +1375,10 @@ pub(crate) fn new_full_accounts_scan_io_readers<'a>(
     // In a recent sample, 99.98% of accounts' data lengths were less than or equal to 128KiB.
     const MIN_CAPACITY: usize = 1024 * 128;
     const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
-    const BUFFER_SIZE: usize = 128 * 1024 * 1024;
+    const BUFFER_SIZE: usize = 16 * 1024 * 1024;
     let readers = SequentialFileReader::multiple_with_capacity_and_read_size(
         num_readers,
-        BUFFER_SIZE,
+        BUFFER_SIZE * num_readers,
         MIN_CAPACITY,
     )
     .unwrap();
