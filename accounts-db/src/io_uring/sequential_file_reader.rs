@@ -3,6 +3,7 @@ use {
         memory::{FixedIoBuffer, LargeBuffer},
         IO_PRIO_BE_HIGHEST,
     },
+    crate::buffered_reader::FileBufRead,
     agave_io_uring::{Completion, Ring, RingOp},
     io_uring::{opcode, squeue, types, IoUring},
     std::{
@@ -347,20 +348,6 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
         }
         self.has_filled_buf = amt < unconsumed_buf_len;
     }
-}
-
-/// An extension of the `BufRead` trait for file readers that allow tracking file
-/// read position offset.
-#[allow(unused)]
-pub(crate) trait FileBufRead<'a>: BufRead {
-    fn set_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()>;
-
-    /// Returns the current file offset corresponding to the start of the buffer
-    /// that will be returned by the next call to `fill_buf`.
-    ///
-    /// This offset represents the position within the underlying file where data
-    /// will be consumed from.
-    fn get_file_offset(&self) -> usize;
 }
 
 impl<'a, B: AsMut<[u8]>> FileBufRead<'a> for SequentialFileReader<'a, B> {
