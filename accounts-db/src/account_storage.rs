@@ -8,6 +8,7 @@ use {
     solana_clock::Slot,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap},
     std::{
+        collections::VecDeque,
         ops::{Index, Range},
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -408,6 +409,24 @@ impl<'a> AccountStoragesConcurrentConsumer<'a> {
         } else {
             None
         }
+    }
+
+    pub fn ensure_chunk_filled(&'a self, chunk: &mut VecDeque<&'a AccountStorageEntry>) -> usize {
+        let num_filled = if chunk.is_empty() || chunk.len() == chunk.capacity() / 2 {
+            let num_missing_items = chunk.capacity() - chunk.len();
+            let consume_index = self
+                .current_index
+                .fetch_add(num_missing_items, Ordering::Relaxed);
+            let consume_range =
+                consume_index..self.orderer.len().min(consume_index + num_missing_items);
+            for index in consume_range.clone() {
+                chunk.push_back(&self.orderer[index]);
+            }
+            consume_range.len()
+        } else {
+            0
+        };
+        num_filled
     }
 }
 

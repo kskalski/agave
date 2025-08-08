@@ -5696,22 +5696,22 @@ impl AccountsDb {
         // Randomized order works well with rayon work splitting, since we only care about
         // uniform distribution of total work size per batch (other ordering strategies might be
         // useful for optimizing disk read sizes and buffers usage in a single IO queue).
-        let storages = AccountStoragesOrderer::with_random_order(storages);
-        let current_index = Arc::new(AtomicUsize::new(0));
+        let storages =
+            AccountStoragesOrderer::with_random_order(storages).into_concurrent_consumer();
         let mut lt_hash = std::thread::scope(|s| {
-            let readers = append_vec::new_full_accounts_scan_io_readers(6);
+            let readers = append_vec::new_full_accounts_scan_io_readers(num_threads);
             let handles = readers
                 .into_iter()
                 .enumerate()
                 .map(|(i, mut reader)| {
+                    let storages = &storages;
                     thread::Builder::new()
                         .name(format!("solVerfyAccts{i:02}"))
-                        .spawn_scoped(s, || {
+                        .spawn_scoped(s, move || {
                             let mut chunk = VecDeque::with_capacity(64);
                             let mut accum = LtHash::identity();
                             loop {
-                                let num_filled =
-                                    ensure_chunk_filled(storages, &current_index, &mut chunk);
+                                let num_filled = storages.ensure_chunk_filled(&mut chunk);
                                 if num_filled > 0 {
                                     for storage in chunk.range(chunk.len() - num_filled..) {
                                         if let Some((a, b)) = storage.accounts.get_file() {
@@ -7410,25 +7410,6 @@ impl AccountsDb {
             );
         }
     }
-}
-
-fn ensure_chunk_filled<'a>(
-    storages: &'a [Arc<AccountStorageEntry>],
-    current_index: &AtomicUsize,
-    chunk: &mut VecDeque<&'a AccountStorageEntry>,
-) -> usize {
-    let num_filled = if chunk.is_empty() || chunk.len() == chunk.capacity() / 2 {
-        let num_missing_items = chunk.capacity() - chunk.len();
-        let consume_index = current_index.fetch_add(num_missing_items, Ordering::Relaxed);
-        let consume_range = consume_index..storages.len().min(consume_index + num_missing_items);
-        for index in consume_range.clone() {
-            chunk.push_back(storages[index].as_ref());
-        }
-        consume_range.len()
-    } else {
-        0
-    };
-    num_filled
 }
 
 #[derive(Debug, Copy, Clone)]
