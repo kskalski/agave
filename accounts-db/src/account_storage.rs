@@ -4,15 +4,15 @@ use {
     crate::accounts_db::{AccountStorageEntry, AccountsFileId},
     dashmap::DashMap,
     rand::seq::SliceRandom,
-    rayon::{
-        iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
-        slice::ParallelSlice,
-    },
+    rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_clock::Slot,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap},
     std::{
-        ops::Range,
-        sync::{Arc, RwLock},
+        ops::{Index, Range},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, RwLock,
+        },
     },
 };
 
@@ -350,6 +350,10 @@ impl<'a> AccountStoragesOrderer<'a> {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
     pub fn iter(&'a self) -> impl ExactSizeIterator<Item = &'a AccountStorageEntry> + 'a {
         self.indices.iter().map(|i| self.storages[*i].as_ref())
     }
@@ -358,16 +362,52 @@ impl<'a> AccountStoragesOrderer<'a> {
         self.indices.par_iter().map(|i| self.storages[*i].as_ref())
     }
 
-    pub fn par_chunks(
-        &'a self,
-        chunk_size: usize,
-    ) -> impl IndexedParallelIterator<Item = Vec<&'a AccountStorageEntry>> + 'a {
-        self.indices.par_chunks(chunk_size).map(|chunk| {
-            chunk
-                .iter()
-                .map(|i| self.storages[*i].as_ref())
-                .collect::<Vec<_>>()
-        })
+    pub fn into_concurrent_consumer(self) -> AccountStoragesConcurrentConsumer<'a> {
+        AccountStoragesConcurrentConsumer::new(self)
+    }
+}
+
+impl Index<usize> for AccountStoragesOrderer<'_> {
+    type Output = AccountStorageEntry;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.storages[self.indices[index]].as_ref()
+    }
+}
+
+/// A thread-safe, lock-free iterator for consuming `AccountStorageEntry` values
+/// from an `AccountStoragesOrderer` across multiple threads.
+///
+/// # Overview
+/// This type enables multiple threads to iterate over the same ordered collection
+/// **concurrently** without requiring locks. Internally, it uses an `AtomicUsize`
+/// to track the current position, so each call to [`next`] returns a unique
+/// element until the collection is exhausted.
+///
+/// Unlike standard iterators, `AccountStoragesConcurrentConsumer`:
+/// - Is **shared** between threads via references (`&self`), not moved.
+/// - Allows safe, parallel consumption where each item is yielded at most once.
+/// - Does **not** implement `Iterator` because it must take `&self` instead of `&mut self`.
+pub struct AccountStoragesConcurrentConsumer<'a> {
+    orderer: AccountStoragesOrderer<'a>,
+    current_index: AtomicUsize,
+}
+
+impl<'a> AccountStoragesConcurrentConsumer<'a> {
+    pub fn new(orderer: AccountStoragesOrderer<'a>) -> Self {
+        Self {
+            orderer,
+            current_index: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn next(&'a self) -> Option<&'a AccountStorageEntry> {
+        let index = self.current_index.fetch_add(1, Ordering::Relaxed);
+        if index < self.orderer.len() {
+            Some(&self.orderer[index])
+        } else {
+            None
+        }
     }
 }
 
