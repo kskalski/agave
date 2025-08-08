@@ -22,6 +22,7 @@ mod geyser_plugin_utils;
 pub mod stats;
 pub mod tests;
 
+use crate::account_storage::AccountStoragesOrderer;
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
 #[cfg(feature = "dev-context-only-utils")]
@@ -5726,7 +5727,7 @@ impl AccountsDb {
                                 storage.get_obsolete_accounts(Some(startup_slot));
                             storage
                                 .accounts
-                                .scan_accounts(reader, |offset, account| {
+                                .scan_accounts(&mut reader, |offset, account| {
                                     // Obsolete accounts were not included in the original hash, so they should not be added here
                                     if !obsolete_accounts.contains(&(offset, account.data.len())) {
                                         let account_lt_hash =

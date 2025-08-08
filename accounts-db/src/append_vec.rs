@@ -1373,7 +1373,7 @@ pub(crate) fn new_full_accounts_scan_io_reader<'a>(
     const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
     const BUFFER_SIZE: usize = 16 * 1024 * 1024;
     BufReaderWithOverflow::new(
-        SequentialFileReader::with_capacity_and_read_size(BUFFER_SIZE, MIN_CAPACITY).unwrap(),
+        SequentialFileReader::with_capacity(BUFFER_SIZE).unwrap(),
         MIN_CAPACITY,
         MAX_CAPACITY,
     )
