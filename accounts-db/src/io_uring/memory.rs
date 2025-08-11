@@ -138,7 +138,7 @@ impl DerefMut for PageAlignedMemory {
 #[derive(Debug)]
 pub(super) struct FixedIoBuffer {
     ptr: *mut u8,
-    size: usize,
+    size: u32,
     io_buf_index: Option<u16>,
 }
 
@@ -164,16 +164,20 @@ impl FixedIoBuffer {
         let buf_start = buffer.as_ptr() as usize;
 
         buffer.chunks_exact_mut(chunk_size).map(move |buf| {
+            assert!(
+                buf.len() <= u32::MAX as usize,
+                "buffer chunk size is too large"
+            );
             let io_buf_index = (buf.as_ptr() as usize - buf_start) / FIXED_BUFFER_LEN;
             Self {
                 ptr: buf.as_mut_ptr(),
-                size: buf.len(),
+                size: buf.len() as u32,
                 io_buf_index: Some(io_buf_index as u16),
             }
         })
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u32 {
         self.size
     }
 
