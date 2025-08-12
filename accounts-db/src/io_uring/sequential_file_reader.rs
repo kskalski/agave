@@ -118,14 +118,14 @@ impl<B: AsMut<[u8]>> SequentialFileReader<'_, B> {
 impl<'a, B> SequentialFileReader<'a, B> {
     /// Opens file under `path`, check its metadata to determine read limit and add it to the reader.
     ///
-    /// See `add_file_owned` for more details.
-    pub fn add_path(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+    /// See `add_owned_file_to_prefetch` for more details.
+    pub fn add_path_to_prefetch(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOATIME)
             .open(path)?;
         let len = file.metadata()?.len() as usize;
-        self.add_file_owned(file, len)
+        self.add_owned_file_to_prefetch(file, len)
     }
 
     /// Add `file` to read. Starts reading the file as soon as a buffer is available.
@@ -135,7 +135,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
     ///
     /// Reader takes ownership of the file and will drop it after it's done reading
     /// and `move_to_next_file` is called.
-    pub fn add_file_owned(&mut self, file: File, read_limit: usize) -> io::Result<()> {
+    pub fn add_owned_file_to_prefetch(&mut self, file: File, read_limit: usize) -> io::Result<()> {
         self.add_file_by_fd(file.as_raw_fd(), read_limit)?;
         self.owned_files.push_back(file);
         Ok(())
@@ -148,7 +148,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
     ///
     /// Lifetime of reference is tied to the reader's lifetime.
     #[allow(unused)]
-    pub fn add_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+    pub fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
         self.add_file_by_fd(file.as_raw_fd(), read_limit)
     }
 
@@ -176,9 +176,7 @@ impl<'a, B> SequentialFileReader<'a, B> {
     }
 
     /// When reading multiple files, this method moves the reader to the next file.
-    ///
-    /// It is required that the previous file is fully read before calling this method.
-    pub fn move_to_next_file(&mut self) -> io::Result<()> {
+    fn move_to_next_file(&mut self) -> io::Result<()> {
         let state = self.state_mut();
 
         let Some(mut file_state) = state.files.pop_front() else {
@@ -351,7 +349,7 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
 }
 
 impl<'a, B: AsMut<[u8]>> FileBufRead<'a> for SequentialFileReader<'a, B> {
-    fn set_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+    fn activate_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
         while self
             .state()
             .files
@@ -361,7 +359,7 @@ impl<'a, B: AsMut<[u8]>> FileBufRead<'a> for SequentialFileReader<'a, B> {
             self.move_to_next_file()?;
         }
         if self.state().files.is_empty() {
-            self.add_file(file, read_limit)?;
+            self.add_file_to_prefetch(file, read_limit)?;
         }
         Ok(())
     }
@@ -716,7 +714,7 @@ mod tests {
         let buf = vec![0; backing_buffer_size];
         let mut reader = SequentialFileReader::with_buffer(buf, read_capacity).unwrap();
         reader
-            .add_file_owned(File::open(temp_file.path()).unwrap(), usize::MAX)
+            .add_owned_file_to_prefetch(File::open(temp_file.path()).unwrap(), usize::MAX)
             .unwrap();
 
         // Read contents from the reader and verify length
@@ -765,7 +763,7 @@ mod tests {
 
         {
             let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-            reader.add_file(temp_file.as_file(), 3).unwrap();
+            reader.add_file_to_prefetch(temp_file.as_file(), 3).unwrap();
             assert_eq!(read_as_vec(&mut reader), &[0xa, 0xb, 0xc]);
         }
         // Independently we can also read from the file directly
@@ -783,8 +781,8 @@ mod tests {
 
         let f1 = File::open(temp1.path()).unwrap();
         let f2 = File::open(temp2.path()).unwrap();
-        reader.add_file_owned(f1, usize::MAX).unwrap();
-        reader.add_file_owned(f2, usize::MAX).unwrap();
+        reader.add_owned_file_to_prefetch(f1, usize::MAX).unwrap();
+        reader.add_owned_file_to_prefetch(f2, usize::MAX).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
         reader.move_to_next_file().unwrap();
@@ -793,7 +791,7 @@ mod tests {
         reader.move_to_next_file().unwrap();
 
         let f1 = File::open(temp1.path()).unwrap();
-        reader.add_file_owned(f1, usize::MAX).unwrap();
+        reader.add_owned_file_to_prefetch(f1, usize::MAX).unwrap();
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
     }
 
@@ -805,10 +803,10 @@ mod tests {
         io::Write::write_all(&mut temp2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file(temp1.as_file(), 2).unwrap();
-        reader.add_file(temp2.as_file(), 3).unwrap();
-        reader.add_file(temp1.as_file(), 4).unwrap();
-        reader.add_file(temp2.as_file(), 5).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 2).unwrap();
+        reader.add_file_to_prefetch(temp2.as_file(), 3).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 4).unwrap();
+        reader.add_file_to_prefetch(temp2.as_file(), 5).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb]);
         reader.move_to_next_file().unwrap();
@@ -821,8 +819,8 @@ mod tests {
 
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
 
-        reader.add_file(temp2.as_file(), 4).unwrap();
-        reader.add_file(temp1.as_file(), 2).unwrap();
+        reader.add_file_to_prefetch(temp2.as_file(), 4).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 2).unwrap();
         reader.move_to_next_file().unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
@@ -842,11 +840,15 @@ mod tests {
 
         let mut reader =
             SequentialFileReader::with_buffer(vec![0; buffer_size], read_size).unwrap();
-        reader.add_file(temp1.as_file(), 2).unwrap();
-        reader.add_file(temp2.as_file(), usize::MAX).unwrap();
-        reader.add_file(temp1.as_file(), 3).unwrap();
-        reader.add_file(temp2.as_file(), 4).unwrap();
-        reader.add_file(temp1.as_file(), usize::MAX).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 2).unwrap();
+        reader
+            .add_file_to_prefetch(temp2.as_file(), usize::MAX)
+            .unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 3).unwrap();
+        reader.add_file_to_prefetch(temp2.as_file(), 4).unwrap();
+        reader
+            .add_file_to_prefetch(temp1.as_file(), usize::MAX)
+            .unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb]);
         reader.move_to_next_file().unwrap();
@@ -875,9 +877,9 @@ mod tests {
 
         let mut reader =
             SequentialFileReader::with_buffer(vec![0; buffer_size], read_size).unwrap();
-        reader.add_file(temp1.as_file(), 1990).unwrap();
-        reader.add_file(temp2.as_file(), 1000).unwrap();
-        reader.add_file(temp1.as_file(), 2010).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 1990).unwrap();
+        reader.add_file_to_prefetch(temp2.as_file(), 1000).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 2010).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), &pattern[..1990]);
 
@@ -899,24 +901,24 @@ mod tests {
         io::Write::write_all(&mut temp2, &pattern[1000..]).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file(temp1.as_file(), 1990).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 1990).unwrap();
         assert_eq!(read_as_vec(&mut reader), &pattern[..1990]);
         reader.move_to_next_file().unwrap();
 
         for _ in 0..10 {
-            reader.add_file(temp2.as_file(), 1000).unwrap();
+            reader.add_file_to_prefetch(temp2.as_file(), 1000).unwrap();
             assert_eq!(read_as_vec(&mut reader), &pattern[1000..]);
             reader.move_to_next_file().unwrap();
 
-            reader.add_file(temp1.as_file(), 2010).unwrap();
+            reader.add_file_to_prefetch(temp1.as_file(), 2010).unwrap();
             assert_eq!(read_as_vec(&mut reader), &pattern[..2000]);
             reader.move_to_next_file().unwrap();
         }
         assert_eq!(read_as_vec(&mut reader), Vec::<u8>::new());
 
         for _ in 0..10 {
-            reader.add_file(temp2.as_file(), 1000).unwrap();
-            reader.add_file(temp1.as_file(), 2010).unwrap();
+            reader.add_file_to_prefetch(temp2.as_file(), 1000).unwrap();
+            reader.add_file_to_prefetch(temp1.as_file(), 2010).unwrap();
 
             assert_eq!(read_as_vec(&mut reader), &pattern[1000..]);
             reader.move_to_next_file().unwrap();
@@ -933,7 +935,7 @@ mod tests {
         io::Write::write_all(&mut temp1, &pattern).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file(temp1.as_file(), 1990).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 1990).unwrap();
 
         assert_eq!(512, reader.fill_buf().unwrap().len());
         assert_eq!(0, reader.get_file_offset());
@@ -962,7 +964,7 @@ mod tests {
         io::Write::write_all(&mut temp1, &pattern).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 2048], 512).unwrap();
-        reader.add_file(temp1.as_file(), 5990).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 5990).unwrap();
 
         assert_eq!(reader.fill_buf().unwrap(), &pattern[..512]);
         assert_eq!(0, reader.get_file_offset());
@@ -983,30 +985,30 @@ mod tests {
     }
 
     #[test]
-    fn test_set_file() {
+    fn test_activate_file() {
         let mut temp1 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp1, &[0xa, 0xb, 0xc]).unwrap();
         let mut temp2 = NamedTempFile::new().unwrap();
         io::Write::write_all(&mut temp2, &[0xd, 0xe, 0xf, 0x10]).unwrap();
 
         let mut reader = SequentialFileReader::with_buffer(vec![0; 1024], 512).unwrap();
-        reader.add_file(temp1.as_file(), 3).unwrap();
-        reader.add_file(temp2.as_file(), 4).unwrap();
+        reader.add_file_to_prefetch(temp1.as_file(), 3).unwrap();
+        reader.add_file_to_prefetch(temp2.as_file(), 4).unwrap();
 
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
 
-        reader.set_file(temp2.as_file(), 4).unwrap();
+        reader.activate_file(temp2.as_file(), 4).unwrap();
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
 
-        reader.set_file(temp1.as_file(), 4).unwrap();
+        reader.activate_file(temp1.as_file(), 4).unwrap();
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
 
         let f1 = File::open(temp1.path()).unwrap();
-        reader.add_file_owned(f1, usize::MAX).unwrap();
+        reader.add_owned_file_to_prefetch(f1, usize::MAX).unwrap();
         reader.move_to_next_file().unwrap();
         assert_eq!(read_as_vec(&mut reader), vec![0xa, 0xb, 0xc]);
 
-        reader.set_file(temp2.as_file(), 4).unwrap();
+        reader.activate_file(temp2.as_file(), 4).unwrap();
         assert_eq!(read_as_vec(&mut reader), vec![0xd, 0xe, 0xf, 0x10]);
     }
 }
