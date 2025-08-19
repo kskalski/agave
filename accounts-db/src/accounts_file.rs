@@ -264,10 +264,10 @@ impl AccountsFile {
         }
     }
 
-    /// Return the `File` and size of the underlying `AppendVec` account file.
+    /// Return the `File` and size of the underlying accounts file.
     pub fn file(&self) -> Option<(&File, usize)> {
         match self {
-            Self::AppendVec(av) => Some((av.file(), av.len())),
+            Self::AppendVec(av) => Some((av.file(), av.capacity() as usize)),
             Self::TieredStorage(_) => None,
         }
     }
