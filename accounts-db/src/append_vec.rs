@@ -26,7 +26,6 @@ use {
             RequiredLenBufRead as _, Stack,
         },
         file_io::read_into_buffer,
-        io_uring::sequential_file_reader::SequentialFileReaderBuilder,
         is_zero_lamport::IsZeroLamport,
         storable_accounts::StorableAccounts,
         u64_align,
@@ -1337,6 +1336,8 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
 
     #[cfg(target_os = "linux")]
     {
+        use io_uring::sequential_file_reader::SequentialFileReaderBuilder;
+
         // Small files will each use one `READ_SIZE` buffer, large files get to around 8-10MB,
         // try to pick buffer that can hold two `SCAN_ACCOUNTS_SMALL_TO_LARGE_FILE_RATIO` cycles.
         const SCAN_ACCOUNTS_BUFFER_SIZE: usize = 32 * 1024 * 1024;

@@ -5547,7 +5547,9 @@ impl AccountsDb {
                                     let new_indices = storages.take_up_to_capacity(&mut chunk);
                                     let new_files =
                                         chunk.range(new_indices).filter_map(|s| s.accounts.file());
-                                    reader.add_files_to_prefetch(new_files).unwrap();
+                                    reader
+                                        .add_files_to_prefetch(new_files)
+                                        .expect("must prefetch accounts storage");
                                 }
 
                                 let Some(storage) = chunk.pop_front() else {
