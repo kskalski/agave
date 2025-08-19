@@ -933,7 +933,7 @@ impl AppendVec {
         match self.backing {
             AppendVecFileBacking::File(ref file) => file,
             AppendVecFileBacking::Mmap(_) => {
-                panic!("Memory-backed AppendVec does not have a file")
+                panic!("Memory-mapped AppendVec does not have a File")
             }
         }
     }
@@ -1345,7 +1345,7 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
         const READ_SIZE: usize = 512 * 1024;
         // scan accounts implementations will submit operations to kernel using
         // FileBufRead::add_files_to_prefetch - just make sure queue size can hold all buffers.
-        const RING_QSIZE: u32 = (SCAN_ACCOUNTS_BUFFER_SIZE / READ_SIZE) as u32;
+        const RING_QSIZE: u32 = (SCAN_ACCOUNTS_BUFFER_SIZE.div_ceil(READ_SIZE)) as u32;
         BufReaderWithOverflow::new(
             SequentialFileReaderBuilder::new()
                 .max_iowq_workers(1)
