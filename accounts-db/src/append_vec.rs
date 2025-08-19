@@ -1336,7 +1336,7 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
 
     #[cfg(target_os = "linux")]
     {
-        use io_uring::sequential_file_reader::SequentialFileReaderBuilder;
+        use crate::io_uring::sequential_file_reader::SequentialFileReaderBuilder;
 
         // Small files will each use one `READ_SIZE` buffer, large files get to around 8-10MB,
         // try to pick buffer that can hold two `SCAN_ACCOUNTS_SMALL_TO_LARGE_FILE_RATIO` cycles.
