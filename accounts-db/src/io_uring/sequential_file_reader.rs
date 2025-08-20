@@ -35,7 +35,7 @@ const DEFAULT_MAX_IOWQ_WORKERS: u32 = 2;
 pub struct SequentialFileReaderBuilder {
     read_size: usize,
     max_iowq_workers: u32,
-    ring_queue_size: Option<u32>,
+    ring_squeue_size: Option<u32>,
 }
 
 /// Utility for building `SequentialFileReader` with specified tuning options.
@@ -44,7 +44,7 @@ impl SequentialFileReaderBuilder {
         Self {
             read_size: DEFAULT_READ_SIZE,
             max_iowq_workers: DEFAULT_MAX_IOWQ_WORKERS,
-            ring_queue_size: None,
+            ring_squeue_size: None,
         }
     }
 
@@ -69,15 +69,19 @@ impl SequentialFileReaderBuilder {
         self
     }
 
-    /// Override the ring queue size (i.e. max concurrent operations and size of submission queue)
+    /// Override the ring submission queue size
     ///
     /// Since sqpoll is not used by the reader, this impacts how frequently we need to `submit`
-    /// operations for kernel to start executing them. Without well timed explicit submits,
-    /// sizing the queue allows to balance how frequently we need to wait to push an operation
-    /// (i.e. when adding more operations than `Ring` capacity) or when waiting for completion
-    /// - both will perform `submit` to empty the queues.
-    pub fn ring_queue_size(mut self, ring_queue_size: u32) -> Self {
-        self.ring_queue_size = Some(ring_queue_size);
+    /// operations for kernel to start executing them. By default reader uses heuristic to
+    /// amortize number of submissions / batch of pushed operations.
+    ///
+    /// This parameter can be adjusted to:
+    /// - low values in order to achieve higher frequency of `submit` syscalls (kernel starts
+    ///   executing operations sooner)
+    /// - higher values to avoid necessity of `submit` when pushing operations (especially when
+    ///   user manually triggers submission by calling `add_files_to_prefetch`)
+    pub fn ring_squeue_size(mut self, ring_squeue_size: u32) -> Self {
+        self.ring_squeue_size = Some(ring_squeue_size);
         self
     }
 
@@ -106,16 +110,21 @@ impl SequentialFileReaderBuilder {
         self,
         mut buffer: B,
     ) -> io::Result<SequentialFileReader<'a, B>> {
-        // recompute ring size in case buffer differs from builder's buf_capacity
         let buf_capacity = buffer.as_mut().len();
 
-        // Unless overriden, set the ring queue to fit half of buffers to amortize `submit` calls
-        // relative to buffer size / number of buffers.
-        let ring_queue_size = self
-            .ring_queue_size
-            .unwrap_or((buf_capacity / 2 / self.read_size).max(1) as u32);
+        // Let all buffers be submitted for reading at any time
+        let max_inflight_ops = (buf_capacity / self.read_size) as u32;
 
-        let ring = io_uring::IoUring::builder().build(ring_queue_size)?;
+        // Unless overriden, set the submission queue to fit half of ops to amortize `submit` calls
+        // to just 2 per fully read buffer size.
+        let ring_squeue_size = self
+            .ring_squeue_size
+            .unwrap_or((max_inflight_ops / 2).max(1));
+
+        // agave io_uring uses cqsize to define state slab size, so cqsize == max inflight ops
+        let ring = io_uring::IoUring::builder()
+            .setup_cqsize(max_inflight_ops)
+            .build(ring_squeue_size)?;
 
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).

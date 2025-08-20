@@ -1344,13 +1344,13 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
         // Vast majority of files are small - compromise between buffer use and faster large reads.
         const READ_SIZE: usize = 512 * 1024;
         // scan accounts implementations will submit operations to kernel using
-        // FileBufRead::add_files_to_prefetch - just make sure queue size can hold all buffers.
-        const RING_QSIZE: u32 = (SCAN_ACCOUNTS_BUFFER_SIZE.div_ceil(READ_SIZE)) as u32;
+        // FileBufRead::add_files_to_prefetch - large submission queue avoids stalls when adding ops.
+        const RING_SQSIZE: u32 = (SCAN_ACCOUNTS_BUFFER_SIZE.div_ceil(READ_SIZE)) as u32;
         BufReaderWithOverflow::new(
             SequentialFileReaderBuilder::new()
                 .max_iowq_workers(1)
                 .read_size(READ_SIZE)
-                .ring_queue_size(RING_QSIZE)
+                .ring_squeue_size(RING_SQSIZE)
                 .build(SCAN_ACCOUNTS_BUFFER_SIZE)
                 .unwrap(),
             MIN_CAPACITY,
