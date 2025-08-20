@@ -88,7 +88,7 @@ impl<'a, B: AsMut<[u8]>> IoUringFileCreator<'a, B> {
         // to submit them for writing (lets kernel start processing before we run out of buffers,
         // but also amortizes number of `submit` syscalls made).
         let ring_qsize = (buffer.as_mut().len() / write_capacity / 2).max(1) as u32;
-        let ring = IoUring::builder().build(ring_qsize)?;
+        let ring = IoUring::builder().setup_sqpoll(50).build(ring_qsize)?;
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).
         ring.submitter()
