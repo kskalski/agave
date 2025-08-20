@@ -15,7 +15,7 @@ use {
     crate::file_io::{read_into_buffer, read_more_buffer},
     std::{
         fs::File,
-        io::{self, BufRead, BufReader},
+        io::{self, BufRead},
         mem::MaybeUninit,
         ops::Range,
         path::Path,
@@ -445,20 +445,22 @@ impl<R: BufRead> RequiredLenBufRead for BufReaderWithOverflow<R> {
 
 /// Open file at `path` with buffering reader using `buf_size` memory and doing
 /// read-ahead IO reads (if `io_uring` is supported by the host)
-pub fn large_file_buf_reader(
-    path: impl AsRef<Path>,
-    buf_size: usize,
-) -> io::Result<Box<dyn BufRead>> {
+pub fn large_file_buf_reader(path: &Path, buf_size: usize) -> io::Result<impl BufRead> {
     #[cfg(target_os = "linux")]
-    if agave_io_uring::io_uring_supported() {
+    {
         use crate::io_uring::sequential_file_reader::SequentialFileReaderBuilder;
 
         let mut reader = SequentialFileReaderBuilder::new().build(buf_size)?;
         reader.add_path_to_prefetch(path)?;
-        return Ok(Box::new(reader));
+        Ok(reader)
     }
-    let file = File::open(path)?;
-    Ok(Box::new(BufReader::with_capacity(buf_size, file)))
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::BufReader;
+
+        let file = File::open(path)?;
+        Ok(BufReader::with_capacity(buf_size, file))
+    }
 }
 
 #[cfg(test)]
