@@ -89,7 +89,7 @@ impl<'a, B: AsMut<[u8]>> IoUringFileCreator<'a, B> {
         // use buffers, some only update metadata, but those usually block some buffer(s)
         // in backlog).
         let ring_qsize = (buffer.as_mut().len() / write_capacity).max(1) as u32;
-        // Enable sqpoll to since:
+        // Enable sqpoll since:
         // - we push a lot of operations, many of them are fast
         // - file open ops block buffers stored in backlog, so delaying those is costly
         // - there seem to be interference of reads landing in the same kernel worker submitted
