@@ -115,7 +115,9 @@ impl SequentialFileReaderBuilder {
             .ring_queue_size
             .unwrap_or((buf_capacity / 2 / self.read_size).max(1) as u32);
 
-        let ring = io_uring::IoUring::builder().build(ring_queue_size)?;
+        let ring = io_uring::IoUring::builder()
+            .setup_cqsize(buf_capacity / self.read_size)
+            .build(ring_queue_size)?;
 
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).
