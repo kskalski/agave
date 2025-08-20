@@ -205,7 +205,9 @@ impl<B> IoUringFileCreator<'_, B> {
             // here before being handled to the kernel or backlog in `file`.
             let mut_slice =
                 unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len() as usize) };
+            let t = std::time::Instant::now();
             let len = src.read(mut_slice)?;
+            state.stats.read_time += t.elapsed();
 
             if len == 0 {
                 file.eof = true;
@@ -328,6 +330,7 @@ struct FileCreatorStats {
     no_buf_count: u32,
     /// Sum of all outstanding write sizes at moments of encountering no free buf
     no_buf_sum_submitted_write_sizes: usize,
+    read_time: Duration,
 }
 
 impl FileCreatorStats {
@@ -338,9 +341,10 @@ impl FileCreatorStats {
             .unwrap_or_default();
         log::info!(
             "files creation stats - large buf headroom: {}, no buf count: {},\
-            avg pending writes at no buf: {avg_writes_at_no_buf}",
+            avg pending writes at no buf: {avg_writes_at_no_buf}, sum read_time: {:?}",
             self.large_buf_headroom_count,
             self.no_buf_count,
+            self.read_time,
         );
     }
 }
