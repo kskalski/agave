@@ -109,15 +109,19 @@ impl SequentialFileReaderBuilder {
         // recompute ring size in case buffer differs from builder's buf_capacity
         let buf_capacity = buffer.as_mut().len();
 
-        // Unless overriden, set the ring queue to fit half of buffers to amortize `submit` calls
-        // relative to buffer size / number of buffers.
-        let ring_queue_size = self
-            .ring_queue_size
-            .unwrap_or((buf_capacity / 2 / self.read_size).max(1) as u32);
+        // Let all buffers be submitted for reading at any time
+        let max_inflight_ops = (buf_capacity / self.read_size) as u32;
 
+        // Unless overriden, set the ring queue to fit half of buffers to amortize `submit` calls
+        // relative to buffer size (number of buffers).
+        let ring_squeue_size = self
+            .ring_queue_size
+            .unwrap_or((max_inflight_ops / 2).max(1));
+
+        // agave io_uring uses cqsize to define state slab size, so cqsize == max inflight ops
         let ring = io_uring::IoUring::builder()
-            .setup_cqsize(buf_capacity / self.read_size)
-            .build(ring_queue_size)?;
+            .setup_cqsize(max_inflight_ops)
+            .build(ring_squeue_size)?;
 
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).

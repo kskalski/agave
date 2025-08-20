@@ -84,11 +84,14 @@ impl<'a, B: AsMut<[u8]>> IoUringFileCreator<'a, B> {
         write_capacity: usize,
         file_complete: F,
     ) -> io::Result<Self> {
+        let max_inflight_ops = (buffer.as_mut().len() / write_capacity) as u32;
         // Let submission queue hold half of buffers before we explicitly syscall
         // to submit them for writing (lets kernel start processing before we run out of buffers,
         // but also amortizes number of `submit` syscalls made).
-        let ring_qsize = (buffer.as_mut().len() / write_capacity / 2).max(1) as u32;
-        let ring = IoUring::builder().setup_sqpoll(50).build(ring_qsize)?;
+        let ring_sqsize = (max_inflight_ops / 2).max(1);
+        let ring = IoUring::builder()
+            .setup_cqsize(max_inflight_ops)
+            .build(ring_sqsize)?;
         // Maximum number of spawned [bounded IO, unbounded IO] kernel threads, we don't expect
         // any unbounded work, but limit it to 1 just in case (0 leaves it unlimited).
         ring.submitter()
