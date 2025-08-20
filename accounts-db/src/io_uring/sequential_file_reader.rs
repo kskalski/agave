@@ -360,12 +360,17 @@ impl<B: AsMut<[u8]>> Read for SequentialFileReader<'_, B> {
     }
 }
 
+impl Drop for SequentialFileReaderState {
+    fn drop(&mut self) {
+        log::info!("eof submits {}", self.num_submits);
+    }
+}
+
 impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if self.state.current_buf_pos == self.state.current_buf_len
             && !self.wait_current_buf_full()?
         {
-            log::info!("eof submits {}", self.state.num_submits);
             return Ok(&[]);
         }
 
