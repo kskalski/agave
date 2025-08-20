@@ -336,6 +336,7 @@ impl<B> SequentialFileReader<'_, B> {
                 ReadBufState::Reading => {
                     // Still no data, wait for more completions, but submit in case there are queued
                     // entries in the submission queue.
+                    self.state.num_submits += 1;
                     self.inner.submit()?
                 }
 
@@ -364,6 +365,7 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
         if self.state.current_buf_pos == self.state.current_buf_len
             && !self.wait_current_buf_full()?
         {
+            log::info!("eof submits {}", self.state.num_submits);
             return Ok(&[]);
         }
 
@@ -465,6 +467,8 @@ struct SequentialFileReaderState {
     current_buf_len: u32,
     /// File offset of the next `fill_buf()` buffer available to consume
     current_offset: usize,
+
+    num_submits: u32,
 
     /// Index in `self.files` of the file that is currently being read (can generate new read ops).
     next_read_file_index: Option<usize>,
