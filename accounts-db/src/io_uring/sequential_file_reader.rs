@@ -508,6 +508,7 @@ impl Default for SequentialFileReaderState {
             owned_files: VecDeque::new(),
             files: VecDeque::new(),
             left_to_consume: 0,
+            num_submits: 0,
         }
     }
 }
