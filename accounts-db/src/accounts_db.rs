@@ -5529,12 +5529,11 @@ impl AccountsDb {
         let storages = AccountStoragesOrderer::with_small_to_large_ratio(storages, ratio)
             .into_concurrent_consumer();
         let mut lt_hash = thread::scope(|s| {
-            let storages = &storages;
             let handles = (0..num_threads.get())
                 .map(|i| {
                     thread::Builder::new()
                         .name(format!("solAcctLtHash{i:02}"))
-                        .spawn_scoped(s, move || {
+                        .spawn_scoped(s, || {
                             let mut reader = append_vec::new_scan_accounts_reader();
                             let mut thread_lt_hash = LtHash::identity();
                             // Always consume a multiple of small/large files cycle, when chunk
@@ -6718,7 +6717,6 @@ impl AccountsDb {
             let storages_consumer =
                 AccountStoragesOrderer::with_random_order(&storages).into_concurrent_consumer();
             let scan_time: u64 = thread::scope(|s| {
-                let storages = &storages_consumer;
                 let handles = (0..std::cmp::max(1, threads.saturating_sub(1)))
                     .map(|i| {
                         thread::Builder::new()
@@ -6741,7 +6739,7 @@ impl AccountsDb {
                             let mut local_num_existed_in_mem = 0;
                             let mut local_num_existed_on_disk = 0;
                             while let Some((nth, storage, origin_index)) =
-                                storages.enumerate_next_with_pos()
+                                storages_consumer.enumerate_next_with_pos()
                             {
                                 let mut scan_time = Measure::start("scan");
                                 log_status.report(nth as u64);
