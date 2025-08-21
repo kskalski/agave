@@ -314,7 +314,7 @@ impl<B> SequentialFileReader<'_, B> {
                         if state.left_to_consume > 0 {
                             let consumed =
                                 state.left_to_consume.min(state.current_buf_left as usize);
-                            // Safety: only advance the pointer by up to `current_buf_left`, which is
+                            // Safety: advance by amount capped with `current_buf_left`, which is
                             // also decremented by the same amount
                             state.current_buf_ptr = unsafe { state.current_buf_ptr.add(consumed) };
                             state.current_buf_left -= consumed as u32;
@@ -381,9 +381,9 @@ impl<B: AsMut<[u8]>> BufRead for SequentialFileReader<'_, B> {
             return Ok(&[]);
         }
 
-        // At this point we must have data or be at EOF.
-        //let current_buf = self.inner.context().get_fast(self.state.current_buf_index);
-        //Ok(current_buf.slice(self.state.current_buf_pos, self.state.current_buf_left))
+        // At this point we must have data.
+        // Safety: `current_buf_ptr` and `current_buf_left` are kept in sync at all times
+        // and span a single buffer obtained from `ReadBufState`.
         Ok(unsafe {
             slice::from_raw_parts(
                 self.state.current_buf_ptr,
@@ -443,13 +443,6 @@ impl BuffersState {
     fn get_mut(&mut self, index: u16) -> &mut ReadBufState {
         &mut self.0[index as usize]
     }
-
-    // #[inline]
-    // fn get_fast(&self, index: u16) -> &ReadBufState {
-    //     debug_assert!(index < self.len());
-    //     // Perf: skip bounds check for performance
-    //     unsafe { self.0.get_unchecked(index as usize) }
-    // }
 }
 
 impl Deref for BuffersState {
@@ -479,9 +472,11 @@ struct SequentialFileReaderState {
     left_to_consume: usize,
     /// Index of `BuffersState` buffer to consume data from (0 if no file is being read)
     current_buf_index: u16,
-    /// Position in buffer (pointed by `current_buf_index`) to consume data from
+    /// Pointer inside current buffer (pointed by `current_buf_index`) to consume data from
+    /// (null until `wait_current_buf_full` initializes it)
     current_buf_ptr: *const u8,
-    /// Cached length of the current buffer (0 until `wait_current_buf_full` initializes it)
+    /// Valid data left to consume in current buffer from `current_buf_ptr`
+    /// (0 when `current_buf_ptr` is null or we consumed all bytes in the current buffer)
     current_buf_left: u32,
     /// File offset of the next `fill_buf()` buffer available to consume
     current_offset: usize,
@@ -673,19 +668,6 @@ impl ReadBufState {
     fn is_reading(&self) -> bool {
         matches!(self, ReadBufState::Reading)
     }
-
-    // #[inline]
-    // fn slice(&self, start_pos: u32, len: u32) -> &[u8] {
-    //     match self {
-    //         Self::Full { buf, eof_pos } => {
-    //             debug_assert!(eof_pos.unwrap_or(buf.len()) >= len);
-    //             unsafe { slice::from_raw_parts(buf.as_ptr().add(start_pos as usize), len as usize) }
-    //         }
-    //         Self::Uninit(_) | Self::Reading => {
-    //             unreachable!("must call as_slice only on full buffer")
-    //         }
-    //     }
-    // }
 
     /// Marks the buffer as uninitialized (after it has been fully consumed).
     fn transition_to_uninit(&mut self) {
