@@ -22,6 +22,7 @@ mod geyser_plugin_utils;
 pub mod stats;
 pub mod tests;
 
+use crate::append_vec::new_scan_accounts_reader;
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
 #[cfg(feature = "dev-context-only-utils")]
@@ -1997,10 +1998,10 @@ impl AccountsDb {
                             dirty_ancient_stores.fetch_add(1, Ordering::Relaxed);
                         }
                         oldest_dirty_slot = oldest_dirty_slot.min(*slot);
-
+                        let mut reader = new_scan_accounts_reader();
                         store
                             .accounts
-                            .scan_accounts_without_data(|_offset, account| {
+                            .scan_accounts_without_data(&mut reader, |_offset, account| {
                                 let pubkey = *account.pubkey();
                                 let is_zero_lamport = account.is_zero_lamport();
                                 insert_candidate(pubkey, is_zero_lamport);
@@ -2939,9 +2940,10 @@ impl AccountsDb {
     ) -> GetUniqueAccountsResult {
         let capacity = store.capacity();
         let mut stored_accounts = Vec::with_capacity(store.count());
+        let mut reader = new_scan_accounts_reader();
         store
             .accounts
-            .scan_accounts_without_data(|offset, account| {
+            .scan_accounts_without_data(&mut reader, |offset, account| {
                 // file_id is unused and can be anything. We will always be loading whatever storage is in the slot.
                 let file_id = 0;
                 stored_accounts.push(AccountFromStorage {
@@ -3973,12 +3975,14 @@ impl AccountsDb {
         B: Send + Default + Sync,
     {
         self.scan_cache_storage_fallback(slot, cache_map_func, |retval, storage| {
+            let mut reader = new_scan_accounts_reader();
             match scan_account_storage_data {
-                ScanAccountStorageData::NoData => {
-                    storage.scan_accounts_without_data(|_offset, account_without_data| {
+                ScanAccountStorageData::NoData => storage.scan_accounts_without_data(
+                    &mut reader,
+                    |_offset, account_without_data| {
                         storage_scan_func(retval, &account_without_data, None);
-                    })
-                }
+                    },
+                ),
                 ScanAccountStorageData::DataRefForStorage => {
                     let mut reader = append_vec::new_scan_accounts_reader();
                     storage.scan_accounts(&mut reader, |_offset, account| {
@@ -6062,6 +6066,7 @@ impl AccountsDb {
                 stores
                     .into_par_iter()
                     .map(|store| {
+                        let mut reader = new_scan_accounts_reader();
                         let slot = store.slot();
                         let mut pubkeys = Vec::with_capacity(store.count());
                         // Obsolete accounts are already unreffed before this point, so do not add
@@ -6069,7 +6074,7 @@ impl AccountsDb {
                         let obsolete_accounts = store.get_obsolete_accounts(None);
                         store
                             .accounts
-                            .scan_accounts_without_data(|offset, account| {
+                            .scan_accounts_without_data(&mut reader, |offset, account| {
                                 if !obsolete_accounts.contains(&(offset, account.data_len)) {
                                     pubkeys.push((slot, *account.pubkey));
                                 }
@@ -6619,7 +6624,7 @@ impl AccountsDb {
                 // withOUT secondary indexes -- scan accounts withOUT account data
                 storage
                     .accounts
-                    .scan_accounts_without_data(|offset, account| {
+                    .scan_accounts_without_data(reader, |offset, account| {
                         let data_len = account.data_len as u64;
                         let stored_size_aligned =
                             storage.accounts.calculate_stored_size(data_len as usize);
@@ -6788,7 +6793,7 @@ impl AccountsDb {
                                     let mut lookup_time = Measure::start("lookup_time");
                                     storage
                                         .accounts
-                                        .scan_accounts_without_data(|offset, account| {
+                                        .scan_accounts_without_data(&mut reader, |offset, account| {
                                             let key = account.pubkey();
                                             let index_entry =
                                                 self.accounts_index.get_cloned(key).unwrap();
