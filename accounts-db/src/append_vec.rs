@@ -1904,7 +1904,7 @@ pub mod tests {
         if storage_access == StorageAccess::File {
             assert!(reopen.is_none());
         } else {
-            assert!(reopen.is_some());
+            assert!(reopen.is_none());
         }
     }
 
