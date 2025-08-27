@@ -161,6 +161,7 @@ impl<'a, T: Backing> BufferedReader<'a, T> {
         }
     }
 
+    #[allow(unused)]
     pub fn with_file(mut self, file: &'a File, read_limit: usize) -> Self {
         self.do_set_file(file, read_limit);
         self

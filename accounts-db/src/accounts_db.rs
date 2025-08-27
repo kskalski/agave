@@ -22,6 +22,7 @@ mod geyser_plugin_utils;
 pub mod stats;
 pub mod tests;
 
+use crate::append_vec::new_scan_accounts_reader;
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
 #[cfg(feature = "dev-context-only-utils")]
@@ -1997,10 +1998,10 @@ impl AccountsDb {
                             dirty_ancient_stores.fetch_add(1, Ordering::Relaxed);
                         }
                         oldest_dirty_slot = oldest_dirty_slot.min(*slot);
-
+                        let mut reader = new_scan_accounts_reader();
                         store
                             .accounts
-                            .scan_accounts_without_data(|_offset, account| {
+                            .scan_accounts_without_data(&mut reader, |_offset, account| {
                                 let pubkey = *account.pubkey();
                                 let is_zero_lamport = account.is_zero_lamport();
                                 insert_candidate(pubkey, is_zero_lamport);
@@ -2939,9 +2940,10 @@ impl AccountsDb {
     ) -> GetUniqueAccountsResult {
         let capacity = store.capacity();
         let mut stored_accounts = Vec::with_capacity(store.count());
+        let mut reader = new_scan_accounts_reader();
         store
             .accounts
-            .scan_accounts_without_data(|offset, account| {
+            .scan_accounts_without_data(&mut reader, |offset, account| {
                 // file_id is unused and can be anything. We will always be loading whatever storage is in the slot.
                 let file_id = 0;
                 stored_accounts.push(AccountFromStorage {
@@ -3973,12 +3975,14 @@ impl AccountsDb {
         B: Send + Default + Sync,
     {
         self.scan_cache_storage_fallback(slot, cache_map_func, |retval, storage| {
+            let mut reader = new_scan_accounts_reader();
             match scan_account_storage_data {
-                ScanAccountStorageData::NoData => {
-                    storage.scan_accounts_without_data(|_offset, account_without_data| {
+                ScanAccountStorageData::NoData => storage.scan_accounts_without_data(
+                    &mut reader,
+                    |_offset, account_without_data| {
                         storage_scan_func(retval, &account_without_data, None);
-                    })
-                }
+                    },
+                ),
                 ScanAccountStorageData::DataRefForStorage => {
                     let mut reader = append_vec::new_scan_accounts_reader();
                     storage.scan_accounts(&mut reader, |_offset, account| {
@@ -5529,12 +5533,11 @@ impl AccountsDb {
         let storages = AccountStoragesOrderer::with_small_to_large_ratio(storages, ratio)
             .into_concurrent_consumer();
         let mut lt_hash = thread::scope(|s| {
-            let storages = &storages;
             let handles = (0..num_threads.get())
                 .map(|i| {
                     thread::Builder::new()
                         .name(format!("solAcctLtHash{i:02}"))
-                        .spawn_scoped(s, move || {
+                        .spawn_scoped(s, || {
                             let mut reader = append_vec::new_scan_accounts_reader();
                             let mut thread_lt_hash = LtHash::identity();
                             // Always consume a multiple of small/large files cycle, when chunk
@@ -6063,6 +6066,7 @@ impl AccountsDb {
                 stores
                     .into_par_iter()
                     .map(|store| {
+                        let mut reader = new_scan_accounts_reader();
                         let slot = store.slot();
                         let mut pubkeys = Vec::with_capacity(store.count());
                         // Obsolete accounts are already unreffed before this point, so do not add
@@ -6070,7 +6074,7 @@ impl AccountsDb {
                         let obsolete_accounts = store.get_obsolete_accounts(None);
                         store
                             .accounts
-                            .scan_accounts_without_data(|offset, account| {
+                            .scan_accounts_without_data(&mut reader, |offset, account| {
                                 if !obsolete_accounts.contains(&(offset, account.data_len)) {
                                     pubkeys.push((slot, *account.pubkey));
                                 }
@@ -6620,7 +6624,7 @@ impl AccountsDb {
                 // withOUT secondary indexes -- scan accounts withOUT account data
                 storage
                     .accounts
-                    .scan_accounts_without_data(|offset, account| {
+                    .scan_accounts_without_data(reader, |offset, account| {
                         let data_len = account.data_len as u64;
                         let stored_size_aligned =
                             storage.accounts.calculate_stored_size(data_len as usize);
@@ -6709,149 +6713,169 @@ impl AccountsDb {
             let total_processed_slots_across_all_threads = AtomicU64::new(0);
             let outer_slots_len = storages.len();
             let threads = num_cpus::get();
-            let chunk_size = (outer_slots_len / (std::cmp::max(1, threads.saturating_sub(1)))) + 1; // approximately 400k slots in a snapshot
+            //let chunk_size = (outer_slots_len / (std::cmp::max(1, threads.saturating_sub(1)))) + 1; // approximately 400k slots in a snapshot
             let mut index_time = Measure::start("index");
             let insertion_time_us = AtomicU64::new(0);
             let total_including_duplicates = AtomicU64::new(0);
             let all_accounts_are_zero_lamports_slots = AtomicU64::new(0);
-            let mut all_zeros_slots = Mutex::new(Vec::<(Slot, Arc<AccountStorageEntry>)>::new());
-            let scan_time: u64 = storages
-                .par_chunks(chunk_size)
-                .map(|storages| {
-                    let mut reader = append_vec::new_scan_accounts_reader();
-                    let mut log_status = MultiThreadProgress::new(
-                        &total_processed_slots_across_all_threads,
-                        2,
-                        outer_slots_len as u64,
-                    );
-                    let mut scan_time_sum = 0;
-                    let mut all_accounts_are_zero_lamports_slots_inner = 0;
-                    let mut all_zeros_slots_inner = vec![];
-                    let mut local_zero_lamport_pubkeys = Vec::new();
-                    let mut insert_time_sum = 0;
-                    let mut total_including_duplicates_sum = 0;
-                    let mut accounts_data_len_sum = 0;
-                    let mut local_num_did_not_exist = 0;
-                    let mut local_num_existed_in_mem = 0;
-                    let mut local_num_existed_on_disk = 0;
-                    for (index, storage) in storages.iter().enumerate() {
-                        let mut scan_time = Measure::start("scan");
-                        log_status.report(index as u64);
-                        let store_id = storage.id();
-                        let slot = storage.slot();
-
-                        scan_time.stop();
-                        scan_time_sum += scan_time.as_us();
-
-                        let insert_us = if pass == 0 {
-                            // generate index
-                            self.maybe_throttle_index_generation();
-                            let SlotIndexGenerationInfo {
-                                insert_time_us: insert_us,
-                                num_accounts: total_this_slot,
-                                accounts_data_len: accounts_data_len_this_slot,
-                                zero_lamport_pubkeys: mut zero_lamport_pubkeys_this_slot,
-                                all_accounts_are_zero_lamports,
-                                num_did_not_exist,
-                                num_existed_in_mem,
-                                num_existed_on_disk,
-                            } = self.generate_index_for_slot(
-                                &mut reader,
-                                storage,
-                                slot,
-                                store_id,
-                                &storage_info,
+            let mut all_zeros_slots = Mutex::new(Vec::<(Slot, usize)>::new());
+            let storages_consumer =
+                AccountStoragesOrderer::with_random_order(&storages).into_concurrent_consumer();
+            let scan_time: u64 = thread::scope(|s| {
+                let handles = (0..std::cmp::max(1, threads.saturating_sub(1)))
+                    .map(|i| {
+                        thread::Builder::new()
+                        .name(format!("solAcctIndex{i:02}"))
+                        .spawn_scoped(s, || {
+                            let mut reader = append_vec::new_scan_accounts_reader();
+                            let mut log_status = MultiThreadProgress::new(
+                                &total_processed_slots_across_all_threads,
+                                2,
+                                outer_slots_len as u64,
                             );
+                            let mut scan_time_sum = 0;
+                            let mut all_accounts_are_zero_lamports_slots_inner = 0;
+                            let mut all_zeros_slots_inner = vec![];
+                            let mut local_zero_lamport_pubkeys = Vec::new();
+                            let mut insert_time_sum = 0;
+                            let mut total_including_duplicates_sum = 0;
+                            let mut accounts_data_len_sum = 0;
+                            let mut local_num_did_not_exist = 0;
+                            let mut local_num_existed_in_mem = 0;
+                            let mut local_num_existed_on_disk = 0;
+                            while let Some((nth, storage, origin_index)) =
+                                storages_consumer.enumerate_next_with_pos()
+                            {
+                                let mut scan_time = Measure::start("scan");
+                                log_status.report(nth as u64);
+                                let store_id = storage.id();
+                                let slot = storage.slot();
 
-                            local_num_did_not_exist += num_did_not_exist;
-                            local_num_existed_in_mem += num_existed_in_mem;
-                            local_num_existed_on_disk += num_existed_on_disk;
-                            total_including_duplicates_sum += total_this_slot;
-                            accounts_data_len_sum += accounts_data_len_this_slot;
-                            if all_accounts_are_zero_lamports {
-                                all_accounts_are_zero_lamports_slots_inner += 1;
-                                all_zeros_slots_inner.push((slot, Arc::clone(storage)));
-                            }
-                            local_zero_lamport_pubkeys.append(&mut zero_lamport_pubkeys_this_slot);
+                                scan_time.stop();
+                                scan_time_sum += scan_time.as_us();
 
-                            insert_us
-                        } else {
-                            // verify index matches expected and measure the time to get all items
-                            assert!(verify);
-                            let mut lookup_time = Measure::start("lookup_time");
-                            storage
-                                .accounts
-                                .scan_accounts_without_data(|offset, account| {
-                                    let key = account.pubkey();
-                                    let index_entry = self.accounts_index.get_cloned(key).unwrap();
-                                    let slot_list = index_entry.slot_list.read().unwrap();
-                                    let mut count = 0;
-                                    for (slot2, account_info2) in slot_list.iter() {
-                                        if *slot2 == slot {
-                                            count += 1;
-                                            let ai = AccountInfo::new(
-                                                StorageLocation::AppendVec(store_id, offset), // will never be cached
-                                                account.is_zero_lamport(),
-                                            );
-                                            assert_eq!(&ai, account_info2);
-                                        }
+                                let insert_us = if pass == 0 {
+                                    // generate index
+                                    self.maybe_throttle_index_generation();
+                                    let SlotIndexGenerationInfo {
+                                        insert_time_us: insert_us,
+                                        num_accounts: total_this_slot,
+                                        accounts_data_len: accounts_data_len_this_slot,
+                                        zero_lamport_pubkeys: mut zero_lamport_pubkeys_this_slot,
+                                        all_accounts_are_zero_lamports,
+                                        num_did_not_exist,
+                                        num_existed_in_mem,
+                                        num_existed_on_disk,
+                                    } = self.generate_index_for_slot(
+                                        &mut reader,
+                                        storage,
+                                        slot,
+                                        store_id,
+                                        &storage_info,
+                                    );
+
+                                    local_num_did_not_exist += num_did_not_exist;
+                                    local_num_existed_in_mem += num_existed_in_mem;
+                                    local_num_existed_on_disk += num_existed_on_disk;
+                                    total_including_duplicates_sum += total_this_slot;
+                                    accounts_data_len_sum += accounts_data_len_this_slot;
+                                    if all_accounts_are_zero_lamports {
+                                        all_accounts_are_zero_lamports_slots_inner += 1;
+                                        all_zeros_slots_inner.push((slot, origin_index));
                                     }
-                                    assert_eq!(1, count);
-                                })
-                                .expect("must scan accounts storage");
-                            lookup_time.stop();
-                            lookup_time.as_us()
-                        };
-                        insert_time_sum += insert_us;
-                    }
+                                    local_zero_lamport_pubkeys
+                                        .append(&mut zero_lamport_pubkeys_this_slot);
 
-                    if pass == 0 {
-                        let mut zero_lamport_pubkeys_lock = zero_lamport_pubkeys.lock().unwrap();
-                        zero_lamport_pubkeys_lock.reserve(local_zero_lamport_pubkeys.len());
-                        zero_lamport_pubkeys_lock.extend(local_zero_lamport_pubkeys.into_iter());
-                        drop(zero_lamport_pubkeys_lock);
+                                    insert_us
+                                } else {
+                                    // verify index matches expected and measure the time to get all items
+                                    assert!(verify);
+                                    let mut lookup_time = Measure::start("lookup_time");
+                                    storage
+                                        .accounts
+                                        .scan_accounts_without_data(&mut reader, |offset, account| {
+                                            let key = account.pubkey();
+                                            let index_entry =
+                                                self.accounts_index.get_cloned(key).unwrap();
+                                            let slot_list = index_entry.slot_list.read().unwrap();
+                                            let mut count = 0;
+                                            for (slot2, account_info2) in slot_list.iter() {
+                                                if *slot2 == slot {
+                                                    count += 1;
+                                                    let ai = AccountInfo::new(
+                                                        StorageLocation::AppendVec(
+                                                            store_id, offset,
+                                                        ), // will never be cached
+                                                        account.is_zero_lamport(),
+                                                    );
+                                                    assert_eq!(&ai, account_info2);
+                                                }
+                                            }
+                                            assert_eq!(1, count);
+                                        })
+                                        .expect("must scan accounts storage");
+                                    lookup_time.stop();
+                                    lookup_time.as_us()
+                                };
+                                insert_time_sum += insert_us;
+                            }
 
-                        // This thread has finished processing its chunk of slots.
-                        // Update the index stats now.
-                        let index_stats = self.accounts_index.bucket_map_holder_stats();
+                            if pass == 0 {
+                                let mut zero_lamport_pubkeys_lock =
+                                    zero_lamport_pubkeys.lock().unwrap();
+                                zero_lamport_pubkeys_lock.reserve(local_zero_lamport_pubkeys.len());
+                                zero_lamport_pubkeys_lock
+                                    .extend(local_zero_lamport_pubkeys.into_iter());
+                                drop(zero_lamport_pubkeys_lock);
 
-                        // stats for inserted entries that previously did *not* exist
-                        index_stats.inc_insert_count(local_num_did_not_exist);
-                        index_stats.add_mem_count(local_num_did_not_exist as usize);
+                                // This thread has finished processing its chunk of slots.
+                                // Update the index stats now.
+                                let index_stats = self.accounts_index.bucket_map_holder_stats();
 
-                        // stats for inserted entries that previous did exist *in-mem*
-                        index_stats
-                            .entries_from_mem
-                            .fetch_add(local_num_existed_in_mem, Ordering::Relaxed);
-                        index_stats
-                            .updates_in_mem
-                            .fetch_add(local_num_existed_in_mem, Ordering::Relaxed);
+                                // stats for inserted entries that previously did *not* exist
+                                index_stats.inc_insert_count(local_num_did_not_exist);
+                                index_stats.add_mem_count(local_num_did_not_exist as usize);
 
-                        // stats for inserted entries that previously did exist *on-disk*
-                        index_stats.add_mem_count(local_num_existed_on_disk as usize);
-                        index_stats
-                            .entries_missing
-                            .fetch_add(local_num_existed_on_disk, Ordering::Relaxed);
-                        index_stats
-                            .updates_in_mem
-                            .fetch_add(local_num_existed_on_disk, Ordering::Relaxed);
-                    }
+                                // stats for inserted entries that previous did exist *in-mem*
+                                index_stats
+                                    .entries_from_mem
+                                    .fetch_add(local_num_existed_in_mem, Ordering::Relaxed);
+                                index_stats
+                                    .updates_in_mem
+                                    .fetch_add(local_num_existed_in_mem, Ordering::Relaxed);
 
-                    all_accounts_are_zero_lamports_slots.fetch_add(
-                        all_accounts_are_zero_lamports_slots_inner,
-                        Ordering::Relaxed,
-                    );
-                    all_zeros_slots
-                        .lock()
-                        .unwrap()
-                        .append(&mut all_zeros_slots_inner);
-                    insertion_time_us.fetch_add(insert_time_sum, Ordering::Relaxed);
-                    total_including_duplicates
-                        .fetch_add(total_including_duplicates_sum, Ordering::Relaxed);
-                    accounts_data_len.fetch_add(accounts_data_len_sum, Ordering::Relaxed);
-                    scan_time_sum
-                })
-                .sum();
+                                // stats for inserted entries that previously did exist *on-disk*
+                                index_stats.add_mem_count(local_num_existed_on_disk as usize);
+                                index_stats
+                                    .entries_missing
+                                    .fetch_add(local_num_existed_on_disk, Ordering::Relaxed);
+                                index_stats
+                                    .updates_in_mem
+                                    .fetch_add(local_num_existed_on_disk, Ordering::Relaxed);
+                            }
+
+                            all_accounts_are_zero_lamports_slots.fetch_add(
+                                all_accounts_are_zero_lamports_slots_inner,
+                                Ordering::Relaxed,
+                            );
+                            all_zeros_slots
+                                .lock()
+                                .unwrap()
+                                .append(&mut all_zeros_slots_inner);
+                            insertion_time_us.fetch_add(insert_time_sum, Ordering::Relaxed);
+                            total_including_duplicates
+                                .fetch_add(total_including_duplicates_sum, Ordering::Relaxed);
+                            accounts_data_len.fetch_add(accounts_data_len_sum, Ordering::Relaxed);
+                            scan_time_sum
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .sum()
+            });
             index_time.stop();
 
             let mut index_flush_us = 0;
@@ -7021,8 +7045,8 @@ impl AccountsDb {
                     "insert all zero slots to clean at startup {}",
                     all_zero_slots_to_clean.len()
                 );
-                for (slot, storage) in all_zero_slots_to_clean {
-                    self.dirty_stores.insert(slot, storage);
+                for (slot, index) in all_zero_slots_to_clean {
+                    self.dirty_stores.insert(slot, storages[index].clone());
                 }
             }
 

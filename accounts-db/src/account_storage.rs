@@ -355,6 +355,11 @@ impl<'a> AccountStoragesOrderer<'a> {
         self.indices.len()
     }
 
+    pub fn nth_with_index(&'a self, nth: usize) -> (&'a AccountStorageEntry, usize) {
+        let index = self.indices[nth];
+        (&self.storages[index].as_ref(), index)
+    }
+
     pub fn iter(&'a self) -> impl ExactSizeIterator<Item = &'a AccountStorageEntry> + 'a {
         self.indices.iter().map(|i| self.storages[*i].as_ref())
     }
@@ -402,6 +407,18 @@ impl<'a> AccountStoragesConcurrentConsumer<'a> {
         let index = self.current_index.fetch_add(1, Ordering::Relaxed);
         if index < self.orderer.entries_len() {
             Some(&self.orderer[index])
+        } else {
+            None
+        }
+    }
+
+    /// Takes the next `(index, AccountStorageEntry)` moving shared consume position
+    /// until the end of the entries source is reached.
+    pub fn enumerate_next_with_pos(&'a self) -> Option<(usize, &'a AccountStorageEntry, usize)> {
+        let position = self.current_index.fetch_add(1, Ordering::Relaxed);
+        if position < self.orderer.entries_len() {
+            let (entry, index) = self.orderer.nth_with_index(position);
+            Some((position, entry, index))
         } else {
             None
         }

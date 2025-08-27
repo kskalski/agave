@@ -279,12 +279,13 @@ impl AccountsFile {
     /// * StoredAccountInfoWithoutData: the account itself, without account data
     ///
     /// Note that account data is not read/passed to the callback.
-    pub fn scan_accounts_without_data(
-        &self,
+    pub(crate) fn scan_accounts_without_data<'a>(
+        &'a self,
+        reader: &mut impl RequiredLenBufFileRead<'a>,
         callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
     ) -> Result<()> {
         match self {
-            Self::AppendVec(av) => av.scan_accounts_without_data(callback),
+            Self::AppendVec(av) => av.scan_accounts_without_data(reader, callback),
             Self::TieredStorage(ts) => {
                 if let Some(reader) = ts.reader() {
                     reader.scan_accounts_without_data(callback)?;

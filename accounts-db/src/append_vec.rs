@@ -10,10 +10,12 @@ pub mod test_utils;
 // Used all over the accounts-db crate.  Probably should be minimized.
 pub(crate) use meta::StoredAccountMeta;
 // Some tests/benches use AccountMeta/StoredMeta
+use crate::buffered_reader::{BufferedReader, Stack};
 #[cfg(feature = "dev-context-only-utils")]
 pub use meta::{AccountMeta, StoredMeta};
 #[cfg(not(feature = "dev-context-only-utils"))]
 use meta::{AccountMeta, StoredMeta};
+
 use {
     crate::{
         account_info::Offset,
@@ -21,10 +23,7 @@ use {
         accounts_file::{
             AccountsFileError, InternalsForArchive, Result, StorageAccess, StoredAccountsInfo,
         },
-        buffered_reader::{
-            BufReaderWithOverflow, BufferedReader, FileBufRead as _, RequiredLenBufFileRead,
-            RequiredLenBufRead as _, Stack,
-        },
+        buffered_reader::{BufReaderWithOverflow, RequiredLenBufFileRead},
         file_io::read_into_buffer,
         is_zero_lamport::IsZeroLamport,
         storable_accounts::StorableAccounts,
@@ -40,7 +39,7 @@ use {
         self,
         convert::TryFrom,
         fs::{remove_file, File, OpenOptions},
-        io::{BufRead, Seek, SeekFrom, Write},
+        io::{Seek, SeekFrom, Write},
         mem::{self, MaybeUninit},
         path::{Path, PathBuf},
         ptr, slice,
@@ -549,7 +548,8 @@ impl AppendVec {
         let mut num_accounts = 0;
         let mut matches = true;
         let mut last_offset = 0;
-        self.scan_stored_accounts_no_data(|account| {
+        let mut reader = new_scan_accounts_no_data_reader();
+        self.scan_stored_accounts_no_data(&mut reader, |account| {
             if !matches || !account.sanitize() {
                 matches = false;
                 return;
@@ -962,11 +962,12 @@ impl AppendVec {
     /// * StoredAccountInfoWithoutData: the account itself, without account data
     ///
     /// Note that account data is not read/passed to the callback.
-    pub fn scan_accounts_without_data(
-        &self,
+    pub(crate) fn scan_accounts_without_data<'a>(
+        &'a self,
+        reader: &mut impl RequiredLenBufFileRead<'a>,
         mut callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
     ) -> Result<()> {
-        self.scan_stored_accounts_no_data(|stored_account| {
+        self.scan_stored_accounts_no_data(reader, |stored_account| {
             let offset = stored_account.offset();
             let account = StoredAccountInfoWithoutData {
                 pubkey: stored_account.pubkey(),
@@ -1141,14 +1142,16 @@ impl AppendVec {
     /// Also, no references have to be maintained/returned from an iterator function.
     /// This fn can operate on a batch of data at once.
     pub fn scan_pubkeys(&self, mut callback: impl FnMut(&Pubkey)) -> Result<()> {
-        self.scan_stored_accounts_no_data(|account| {
+        let mut reader = new_scan_accounts_reader();
+        self.scan_stored_accounts_no_data(&mut reader, |account| {
             callback(account.pubkey());
         })
     }
 
     /// Iterate over all accounts and call `callback` with the fixed sized portion of each account.
-    fn scan_stored_accounts_no_data(
-        &self,
+    fn scan_stored_accounts_no_data<'a>(
+        &'a self,
+        reader: &mut impl RequiredLenBufFileRead<'a>,
         mut callback: impl FnMut(StoredAccountNoData),
     ) -> Result<()> {
         let self_len = self.len();
@@ -1187,9 +1190,10 @@ impl AppendVec {
             }
             AppendVecFileBacking::File(file) => {
                 // Heuristic observed in benchmarking that maintains a reasonable balance between syscalls and data waste
-                const BUFFER_SIZE: usize = PAGE_SIZE * 4;
-                let mut reader =
-                    BufferedReader::<Stack<BUFFER_SIZE>>::new_stack().with_file(file, self_len);
+                // const BUFFER_SIZE: usize = PAGE_SIZE * 4;
+                // let mut reader =
+                //     BufferedReader::<Stack<BUFFER_SIZE>>::new_stack().with_file(file, self_len);
+                reader.activate_file(file, self_len)?;
                 const REQUIRED_READ_LEN: usize =
                     mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>();
                 loop {
@@ -1326,6 +1330,11 @@ impl AppendVec {
 
 /// Ratio of number of small files to large files fetched in chunks when scanning accounts.
 pub const SCAN_ACCOUNTS_SMALL_TO_LARGE_FILE_RATIO: (usize, usize) = (7, 1);
+
+pub(crate) fn new_scan_accounts_no_data_reader<'a>() -> impl RequiredLenBufFileRead<'a> {
+    const BUFFER_SIZE: usize = PAGE_SIZE * 4;
+    BufReaderWithOverflow::new(BufferedReader::<Stack<BUFFER_SIZE>>::new_stack(), 0, 1024)
+}
 
 /// Create a reusable buffered reader tuned for scanning storages with account data.
 pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> {
