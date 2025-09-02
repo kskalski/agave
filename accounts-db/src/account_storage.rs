@@ -5,6 +5,7 @@ use {
         account_info::Offset,
         account_storage::stored_account_info::StoredAccountInfo,
         accounts_db::{AccountStorageEntry, AccountsFileId},
+        accounts_file::AccountsFileError,
         append_vec,
     },
     dashmap::DashMap,
@@ -432,46 +433,54 @@ impl<'a> AccountStoragesConcurrentConsumer<'a> {
         }
     }
 
+    /// Perform scan of accounts from all storages using threads created for call duration
+    ///
+    /// `num_threads` are created in the scope of this call to perform the scan. Upon creation
+    /// of each thread, `init_thread_state` is called to create value (`S`) whose &mut is passed
+    /// into `account_callback`, similarly `init_storage_state` is called for each scanned storage
+    /// to create value (`T`) also passed as &mut to the callback for each account.
+    ///
+    /// Returns a vector of `S` values, one for each thread.
     pub fn scan_with_scoped_threads<S: Send, T>(
         self,
+        thread_name_prefix: &str,
         num_threads: NonZeroUsize,
         init_thread_state: impl Fn() -> S + Sync,
         init_storage_state: impl Fn(&NextItem) -> T + Sync,
         account_callback: impl Fn(&mut S, &mut T, Offset, StoredAccountInfo) + Sync,
-    ) -> Vec<S> {
+    ) -> Result<Vec<S>, AccountsFileError> {
         thread::scope(|s| {
             let handles = (0..num_threads.get())
                 .map(|i| {
                     thread::Builder::new()
-                        .name(format!("solAcctLtHash{i:02}"))
+                        .name(format!("{thread_name_prefix}{i:02}"))
                         .spawn_scoped(s, || {
                             let mut reader = append_vec::new_scan_accounts_reader();
                             let mut state = init_thread_state();
 
                             while let Some(item) = self.next() {
                                 let mut storage_state = init_storage_state(&item);
-                                item.storage
-                                    .accounts
-                                    .scan_accounts(&mut reader, |offset, account| {
+                                item.storage.accounts.scan_accounts(
+                                    &mut reader,
+                                    |offset, account| {
                                         account_callback(
                                             &mut state,
                                             &mut storage_state,
                                             offset,
                                             account,
                                         )
-                                    })
-                                    .expect("must scan accounts storage");
+                                    },
+                                )?;
                             }
-                            state
+                            Ok(state)
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()
-                .expect("threads should spawn successfully");
+                .expect("threads must spawn successfully");
             handles
                 .into_iter()
-                .map(|handle| handle.join())
+                .map(|handle| handle.join().expect("thread must join successfully"))
                 .collect::<Result<Vec<_>, _>>()
-                .expect("threads should join successfully")
         })
     }
 }

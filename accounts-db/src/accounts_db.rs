@@ -31,7 +31,8 @@ use {
         account_info::{AccountInfo, Offset, StorageLocation},
         account_storage::{
             stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
-            AccountStorage, AccountStorageStatus, AccountStoragesOrderer, ShrinkInProgress,
+            AccountStorage, AccountStorageStatus, AccountStoragesOrderer, NextItem,
+            ShrinkInProgress,
         },
         accounts_cache::{AccountsCache, CachedAccount, SlotCache},
         accounts_db::stats::{
@@ -5551,10 +5552,11 @@ impl AccountsDb {
         // storages as of startup_slot. This means that any accounts marked obsolete at a
         // slot newer than startup_slot should be included in the accounts_lt_hash
         let init_obsolete_accounts =
-            |entry: &AccountStorageEntry| entry.get_obsolete_accounts(Some(startup_slot));
+            |item: &NextItem| item.storage.get_obsolete_accounts(Some(startup_slot));
 
         let mut lt_hash = storages
             .scan_with_scoped_threads(
+                "solAcctLtHash",
                 num_threads,
                 LtHash::identity,
                 init_obsolete_accounts,
@@ -5566,6 +5568,7 @@ impl AccountsDb {
                     }
                 },
             )
+            .expect("must scan account storages")
             .into_iter()
             .fold(LtHash::identity(), |mut accum, elem| {
                 accum.mix_in(&elem);
