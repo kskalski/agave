@@ -1,18 +1,25 @@
 //! Manage the map of slot -> append vec
 
 use {
-    crate::accounts_db::{AccountStorageEntry, AccountsFileId},
+    crate::{
+        account_info::Offset,
+        account_storage::stored_account_info::StoredAccountInfo,
+        accounts_db::{AccountStorageEntry, AccountsFileId},
+        append_vec,
+    },
     dashmap::DashMap,
     rand::seq::SliceRandom,
     rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_clock::Slot,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap},
     std::{
+        num::NonZeroUsize,
         ops::{Index, Range},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, RwLock,
         },
+        thread,
     },
 };
 
@@ -423,6 +430,49 @@ impl<'a> AccountStoragesConcurrentConsumer<'a> {
         } else {
             None
         }
+    }
+
+    pub fn scan_with_scoped_threads<S: Send, T>(
+        self,
+        num_threads: NonZeroUsize,
+        init_thread_state: impl Fn() -> S + Sync,
+        init_storage_state: impl Fn(&NextItem) -> T + Sync,
+        account_callback: impl Fn(&mut S, &mut T, Offset, StoredAccountInfo) + Sync,
+    ) -> Vec<S> {
+        thread::scope(|s| {
+            let handles = (0..num_threads.get())
+                .map(|i| {
+                    thread::Builder::new()
+                        .name(format!("solAcctLtHash{i:02}"))
+                        .spawn_scoped(s, || {
+                            let mut reader = append_vec::new_scan_accounts_reader();
+                            let mut state = init_thread_state();
+
+                            while let Some(item) = self.next() {
+                                let mut storage_state = init_storage_state(&item);
+                                item.storage
+                                    .accounts
+                                    .scan_accounts(&mut reader, |offset, account| {
+                                        account_callback(
+                                            &mut state,
+                                            &mut storage_state,
+                                            offset,
+                                            account,
+                                        )
+                                    })
+                                    .expect("must scan accounts storage");
+                            }
+                            state
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .expect("threads should spawn successfully");
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("threads should join successfully")
+        })
     }
 }
 
