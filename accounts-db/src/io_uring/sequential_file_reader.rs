@@ -410,13 +410,7 @@ impl<'a, B: AsMut<[u8]>> FileBufRead<'a> for SequentialFileReader<'a, B> {
         self.add_file_by_fd(file.as_raw_fd(), read_limit)
     }
 
-    fn add_files_to_prefetch(
-        &mut self,
-        files: impl Iterator<Item = (&'a File, usize)>,
-    ) -> io::Result<()> {
-        for (file, read_limit) in files {
-            self.add_file_by_fd(file.as_raw_fd(), read_limit)?;
-        }
+    fn submit_prefetch(&mut self) -> io::Result<()> {
         self.inner.submit()
     }
 }
