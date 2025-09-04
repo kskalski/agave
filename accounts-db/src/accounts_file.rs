@@ -294,7 +294,7 @@ impl AccountsFile {
     /// as it can potentially read less and be faster.
     pub(crate) fn scan_accounts<'a>(
         &'a self,
-        reader: &mut impl RequiredLenBufFileRead<'a>,
+        reader: &mut dyn RequiredLenBufFileRead<'a>,
         callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
     ) -> Result<()> {
         match self {
@@ -317,7 +317,7 @@ impl AccountsFile {
         &self,
         callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
     ) -> Result<()> {
-        let mut reader = append_vec::new_scan_accounts_reader();
+        let mut reader = append_vec::new_scan_accounts_reader(0);
         match self {
             Self::AppendVec(av) => av.scan_accounts_stored_meta(&mut reader, callback),
             Self::TieredStorage(_) => {

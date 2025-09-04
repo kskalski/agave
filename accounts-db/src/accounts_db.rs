@@ -51,7 +51,7 @@ use {
         active_stats::{ActiveStatItem, ActiveStats},
         ancestors::Ancestors,
         append_vec::{self, aligned_stored_size, IndexInfo, IndexInfoInner, STORE_META_OVERHEAD},
-        buffered_reader::{FileBufRead, RequiredLenBufFileRead},
+        buffered_reader::{FileBufRead as _, RequiredLenBufFileRead},
         contains::Contains,
         is_zero_lamport::IsZeroLamport,
         partitioned_rewards::{
@@ -2076,12 +2076,12 @@ impl AccountsDb {
         storages.retain(|s| s.slot() <= max_slot_inclusive);
         // populate
         storages.par_iter().for_each_init(
-            || Box::new(append_vec::new_scan_accounts_reader()),
+            || append_vec::new_scan_accounts_reader(0),
             |reader, storage| {
                 let slot = storage.slot();
                 storage
                     .accounts
-                    .scan_accounts(reader.as_mut(), |_offset, account| {
+                    .scan_accounts(reader, |_offset, account| {
                         let pk = account.pubkey();
                         match pubkey_refcount.entry(*pk) {
                             dashmap::mapref::entry::Entry::Occupied(mut occupied_entry) => {
@@ -3982,7 +3982,7 @@ impl AccountsDb {
                     })
                 }
                 ScanAccountStorageData::DataRefForStorage => {
-                    let mut reader = append_vec::new_scan_accounts_reader();
+                    let mut reader = append_vec::new_scan_accounts_reader(0);
                     storage.scan_accounts(&mut reader, |_offset, account| {
                         let account_without_data = StoredAccountInfoWithoutData::new_from(&account);
                         storage_scan_func(retval, &account_without_data, Some(account.data));
@@ -6681,6 +6681,7 @@ impl AccountsDb {
     pub fn generate_index(
         &self,
         limit_load_slot_count_from_snapshot: Option<usize>,
+        memlock_budget_size: usize,
         verify: bool,
     ) -> IndexGenerationInfo {
         let mut total_time = Measure::start("generate_index");
@@ -6749,6 +6750,7 @@ impl AccountsDb {
         let exit_logger = AtomicBool::new(false);
         let num_processed = AtomicU64::new(0);
         let num_threads = num_cpus::get();
+        let per_thread_memlock_budget_size = memlock_budget_size / num_threads;
         let mut index_time = Measure::start("index");
         thread::scope(|s| {
             let thread_handles = (0..num_threads)
@@ -6757,27 +6759,30 @@ impl AccountsDb {
                         .name(format!("solGenIndex{i:02}"))
                         .spawn_scoped(s, || {
                             let mut thread_accum = IndexGenerationAccumulator::new();
-                            let mut reader = append_vec::new_scan_accounts_reader();
+                            let mut reader = append_vec::new_scan_accounts_reader(
+                                per_thread_memlock_budget_size,
+                            );
                             // Always consume a multiple of small/large files cycle, when chunk
                             // is replenished, it will get a single cycle (half capacity) and
                             // add it to prefetch, while the existing cycle is being read.
-                            let mut prefetch_chunk =
-                                VecDeque::with_capacity(2 * (ratio.0 + ratio.1));
+                            let mut chunk = VecDeque::with_capacity(2 * (ratio.0 + ratio.1));
 
                             loop {
-                                if prefetch_chunk.is_empty()
-                                    || prefetch_chunk.len() == prefetch_chunk.capacity() / 2
-                                {
-                                    let new_entries =
-                                        storages_orderer.take_up_to_capacity(&mut prefetch_chunk);
-                                    let new_files = new_entries
-                                        .filter_map(|item| item.storage.accounts.file_io_info());
-                                    reader
-                                        .add_files_to_prefetch(new_files)
-                                        .expect("must prefetch accounts storage");
+                                if chunk.is_empty() || chunk.len() == chunk.capacity() / 2 {
+                                    for new_item in storages_orderer.take_up_to_capacity(&mut chunk)
+                                    {
+                                        if let Some((file, size)) =
+                                            new_item.storage.accounts.file_io_info()
+                                        {
+                                            reader
+                                                .add_file_to_prefetch(file, size)
+                                                .expect("must prefetch accounts storage")
+                                        }
+                                    }
+                                    reader.submit_prefetch().expect("must submit prefetch");
                                 }
 
-                                let Some(next_item) = prefetch_chunk.pop_front() else {
+                                let Some(next_item) = chunk.pop_front() else {
                                     break;
                                 };
 
@@ -7471,7 +7476,7 @@ impl AccountsDb {
         storages: &[Arc<AccountStorageEntry>],
         mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
     ) {
-        let mut reader = append_vec::new_scan_accounts_reader();
+        let mut reader = append_vec::new_scan_accounts_reader(0);
         for storage in storages {
             storage
                 .accounts

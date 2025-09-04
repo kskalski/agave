@@ -87,25 +87,36 @@ pub(crate) trait FileBufRead<'a>: BufRead {
     ///
     /// The read finishes when EOF is reached or `read_limit` bytes are read.
     /// Multiple files can be added to the reader and they will be read-ahead in FIFO order.
+    /// The exact moment how and when reads are performed is implementation-specific, but
+    /// can be expedited by calling `submit_prefetch`.
     ///
     /// In order to consume prefetched files, call `activate_file` in the same order.
     ///
     /// Lifetime of reference is tied to the reader's lifetime.
     fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: usize) -> io::Result<()>;
 
-    /// Adds multiple `files` to the read-ahead queue.
+    /// Submit all prefetched files for reading.
     ///
-    /// Default implementation will call `add_file_to_prefetch` in sequence.
-    /// Specific implementations may optimize this operation and use it as opportunity
-    /// to batch IO operations for a larger chunk of files.
-    fn add_files_to_prefetch(
-        &mut self,
-        files: impl Iterator<Item = (&'a File, usize)>,
-    ) -> io::Result<()> {
-        for (file, read_limit) in files {
-            self.add_file_to_prefetch(file, read_limit)?;
-        }
-        Ok(())
+    /// This method can be used for optimizing interaction with the kernel to batch multiple
+    /// requests (e.g. operations scheduled by `add_file_to_prefetch`) in a single syscall.
+    fn submit_prefetch(&mut self) -> io::Result<()>;
+}
+
+impl<'a> FileBufRead<'a> for Box<dyn FileBufRead<'a> + 'a> {
+    fn activate_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+        self.as_mut().activate_file(file, read_limit)
+    }
+
+    fn get_file_offset(&self) -> usize {
+        self.as_ref().get_file_offset()
+    }
+
+    fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+        self.as_mut().add_file_to_prefetch(file, read_limit)
+    }
+
+    fn submit_prefetch(&mut self) -> io::Result<()> {
+        self.as_mut().submit_prefetch()
     }
 }
 
@@ -192,6 +203,10 @@ impl<'a, T: Backing> FileBufRead<'a> for BufferedReader<'a, T> {
 
     fn add_file_to_prefetch(&mut self, _file: &'a File, _read_limit: usize) -> io::Result<()> {
         // No prefetching in this implementation
+        Ok(())
+    }
+
+    fn submit_prefetch(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -393,11 +408,8 @@ impl<'a, R: FileBufRead<'a>> FileBufRead<'a> for BufReaderWithOverflow<R> {
         self.reader.add_file_to_prefetch(file, read_limit)
     }
 
-    fn add_files_to_prefetch(
-        &mut self,
-        files: impl Iterator<Item = (&'a File, usize)>,
-    ) -> io::Result<()> {
-        self.reader.add_files_to_prefetch(files)
+    fn submit_prefetch(&mut self) -> io::Result<()> {
+        self.reader.submit_prefetch()
     }
 }
 
