@@ -1376,7 +1376,8 @@ pub(crate) fn new_scan_accounts_reader<'a>(
     }
     let _ = memlock_budget_size;
     const BUFFER_SIZE: usize = PAGE_SIZE * 8;
-    let file_reader = Box::new(BufferedReader::<Stack<BUFFER_SIZE>>::new_stack());
+    let file_reader: Box<dyn FileBufRead<'a>> =
+        Box::new(BufferedReader::<Stack<BUFFER_SIZE>>::new_stack());
     BufReaderWithOverflow::new(file_reader, MIN_CAPACITY, MAX_CAPACITY)
 }
 
