@@ -224,6 +224,7 @@ impl<B> IoUringFileCreator<'_, B> {
                     file_key,
                     offset,
                     buf,
+                    buf_offset: 0,
                     write_len: len,
                 };
                 state.submitted_writes_size += len;
@@ -385,6 +386,7 @@ impl OpenOp {
                 file_key: self.file_key,
                 offset,
                 buf,
+                buf_offset: 0,
                 write_len: len,
             };
             ring.context_mut().submitted_writes_size += len;
@@ -428,6 +430,7 @@ struct WriteOp {
     file_key: usize,
     offset: usize,
     buf: FixedIoBuffer,
+    buf_offset: usize,
     write_len: usize,
 }
 
@@ -437,6 +440,7 @@ impl<'a> WriteOp {
             file_key,
             offset,
             buf,
+            buf_offset,
             write_len,
         } = self;
 
@@ -444,7 +448,7 @@ impl<'a> WriteOp {
         // reclaimed after completion passed in a call to `mark_write_completed`.
         opcode::WriteFixed::new(
             types::Fixed(*file_key as u32),
-            unsafe { buf.as_mut_ptr() },
+            unsafe { buf.as_mut_ptr().byte_add(*buf_offset) },
             *write_len as u32,
             buf.io_buf_index()
                 .expect("should have a valid fixed buffer"),
@@ -466,15 +470,31 @@ impl<'a> WriteOp {
 
         let WriteOp {
             file_key,
-            offset: _,
+            offset,
             ref mut buf,
+            buf_offset,
             write_len,
         } = self;
 
-        // unless specified otherwise, the io uring worker will retry automatically on EAGAIN
-        assert_eq!(written, *write_len, "short write");
-
         let buf = mem::replace(buf, FixedIoBuffer::empty());
+
+        if written < *write_len {
+            if written == 0 {
+                // likely a full disk
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+
+            // on 5.4 kernel the io uring worker won't retry automatically on EAGAIN
+            ring.push(FileCreatorOp::Write(WriteOp {
+                file_key: *file_key,
+                offset: *offset + written,
+                buf,
+                buf_offset: *buf_offset + written,
+                write_len: *write_len - written,
+            }));
+            return Ok(());
+        }
+
         if ring
             .context_mut()
             .mark_write_completed(*file_key, *write_len, buf)
