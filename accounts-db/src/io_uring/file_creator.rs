@@ -466,7 +466,12 @@ impl<'a> WriteOp {
     where
         Self: Sized,
     {
-        let written = res? as usize;
+        let written = match res {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()), // likely a full disk
+            Ok(res) => res as usize,
+            Err(err) if err.kind() == io::ErrorKind::ResourceBusy => 0, // treat as a kind of short write
+            Err(err) => return Err(err),
+        };
 
         let WriteOp {
             file_key,
@@ -477,19 +482,16 @@ impl<'a> WriteOp {
         } = self;
 
         let buf = mem::replace(buf, FixedIoBuffer::empty());
+        let total_written = *buf_offset + written;
 
         if written < *write_len {
-            if written == 0 {
-                // likely a full disk
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-
-            // on 5.4 kernel the io uring worker won't retry automatically on EAGAIN
+            // On 5.15 kernel the io_uring worker might generate a short write, re-submit
+            // with offsets updated
             ring.push(FileCreatorOp::Write(WriteOp {
                 file_key: *file_key,
                 offset: *offset + written,
                 buf,
-                buf_offset: *buf_offset + written,
+                buf_offset: total_written,
                 write_len: *write_len - written,
             }));
             return Ok(());
@@ -497,7 +499,7 @@ impl<'a> WriteOp {
 
         if ring
             .context_mut()
-            .mark_write_completed(*file_key, *write_len, buf)
+            .mark_write_completed(*file_key, total_written, buf)
         {
             ring.push(FileCreatorOp::Close(CloseOp::new(*file_key)));
         }
