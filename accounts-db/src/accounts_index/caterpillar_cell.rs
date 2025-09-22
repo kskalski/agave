@@ -23,6 +23,7 @@ use {
 ///
 /// # Example
 /// ```
+/// use modular_bitfield::prelude::*;
 /// #[bitfield(bits = 61)]
 /// #[derive(BitfieldSpecifier)]
 /// struct MyPayload {
@@ -75,19 +76,6 @@ pub trait ExpandedPayload<C: CompactPayload> {
 ///
 /// Transitioning back from expanded to compact representation currently requires `&mut` access
 /// to the cell.
-///
-/// # Example
-/// ```
-/// let cell = CaterpillarCell::from_compact(small_payload);
-///
-/// // Multiple threads can safely expand concurrently
-/// match cell.turn_to_expanded() {
-///     CaterpillarCellView::Expanded(expanded) => {
-///         // Now can use the & to expanded data (requires inner lock for concurrent updates)
-///     }
-///     _ => unreachable!(),
-/// }
-/// ```
 #[derive(Debug, Default)]
 pub struct CaterpillarCell<C: CompactPayload, E> {
     /// Raw value - either an embedded (small) payload or address of a boxed full value
