@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(unused_variables)]
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -328,15 +330,6 @@ mod tests {
         pub inner_payloads: RwLock<Vec<TestCompactPayload>>,
     }
 
-    impl From<TestCompactPayload> for TestExpandedPayload {
-        fn from(compact: TestCompactPayload) -> Self {
-            Self {
-                beeps: 1,
-                inner_payloads: RwLock::new(vec![compact]),
-            }
-        }
-    }
-
     #[bitfield(bits = 61)]
     #[repr(C)]
     #[derive(Clone, Debug, BitfieldSpecifier)]
@@ -346,10 +339,17 @@ mod tests {
         pub is_bar: bool,
     }
 
-    impl From<TestExpandedPayload> for TestCompactPayload {
-        fn from(expanded: TestExpandedPayload) -> Self {
-            let payloads = expanded.inner_payloads.into_inner().unwrap();
-            Self::new()
+    impl ExpandedPayload<TestCompactPayload> for TestExpandedPayload {
+        fn from_compact(compact: TestCompactPayload) -> Self {
+            Self {
+                beeps: 1,
+                inner_payloads: RwLock::new(vec![compact]),
+            }
+        }
+
+        fn into_compact(self) -> TestCompactPayload {
+            let payloads = self.inner_payloads.into_inner().unwrap();
+            TestCompactPayload::new()
                 .with_id(payloads[0].id())
                 .with_offset(payloads[0].offset())
         }
