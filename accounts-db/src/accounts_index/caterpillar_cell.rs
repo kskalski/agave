@@ -35,16 +35,20 @@ pub trait CompactPayload {
 
     fn from_raw(raw: u64) -> Self;
     fn into_raw(self) -> u64;
-}
 
-impl<T: Specifier<Bytes = u64, InOut = T>> CompactPayload for T {
-    fn from_raw(raw: u64) -> Self {
-        debug_assert_eq!(Self::BITS, Self::COMPACT_BITS);
-        T::from_bytes(raw).expect("only 61 least significant bits can be set")
+    fn from_bitfield_raw<T>(bitfield: u64) -> T
+    where
+        T: Specifier<Bytes = u64, InOut = T>,
+    {
+        debug_assert_eq!(T::BITS, Self::COMPACT_BITS);
+        T::from_bytes(bitfield).expect("only 61 least significant bits can be set")
     }
 
-    fn into_raw(self) -> u64 {
-        T::into_bytes(self).unwrap()
+    fn into_bitfield_raw<T>(value: T) -> u64
+    where
+        T: Specifier<Bytes = u64, InOut = T>,
+    {
+        T::into_bytes(value).unwrap()
     }
 }
 
@@ -348,12 +352,6 @@ mod tests {
         },
     };
 
-    #[derive(Debug)]
-    pub struct TestExpandedPayload {
-        pub beeps: u32,
-        pub inner_payloads: RwLock<Vec<TestCompactPayload>>,
-    }
-
     #[bitfield(bits = 61)]
     #[repr(C)]
     #[derive(Clone, Debug, BitfieldSpecifier)]
@@ -361,6 +359,22 @@ mod tests {
         pub id: B29,
         pub offset: B31,
         pub is_bar: bool,
+    }
+
+    impl CompactPayload for TestCompactPayload {
+        fn from_raw(raw: u64) -> Self {
+            TestCompactPayload::from_bitfield_raw(raw)
+        }
+
+        fn into_raw(self) -> u64 {
+            TestCompactPayload::into_bitfield_raw(self)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct TestExpandedPayload {
+        pub beeps: u32,
+        pub inner_payloads: RwLock<Vec<TestCompactPayload>>,
     }
 
     impl ExpandedPayload<TestCompactPayload> for TestExpandedPayload {
