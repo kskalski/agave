@@ -29,6 +29,11 @@ use static_assertions::const_assert_eq;
 /// ```
 pub trait CompactPayload: Specifier<Bytes = u64, InOut = Self> {}
 
+pub trait ExpandedPayload<C: CompactPayload> {
+    fn from_compact(compact: C) -> Self;
+    fn into_compact(self) -> C;
+}
+
 /// A thread-safe container that can dynamically switch between compact and expanded representations.
 ///
 /// `CaterpillarCell` starts with a compact payload `C` embedded directly in a 64-bit atomic value.
@@ -60,6 +65,7 @@ pub trait CompactPayload: Specifier<Bytes = u64, InOut = Self> {}
 ///     _ => unreachable!(),
 /// }
 /// ```
+#[derive(Debug, Default)]
 pub struct CaterpillarCell<C: CompactPayload, E> {
     /// Raw value - either an embedded (small) payload or address of a boxed full value
     raw_atomic: AtomicU64,
@@ -68,8 +74,8 @@ pub struct CaterpillarCell<C: CompactPayload, E> {
 
 impl<C, E> CaterpillarCell<C, E>
 where
-    E: From<C>,
-    C: From<E> + CompactPayload,
+    C: CompactPayload,
+    E: ExpandedPayload<C>,
 {
     /// Creates a new `CaterpillarCell` containing a compact payload.
     pub fn from_compact(compact: C) -> Self {
@@ -120,7 +126,7 @@ where
             let current_holder = TransmutationCell::from_raw(current_raw);
             match current_holder.into_view() {
                 CaterpillarCellView::Compact(compact) => {
-                    let new_holder = TransmutationCell::from_expanded(E::from(compact));
+                    let new_holder = TransmutationCell::from_expanded(E::from_compact(compact));
                     match self.raw_atomic.compare_exchange(
                         current_raw,
                         new_holder.raw(),
@@ -160,7 +166,7 @@ where
         let expanded = current_transmute
             .deallocate_box_if_expanded()
             .expect("entry should be of expanded kind");
-        let new_transmute = TransmutationCell::from_compact(C::from(expanded));
+        let new_transmute = TransmutationCell::from_compact(expanded.into_compact());
         // We have exclusive (&mut) access to the entry, so no other code is reading or updating
         // the raw atomic. This means we can just store new value without conflict.
         self.raw_atomic
@@ -291,7 +297,7 @@ impl<C: Specifier<Bytes = u64, InOut = C>, E> TransmutationCell<C, E> {
     /// `E` must be a 8-byte aligned struct
     fn make_ptr_shifted_address(ptr: NonNull<E>) -> u64 {
         let address = ptr.addr().get() as u64;
-        assert_eq!(address & (1 << Self::ALIGNED_PTR_SHIFT - 1), 0);
+        assert_eq!(address & ((1 << Self::ALIGNED_PTR_SHIFT) - 1), 0);
         address >> Self::ALIGNED_PTR_SHIFT
     }
 
