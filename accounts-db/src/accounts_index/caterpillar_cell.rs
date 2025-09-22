@@ -215,7 +215,7 @@ pub enum CaterpillarCellView<'a, C, E> {
 /// shifted heap pointer.
 #[bitfield(bits = 3)]
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, BitfieldSpecifier)]
+#[derive(Debug, Default, Copy, Clone, BitfieldSpecifier)]
 pub struct CommonPayloadInfo {
     /// Whether the payload is compact in the entry itself (otherwise entry stores address to heap memory)
     pub is_compact: bool,
@@ -226,7 +226,7 @@ pub struct CommonPayloadInfo {
 /// The complete 64-bit representation combining metadata and payload data.
 #[bitfield(bits = 64)]
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct CommonInfoAndPayload {
     /// 3-bit metadata indicating payload type and flags
     pub common_info: CommonPayloadInfo,
