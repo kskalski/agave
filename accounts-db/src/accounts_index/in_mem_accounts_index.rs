@@ -3,7 +3,7 @@ use {
         accounts_index::{
             account_map_entry::{
                 AccountMapEntry, AccountMapEntryMeta, AccountMapEntryView,
-                PreAllocatedAccountMapEntry,
+                IrregularAccountMapEntry, PreAllocatedAccountMapEntry,
             },
             caterpillar_cell::CompactPayload,
             DiskIndexValue, IndexValue, ReclaimsSlotList, RefCount, SlotList, UpsertReclaim,
@@ -938,31 +938,31 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
 
     fn should_evict_based_on_age(
         current_age: Age,
-        entry: &AccountMapEntryView<T>,
+        entry_age: Age,
         startup: bool,
         ages_flushing_now: Age,
     ) -> bool {
-        startup || current_age.wrapping_sub(entry.age()) <= ages_flushing_now
+        startup || current_age.wrapping_sub(entry_age) <= ages_flushing_now
     }
 
     /// return true if 'entry' should be evicted from the in-mem index
     fn should_evict_from_mem<'a>(
         &self,
         current_age: Age,
-        entry: &'a AccountMapEntryView<T>,
+        entry: &'a IrregularAccountMapEntry<T>,
         startup: bool,
         update_stats: bool,
         ages_flushing_now: Age,
     ) -> (bool, Option<std::sync::RwLockReadGuard<'a, SlotList<T>>>) {
         // this could be tunable dynamically based on memory pressure
         // we could look at more ages or we could throw out more items we are choosing to keep in the cache
-        if Self::should_evict_based_on_age(current_age, entry, startup, ages_flushing_now) {
+        if Self::should_evict_based_on_age(current_age, entry.age(), startup, ages_flushing_now) {
             if entry.ref_count() != 1 {
                 Self::update_stat(&self.stats().held_in_mem.ref_count, 1);
                 (false, None)
             } else {
                 // only read the slot list if we are planning to throw the item out
-                let slot_list = entry.slot_list();
+                let slot_list = entry.slot_list.read().unwrap();
                 if slot_list.len() != 1 {
                     if update_stats {
                         Self::update_stat(&self.stats().held_in_mem.slot_list_len, 1);
@@ -1205,13 +1205,16 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                     (true, &mut evictions_random),
                 ] {
                     for (k, v) in check_for_eviction_and_dirty.drain(..) {
-                        let entry_view = v.entry_view();
+                        let AccountMapEntryView::Irregular(irregular) = v.entry_view() else {
+                            // only dirty entries are saved to disk, but marking dirty turns entry into irregular
+                            continue;
+                        };
                         let mut slot_list = None;
                         if !is_random {
                             let mut mse = Measure::start("flush_should_evict");
                             let (evict_for_age, slot_list_temp) = self.should_evict_from_mem(
                                 current_age,
-                                &entry_view,
+                                irregular,
                                 startup,
                                 true,
                                 ages_flushing_now,
@@ -1225,17 +1228,17 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                                 // not evicting, so don't write, even if dirty
                                 continue;
                             }
-                        } else if v.ref_count() != 1 {
+                        } else if irregular.ref_count() != 1 {
                             continue;
                         }
-                        if is_random && v.dirty() {
+                        if is_random && irregular.dirty() {
                             // Don't randomly evict dirty entries. Evicting dirty entries results in us writing entries with many slot list elements for example, unnecessarily.
                             // So, only randomly evict entries that lru would say don't throw away and were just read (or were dirty and written, but could not be evicted).
                             continue;
                         }
 
                         // if we are evicting it, then we need to update disk if we're dirty
-                        if v.clear_dirty() {
+                        if irregular.clear_dirty() {
                             // step 1: clear the dirty flag
                             // step 2: perform the update on disk based on the fields in the entry
                             // If a parallel operation dirties the item again - even while this flush is occurring,
@@ -1247,14 +1250,15 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                             // may have to loop if disk has to grow and we have to retry the write
                             loop {
                                 let disk_resize = {
-                                    let slot_list =
-                                        slot_list.take().unwrap_or_else(|| entry_view.slot_list());
+                                    let slot_list = slot_list
+                                        .take()
+                                        .unwrap_or_else(|| irregular.slot_list.read().unwrap());
                                     // Check the ref count and slot list one more time before flushing.
                                     // It is possible the foreground has updated this entry since
                                     // we last checked above in `should_evict_from_mem()`.
                                     // If the entry *was* updated, re-mark it as dirty then
                                     // skip to the next pubkey/entry.
-                                    let ref_count = entry_view.ref_count();
+                                    let ref_count = irregular.ref_count();
                                     if ref_count != 1 || slot_list.len() != 1 {
                                         v.set_dirty(true);
                                         break;
@@ -1361,7 +1365,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                         || (!randomly_evicted
                             && !Self::should_evict_based_on_age(
                                 current_age,
-                                &entry_view,
+                                entry_view.age(),
                                 startup,
                                 ages_flushing_now,
                             ))
@@ -1764,17 +1768,17 @@ mod tests {
                 ref_count,
                 AccountMapEntryMeta::default(),
             ));
+            let AccountMapEntryView::Irregular(irregular) =
+                one_element_slot_list_entry.entry_view()
+            else {
+                assert_eq!(ref_count, 1);
+                continue;
+            };
 
             // exceeded budget
             assert_eq!(
                 bucket
-                    .should_evict_from_mem(
-                        current_age,
-                        &one_element_slot_list_entry.entry_view(),
-                        startup,
-                        false,
-                        1,
-                    )
+                    .should_evict_from_mem(current_age, irregular, startup, false, 1,)
                     .0,
                 ref_count == 1
             );
@@ -1824,7 +1828,7 @@ mod tests {
                     assert!(
                         InMemAccountsIndex::<u64, u64>::should_evict_based_on_age(
                             current_age,
-                            &v.entry_view(),
+                            v.entry_view().age(),
                             startup,
                             ages_flushing_now,
                         ),
@@ -1857,12 +1861,12 @@ mod tests {
             !bucket
                 .should_evict_from_mem(
                     current_age,
-                    &AccountMapEntry::new(
+                    AccountMapEntry::new(
                         SlotList::new(),
                         ref_count,
                         AccountMapEntryMeta::default()
                     )
-                    .entry_view(),
+                    .make_irregular(),
                     startup,
                     false,
                     0,
@@ -1874,7 +1878,7 @@ mod tests {
             bucket
                 .should_evict_from_mem(
                     current_age,
-                    &one_element_slot_list_entry.entry_view(),
+                    &one_element_slot_list_entry.make_irregular(),
                     startup,
                     false,
                     0,
@@ -1886,12 +1890,12 @@ mod tests {
             !bucket
                 .should_evict_from_mem(
                     current_age,
-                    &AccountMapEntry::new(
+                    AccountMapEntry::new(
                         SlotList::from_iter([(0, 0u64), (1, 1)]),
                         ref_count,
                         AccountMapEntryMeta::default()
                     )
-                    .entry_view(),
+                    .make_irregular(),
                     startup,
                     false,
                     0,
@@ -1906,12 +1910,12 @@ mod tests {
                 !bucket
                     .should_evict_from_mem(
                         current_age,
-                        &AccountMapEntry::new(
+                        AccountMapEntry::new(
                             SlotList::from([(0, 0.0)]),
                             ref_count,
                             AccountMapEntryMeta::default()
                         )
-                        .entry_view(),
+                        .make_irregular(),
                         startup,
                         false,
                         0,
@@ -1925,7 +1929,7 @@ mod tests {
             bucket
                 .should_evict_from_mem(
                     current_age,
-                    &one_element_slot_list_entry.entry_view(),
+                    one_element_slot_list_entry.make_irregular(),
                     startup,
                     false,
                     0,
@@ -1939,7 +1943,7 @@ mod tests {
             !bucket
                 .should_evict_from_mem(
                     current_age,
-                    &one_element_slot_list_entry.entry_view(),
+                    one_element_slot_list_entry.make_irregular(),
                     startup,
                     false,
                     0,
@@ -1953,7 +1957,7 @@ mod tests {
             bucket
                 .should_evict_from_mem(
                     current_age,
-                    &one_element_slot_list_entry.entry_view(),
+                    one_element_slot_list_entry.make_irregular(),
                     startup,
                     false,
                     0,

@@ -8,9 +8,13 @@ use {
         is_zero_lamport::IsZeroLamport,
     },
     solana_clock::Slot,
-    std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    std::{
+        fmt::Debug,
+        ops::Deref,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        },
     },
 };
 
@@ -111,11 +115,7 @@ impl<T: IndexValue> AccountMapEntry<T> {
     /// set dirty to false, return true if was dirty
     pub fn clear_dirty(&self) -> bool {
         if let AccountMapEntryView::Irregular(irregular) = self.entry_view() {
-            irregular
-                .meta
-                .dirty
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
+            irregular.clear_dirty()
         } else {
             false
         }
@@ -126,10 +126,7 @@ impl<T: IndexValue> AccountMapEntry<T> {
     }
 
     pub fn set_age(&self, value: Age) {
-        self.make_irregular()
-            .meta
-            .age
-            .store(value, Ordering::Release)
+        self.make_irregular().set_age(value);
     }
 
     /// set age to 'next_age' if 'self.age' is 'expected_age'
@@ -157,8 +154,12 @@ pub struct IrregularAccountMapEntry<T> {
 }
 
 impl<T: CompactPayload> ExpandedPayload<T> for IrregularAccountMapEntry<T> {
-    fn from_compact(_compact: T) -> Self {
-        todo!()
+    fn from_compact(compact: T) -> Self {
+        Self {
+            ref_count: AtomicRefCount::new(1),
+            slot_list: RwLock::new(SlotList::from([(0, compact)])),
+            meta: AccountMapEntryMeta::default(),
+        }
     }
 
     fn into_compact(self) -> T {
@@ -167,8 +168,31 @@ impl<T: CompactPayload> ExpandedPayload<T> for IrregularAccountMapEntry<T> {
 }
 
 impl<T> IrregularAccountMapEntry<T> {
+    pub fn ref_count(&self) -> RefCount {
+        self.ref_count.load(Ordering::Acquire)
+    }
+
+    pub fn age(&self) -> Age {
+        self.meta.age.load(Ordering::Acquire)
+    }
+
+    pub fn set_age(&self, value: Age) {
+        self.meta.age.store(value, Ordering::Release)
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.meta.dirty.load(Ordering::Acquire)
+    }
+
     pub fn set_dirty(&self, value: bool) {
         self.meta.dirty.store(value, Ordering::Release)
+    }
+
+    pub fn clear_dirty(&self) -> bool {
+        self.meta
+            .dirty
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
@@ -177,27 +201,42 @@ pub enum AccountMapEntryView<'a, T> {
     Irregular(&'a IrregularAccountMapEntry<T>),
 }
 
+#[derive(Debug)]
+enum SlotListOrGuard<'a, T> {
+    SlotList(SlotList<T>),
+    Guard(RwLockReadGuard<'a, SlotList<T>>),
+}
+
+impl<T> Deref for SlotListOrGuard<'_, T> {
+    type Target = SlotList<T>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            SlotListOrGuard::SlotList(slot_list) => slot_list,
+            SlotListOrGuard::Guard(guard) => guard,
+        }
+    }
+}
+
 impl<T: IndexValue> AccountMapEntryView<'_, T> {
     pub fn ref_count(&self) -> RefCount {
         match self {
             Self::Regular(_) => 1,
-            Self::Irregular(irregular) => irregular.ref_count.load(Ordering::Acquire),
+            Self::Irregular(irregular) => irregular.ref_count(),
         }
     }
 
     pub fn dirty(&self) -> bool {
         match self {
             AccountMapEntryView::Regular(_) => false,
-            AccountMapEntryView::Irregular(irregular) => {
-                irregular.meta.dirty.load(Ordering::Acquire)
-            }
+            AccountMapEntryView::Irregular(irregular) => irregular.dirty(),
         }
     }
 
     pub fn age(&self) -> Age {
         match self {
             AccountMapEntryView::Regular(_) => 0,
-            AccountMapEntryView::Irregular(irregular) => irregular.meta.age.load(Ordering::Acquire),
+            AccountMapEntryView::Irregular(irregular) => irregular.age(),
         }
     }
 
@@ -210,10 +249,12 @@ impl<T: IndexValue> AccountMapEntryView<'_, T> {
         }
     }
 
-    pub fn slot_list(&self) -> RwLockReadGuard<SlotList<T>> {
+    pub fn slot_list(&self) -> impl Deref<Target = SlotList<T>> + use<'_, T> + Debug {
         match self {
-            AccountMapEntryView::Regular(_entry) => todo!(),
-            AccountMapEntryView::Irregular(irregular) => irregular.slot_list.read().unwrap(),
+            AccountMapEntryView::Regular(_entry) => SlotListOrGuard::SlotList(SlotList::new()),
+            AccountMapEntryView::Irregular(irregular) => {
+                SlotListOrGuard::Guard(irregular.slot_list.read().unwrap())
+            }
         }
     }
 
