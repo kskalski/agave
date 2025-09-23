@@ -76,7 +76,7 @@ pub trait ExpandedPayload<C: CompactPayload> {
 ///
 /// Transitioning back from expanded to compact representation currently requires `&mut` access
 /// to the cell.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CaterpillarCell<C: CompactPayload, E> {
     /// Raw value - either an embedded (small) payload or address of a boxed full value
     raw_atomic: AtomicU64,
