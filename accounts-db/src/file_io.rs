@@ -380,7 +380,7 @@ mod tests {
     fn test_create_writes_contents_tmpfs() -> io::Result<()> {
         let temp_dir = tempfile::tempdir_in("/mnt/tmpfs")?;
         let file_path = temp_dir.path().join("test.txt");
-        let contents = "Hello, world!";
+        let contents = "Hello world".repeat(1 << 19);
 
         // Shared state to capture callback invocations
         let mut callback_invoked_path = None;
@@ -395,7 +395,7 @@ mod tests {
             file_path.clone(),
             0o644,
             dir,
-            &mut Cursor::new(contents),
+            &mut Cursor::new(contents.clone()),
         )?;
         creator.drain()?;
         drop(creator);
