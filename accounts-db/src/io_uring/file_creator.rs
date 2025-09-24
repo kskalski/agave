@@ -484,6 +484,7 @@ impl<'a> WriteOp {
         let total_written = *buf_offset + written;
 
         if written < *write_len {
+            log::warn!("short write ({written}/{}), file={}", *write_len, *file_key);
             ring.push(FileCreatorOp::Write(WriteOp {
                 file_key: *file_key,
                 offset: *offset + written,
