@@ -469,7 +469,6 @@ impl<'a> WriteOp {
         let written = match res {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()), // likely a full disk
             Ok(res) => res as usize,
-            Err(err) if err.kind() == io::ErrorKind::ResourceBusy => 0, // treat as a kind of short write
             Err(err) => return Err(err),
         };
 
@@ -485,8 +484,6 @@ impl<'a> WriteOp {
         let total_written = *buf_offset + written;
 
         if written < *write_len {
-            // On 5.15 kernel the io_uring worker might generate a short write, re-submit
-            // with offsets updated
             ring.push(FileCreatorOp::Write(WriteOp {
                 file_key: *file_key,
                 offset: *offset + written,
