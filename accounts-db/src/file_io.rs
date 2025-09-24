@@ -404,4 +404,105 @@ mod tests {
         assert_eq!(callback_counter, 5);
         Ok(())
     }
+
+    use libc::{mount, umount2};
+    // use nix::sched::unshare;
+    // use nix::sched::CloneFlags;
+    // use nix::unistd::{fork, ForkResult, Pid};
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
+    use std::ptr;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Writes uid_map/gid_map for a child process
+    fn setup_uid_gid_maps(child_pid: i32) -> std::io::Result<()> {
+        // disable setgroups before writing gid_map (kernel requirement)
+        let setgroups_path = format!("/proc/{}/setgroups", child_pid);
+        if std::fs::metadata(&setgroups_path).is_ok() {
+            std::fs::write(&setgroups_path, "deny")?;
+        }
+
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        let uid_map = format!("0 {} 1\n", uid);
+        let gid_map = format!("0 {} 1\n", gid);
+
+        std::fs::write(format!("/proc/{}/uid_map", child_pid), uid_map)?;
+        std::fs::write(format!("/proc/{}/gid_map", child_pid), gid_map)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tmpfs_in_userns() {
+        match unsafe { libc::fork() } {
+            0 => {
+                // Create new user+mount namespace
+                assert_eq!(0, unsafe { libc::unshare(libc::CLONE_NEWUSER) });
+                // Give parent time to write uid_map/gid_map
+                thread::sleep(Duration::from_millis(200));
+
+                // Now we should have CAP_SYS_ADMIN inside this namespace
+                let temp_dir = TempDir::new().unwrap();
+                let mount_point = temp_dir.path().join("mnt");
+                fs::create_dir(&mount_point).unwrap();
+
+                let target_c = CString::new(mount_point.to_str().unwrap()).unwrap();
+                let fstype = CString::new("tmpfs").unwrap();
+                let data = CString::new("size=1M").unwrap();
+
+                unsafe {
+                    let res = mount(
+                        ptr::null(),                          // source
+                        target_c.as_ptr(),                    // target
+                        fstype.as_ptr(),                      // filesystem type
+                        libc::MS_NOEXEC | libc::MS_PRIVATE,   // flags
+                        data.as_ptr() as *const libc::c_void, // data (options)
+                    );
+                    if res != 0 {
+                        println!("mount failed: {}", std::io::Error::last_os_error());
+                        std::process::exit(1);
+                    }
+                }
+                // Write a file bigger than 1M
+                let file_path = mount_point.join("bigfile");
+                let mut f = File::create(&file_path).unwrap();
+                let buf = vec![0u8; 2 * 1024 * 1024]; // 2 MB
+                match f.write_all(&buf) {
+                    Ok(_) => panic!("unexpectedly wrote >1MB in tmpfs"),
+                    Err(e) => {
+                        assert_eq!(e.kind(), ErrorKind::Other);
+                        assert!(e.to_string().contains("No space"));
+                    }
+                }
+                unsafe {
+                    umount2(target_c.as_ptr(), 0);
+                }
+                std::process::exit(2);
+                //panic!("check");
+            }
+            -1 => {
+                panic!("fork failed");
+            }
+
+            child => {
+                assert!(child > 0);
+                // Give child time to unshare
+                thread::sleep(Duration::from_millis(100));
+
+                // Write UID/GID maps from parent
+                setup_uid_gid_maps(child).expect("failed to write uid/gid maps");
+
+                // Wait for child
+                let mut status = 0;
+                let _ = unsafe { libc::waitpid(child, &mut status, 0) };
+                assert_eq!(status, 0);
+                panic!("parent check");
+            }
+        }
+    }
 }
