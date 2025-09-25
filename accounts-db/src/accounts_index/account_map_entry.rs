@@ -1,124 +1,87 @@
 use {
     super::{AtomicRefCount, DiskIndexValue, IndexValue, RefCount, SlotList},
     crate::{
-        accounts_index::caterpillar_cell::{
-            CaterpillarCell, CaterpillarCellView, CompactPayload, ExpandedPayload,
-        },
         bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
         is_zero_lamport::IsZeroLamport,
     },
     solana_clock::Slot,
     std::{
         fmt::Debug,
-        ops::Deref,
+        ops::{Deref, DerefMut},
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+            Arc, RwLock, RwLockReadGuard,
         },
     },
 };
 
+#[derive(Debug)]
+pub enum AccountMapEntryKind<T> {
+    Regular((Slot, T)),
+    Irregular(Box<IrregularAccountMapEntry<T>>),
+}
+
 /// one entry in the in-mem accounts index
 /// Represents the value for an account key in the in-memory accounts index
-#[derive(Debug)]
-pub struct AccountMapEntry<T: CompactPayload>(CaterpillarCell<T, IrregularAccountMapEntry<T>>);
+pub struct AccountMapEntry<T>(RwLock<AccountMapEntryKind<T>>);
 
 impl<T: IndexValue> AccountMapEntry<T> {
     pub fn new(slot_list: SlotList<T>, ref_count: RefCount, meta: AccountMapEntryMeta) -> Self {
-        let cell = if slot_list.len() == 1 && ref_count == 1 && !meta.dirty.load(Ordering::Relaxed)
+        let kind = if slot_list.len() == 1 && ref_count == 1 && !meta.dirty.load(Ordering::Relaxed)
         {
-            CaterpillarCell::from_compact(slot_list[0].1)
+            AccountMapEntryKind::Regular(slot_list[0])
         } else {
-            CaterpillarCell::from_expanded(IrregularAccountMapEntry {
-                slot_list: RwLock::new(slot_list),
+            AccountMapEntryKind::Irregular(Box::new(IrregularAccountMapEntry {
+                slot_list,
                 ref_count: AtomicRefCount::new(ref_count),
                 meta,
-            })
+            }))
         };
-        Self(cell)
+        Self(RwLock::new(kind))
     }
 
     #[cfg(test)]
     pub(super) fn empty_for_tests() -> Self {
-        Self(CaterpillarCell::from_expanded(
+        Self(RwLock::new(AccountMapEntryKind::Irregular(Box::new(
             IrregularAccountMapEntry::default(),
-        ))
+        ))))
     }
 
-    pub fn entry_view(&self) -> AccountMapEntryView<T> {
-        match self.0.as_view() {
-            CaterpillarCellView::Compact(c) => AccountMapEntryView::Regular(c),
-            CaterpillarCellView::Expanded(e) => AccountMapEntryView::Irregular(e),
+    pub fn entry_view(&self) -> RwLockReadGuard<AccountMapEntryKind<T>> {
+        self.0.read().unwrap()
+    }
+
+    pub fn make_irregular(
+        &self,
+    ) -> impl DerefMut<Target = IrregularAccountMapEntry<T>> + use<'_, T> {
+        let mut kind = self.0.write().unwrap();
+        if let AccountMapEntryKind::Regular(entry) = &mut *kind {
+            *kind = AccountMapEntryKind::Irregular(Box::new(IrregularAccountMapEntry {
+                slot_list: SlotList::from([*entry]),
+                ref_count: AtomicRefCount::new(1),
+                meta: AccountMapEntryMeta::default(),
+            }));
         }
-    }
 
-    pub fn slot_list_mut(&self) -> RwLockWriteGuard<SlotList<T>> {
-        self.make_irregular().slot_list.write().unwrap()
-    }
-
-    pub fn make_irregular(&self) -> &IrregularAccountMapEntry<T> {
-        match self.0.as_view() {
-            CaterpillarCellView::Compact(_) => {
-                let CaterpillarCellView::Expanded(e) = self.0.turn_to_expanded() else {
-                    unreachable!("turn_to_expanded should always return expanded")
-                };
-                e
-            }
-            CaterpillarCellView::Expanded(e) => e,
-        }
+        WriteGuardMap(
+            kind,
+            |kind| match kind {
+                AccountMapEntryKind::Irregular(irregular) => irregular.as_ref(),
+                _ => unreachable!(),
+            },
+            |kind| match kind {
+                AccountMapEntryKind::Irregular(irregular) => irregular.as_mut(),
+                _ => unreachable!(),
+            },
+        )
     }
 
     pub fn ref_count(&self) -> RefCount {
         self.entry_view().ref_count()
     }
 
-    pub fn addref(&self) {
-        let irregular = self.make_irregular();
-        let previous = irregular.ref_count.fetch_add(1, Ordering::Release);
-        // ensure ref count does not overflow
-        assert_ne!(previous, RefCount::MAX);
-        irregular.set_dirty(true);
-    }
-
-    /// decrement the ref count by one
-    /// return the refcount prior to subtracting 1
-    /// 0 indicates an under refcounting error in the system.
-    pub fn unref(&self) -> RefCount {
-        self.unref_by_count(1)
-    }
-
-    /// decrement the ref count by the passed in amount
-    /// return the refcount prior to the ref count change
-    pub fn unref_by_count(&self, count: RefCount) -> RefCount {
-        let irregular = self.make_irregular();
-        let previous = irregular.ref_count.fetch_sub(count, Ordering::Release);
-        irregular.set_dirty(true);
-        assert!(
-            previous >= count,
-            "decremented ref count below zero: {self:?}"
-        );
-        previous
-    }
-
     pub fn dirty(&self) -> bool {
         self.entry_view().dirty()
-    }
-
-    pub fn set_dirty(&self, value: bool) {
-        if value {
-            self.make_irregular().set_dirty(true);
-        } else if let AccountMapEntryView::Irregular(irregular) = self.entry_view() {
-            irregular.set_dirty(false);
-        }
-    }
-
-    /// set dirty to false, return true if was dirty
-    pub fn clear_dirty(&self) -> bool {
-        if let AccountMapEntryView::Irregular(irregular) = self.entry_view() {
-            irregular.clear_dirty()
-        } else {
-            false
-        }
     }
 
     pub fn age(&self) -> Age {
@@ -140,6 +103,12 @@ impl<T: IndexValue> AccountMapEntry<T> {
     }
 }
 
+impl<T: Debug> Debug for AccountMapEntry<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AccountMapEntry").field(&self.0).finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct IrregularAccountMapEntry<T> {
     /// number of alive slots that contain >= 1 instances of account data for this pubkey
@@ -148,26 +117,20 @@ pub struct IrregularAccountMapEntry<T> {
     /// list of slots in which this pubkey was updated
     /// Note that 'clean' removes outdated entries (ie. older roots) from this slot_list
     /// purge_slot() also removes non-rooted slots from this list
-    pub slot_list: RwLock<SlotList<T>>,
+    pub slot_list: SlotList<T>,
     /// synchronization metadata for in-memory state since last flush to disk accounts index
     pub meta: AccountMapEntryMeta,
 }
 
-impl<T: CompactPayload> ExpandedPayload<T> for IrregularAccountMapEntry<T> {
-    fn from_compact(compact: T) -> Self {
+impl<T: Debug> IrregularAccountMapEntry<T> {
+    pub fn from_count(ref_count: u32) -> Self {
         Self {
-            ref_count: AtomicRefCount::new(1),
-            slot_list: RwLock::new(SlotList::from([(0, compact)])),
+            ref_count: AtomicRefCount::new(ref_count),
+            slot_list: SlotList::default(),
             meta: AccountMapEntryMeta::default(),
         }
     }
 
-    fn into_compact(self) -> T {
-        todo!()
-    }
-}
-
-impl<T> IrregularAccountMapEntry<T> {
     pub fn ref_count(&self) -> RefCount {
         self.ref_count.load(Ordering::Acquire)
     }
@@ -194,31 +157,65 @@ impl<T> IrregularAccountMapEntry<T> {
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
     }
-}
 
-pub enum AccountMapEntryView<'a, T> {
-    Regular(T),
-    Irregular(&'a IrregularAccountMapEntry<T>),
-}
+    pub fn addref(&self) {
+        let previous = self.ref_count.fetch_add(1, Ordering::Release);
+        // ensure ref count does not overflow
+        assert_ne!(previous, RefCount::MAX);
+        self.set_dirty(true);
+    }
 
-#[derive(Debug)]
-enum SlotListOrGuard<'a, T> {
-    SlotList(SlotList<T>),
-    Guard(RwLockReadGuard<'a, SlotList<T>>),
-}
+    /// decrement the ref count by one
+    /// return the refcount prior to subtracting 1
+    /// 0 indicates an under refcounting error in the system.
+    pub fn unref(&self) -> RefCount {
+        self.unref_by_count(1)
+    }
 
-impl<T> Deref for SlotListOrGuard<'_, T> {
-    type Target = SlotList<T>;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            SlotListOrGuard::SlotList(slot_list) => slot_list,
-            SlotListOrGuard::Guard(guard) => guard,
-        }
+    /// decrement the ref count by the passed in amount
+    /// return the refcount prior to the ref count change
+    pub fn unref_by_count(&self, count: RefCount) -> RefCount {
+        let previous = self.ref_count.fetch_sub(count, Ordering::Release);
+        self.set_dirty(true);
+        assert!(
+            previous >= count,
+            "decremented ref count below zero: {self:?}"
+        );
+        previous
     }
 }
 
-impl<T: IndexValue> AccountMapEntryView<'_, T> {
+struct WriteGuardMap<G, S, T, FR, F>(G, FR, F)
+where
+    G: DerefMut<Target = S>,
+    for<'b> FR: Fn(&'b S) -> &'b T,
+    for<'b> F: Fn(&'b mut S) -> &'b mut T;
+
+impl<G, S, T, FR, F> Deref for WriteGuardMap<G, S, T, FR, F>
+where
+    G: DerefMut<Target = S>,
+    for<'b> FR: Fn(&'b S) -> &'b T,
+    for<'b> F: Fn(&'b mut S) -> &'b mut T,
+{
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.1(&*self.0)
+    }
+}
+
+impl<G, S, T, FR, F> DerefMut for WriteGuardMap<G, S, T, FR, F>
+where
+    G: DerefMut<Target = S>,
+    for<'b> FR: Fn(&'b S) -> &'b T,
+    for<'b> F: Fn(&'b mut S) -> &'b mut T,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.2(&mut *self.0)
+    }
+}
+
+impl<T: IndexValue> AccountMapEntryKind<T> {
     pub fn ref_count(&self) -> RefCount {
         match self {
             Self::Regular(_) => 1,
@@ -228,40 +225,36 @@ impl<T: IndexValue> AccountMapEntryView<'_, T> {
 
     pub fn dirty(&self) -> bool {
         match self {
-            AccountMapEntryView::Regular(_) => false,
-            AccountMapEntryView::Irregular(irregular) => irregular.dirty(),
+            AccountMapEntryKind::Regular(_) => false,
+            AccountMapEntryKind::Irregular(irregular) => irregular.dirty(),
         }
     }
 
     pub fn age(&self) -> Age {
         match self {
-            AccountMapEntryView::Regular(_) => 0,
-            AccountMapEntryView::Irregular(irregular) => irregular.age(),
+            AccountMapEntryKind::Regular(_) => 0,
+            AccountMapEntryKind::Irregular(irregular) => irregular.age(),
         }
     }
 
     pub fn is_zero_lamport(&self) -> bool {
         match self {
-            AccountMapEntryView::Regular(entry) => entry.is_zero_lamport(),
-            AccountMapEntryView::Irregular(irregular) => {
-                irregular.slot_list.read().unwrap()[0].1.is_zero_lamport()
-            }
+            AccountMapEntryKind::Regular((_, entry)) => entry.is_zero_lamport(),
+            AccountMapEntryKind::Irregular(irregular) => irregular.slot_list[0].1.is_zero_lamport(),
         }
     }
 
-    pub fn slot_list(&self) -> impl Deref<Target = SlotList<T>> + use<'_, T> + Debug {
+    pub fn slot_list(&self) -> &[(Slot, T)] {
         match self {
-            AccountMapEntryView::Regular(_entry) => SlotListOrGuard::SlotList(SlotList::new()),
-            AccountMapEntryView::Irregular(irregular) => {
-                SlotListOrGuard::Guard(irregular.slot_list.read().unwrap())
-            }
+            AccountMapEntryKind::Regular(entry) => std::slice::from_ref(entry),
+            AccountMapEntryKind::Irregular(irregular) => irregular.slot_list.as_slice(),
         }
     }
 
     pub fn slot_list_len(&self) -> usize {
         match self {
             Self::Regular(_) => 1,
-            Self::Irregular(irregular) => irregular.slot_list.read().unwrap().len(),
+            Self::Irregular(irregular) => irregular.slot_list.len(),
         }
     }
 }

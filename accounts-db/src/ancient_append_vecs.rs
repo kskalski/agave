@@ -1660,7 +1660,7 @@ pub mod tests {
                             original_results.iter().for_each(|results| {
                                 results.stored_accounts.iter().for_each(|account| {
                                     db.accounts_index.get_and_then(account.pubkey(), |entry| {
-                                        (false, entry.unwrap().addref())
+                                        (false, entry.unwrap().make_irregular().addref())
                                     });
                                 })
                             });
@@ -1769,10 +1769,15 @@ pub mod tests {
                                 if two_refs {
                                     original_results.iter().for_each(|results| {
                                         results.stored_accounts.iter().for_each(|account| {
-                                            db.accounts_index
-                                                .get_and_then(account.pubkey(), |entry| {
-                                                    (false, entry.unwrap().addref())
-                                                });
+                                            db.accounts_index.get_and_then(
+                                                account.pubkey(),
+                                                |entry| {
+                                                    (
+                                                        false,
+                                                        entry.unwrap().make_irregular().addref(),
+                                                    )
+                                                },
+                                            );
                                         })
                                     });
                                 }
@@ -2170,8 +2175,9 @@ pub mod tests {
             );
             original_results.iter().for_each(|results| {
                 results.stored_accounts.iter().for_each(|account| {
-                    db.accounts_index
-                        .get_and_then(account.pubkey(), |entry| (true, entry.unwrap().addref()));
+                    db.accounts_index.get_and_then(account.pubkey(), |entry| {
+                        (true, entry.unwrap().make_irregular().addref())
+                    });
                 })
             });
 
