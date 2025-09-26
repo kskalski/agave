@@ -5,7 +5,6 @@ use {
                 AccountMapEntry, AccountMapEntryKind, AccountMapEntryMeta,
                 IrregularAccountMapEntry, PreAllocatedAccountMapEntry,
             },
-            caterpillar_cell::CompactPayload,
             DiskIndexValue, IndexValue, ReclaimsSlotList, RefCount, SlotList, UpsertReclaim,
         },
         bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
@@ -95,8 +94,7 @@ impl<T: IndexValue> PossibleEvictions<T> {
 }
 
 // one instance of this represents one bin of the accounts index.
-pub struct InMemAccountsIndex<T: IndexValue + CompactPayload, U: DiskIndexValue + From<T> + Into<T>>
-{
+pub struct InMemAccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     last_age_flushed: AtomicAge,
 
     // backing store
@@ -130,9 +128,7 @@ pub struct InMemAccountsIndex<T: IndexValue + CompactPayload, U: DiskIndexValue 
     pub(crate) startup_stats: Arc<StartupStats>,
 }
 
-impl<T: IndexValue + CompactPayload, U: DiskIndexValue + From<T> + Into<T>> Debug
-    for InMemAccountsIndex<T, U>
-{
+impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> Debug for InMemAccountsIndex<T, U> {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
     }
@@ -179,7 +175,7 @@ struct StartupInfo<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 
 #[derive(Default, Debug)]
 /// result from scanning in-mem index during flush
-struct FlushScanResult<T: CompactPayload> {
+struct FlushScanResult<T> {
     /// pubkeys whose age indicates they may be evicted now, pending further checks.
     evictions_age_possible: Vec<(Pubkey, Arc<AccountMapEntry<T>>)>,
     /// pubkeys chosen to evict based on random eviction

@@ -24,7 +24,6 @@ pub mod tests;
 
 #[cfg(test)]
 use crate::append_vec::StoredAccountMeta;
-use modular_bitfield::prelude::B29;
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
@@ -667,7 +666,6 @@ impl IsZeroLamport for Account {
 /// An offset into the AccountsDb::storage vector
 pub type AtomicAccountsFileId = AtomicU32;
 pub type AccountsFileId = u32;
-pub type AccountsFileIdRepr = B29;
 
 type AccountSlots = HashMap<Pubkey, IntSet<Slot>>;
 type SlotOffsets = IntMap<Slot, IntSet<Offset>>;

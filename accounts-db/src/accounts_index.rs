@@ -1,14 +1,11 @@
 mod account_map_entry;
-pub(crate) mod caterpillar_cell;
 pub(crate) mod in_mem_accounts_index;
 mod iter;
 mod roots_tracker;
 mod secondary;
 use {
     crate::{
-        accounts_index::{
-            account_map_entry::AccountMapEntryKind, caterpillar_cell::CompactPayload,
-        },
+        accounts_index::account_map_entry::AccountMapEntryKind,
         accounts_index_storage::{AccountsIndexStorage, Startup},
         ancestors::Ancestors,
         bucket_map_holder::Age,
@@ -206,7 +203,7 @@ pub trait IsCached {
     fn is_cached(&self) -> bool;
 }
 
-pub trait IndexValue: 'static + IsCached + IsZeroLamport + DiskIndexValue + CompactPayload {}
+pub trait IndexValue: 'static + IsCached + IsZeroLamport + DiskIndexValue {}
 
 pub trait DiskIndexValue:
     'static + Clone + Debug + PartialEq + Copy + Default + Sync + Send
@@ -1959,15 +1956,6 @@ pub mod tests {
     type AccountInfoTest = f64;
 
     impl IndexValue for AccountInfoTest {}
-    impl CompactPayload for AccountInfoTest {
-        fn from_raw(raw: u64) -> Self {
-            raw as f64
-        }
-
-        fn into_raw(self) -> u64 {
-            self as u64
-        }
-    }
     impl DiskIndexValue for AccountInfoTest {}
     impl IsCached for AccountInfoTest {
         fn is_cached(&self) -> bool {
@@ -3773,25 +3761,7 @@ pub mod tests {
     }
 
     impl IndexValue for bool {}
-    impl CompactPayload for bool {
-        fn from_raw(raw: u64) -> Self {
-            raw != 0
-        }
-
-        fn into_raw(self) -> u64 {
-            self as u64
-        }
-    }
     impl IndexValue for u64 {}
-    impl CompactPayload for u64 {
-        fn from_raw(raw: u64) -> Self {
-            raw
-        }
-
-        fn into_raw(self) -> u64 {
-            self
-        }
-    }
     impl DiskIndexValue for bool {}
     impl DiskIndexValue for u64 {}
     impl IsCached for bool {
@@ -3821,15 +3791,6 @@ pub mod tests {
     #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
     struct CacheableIndexValueTest(bool);
     impl IndexValue for CacheableIndexValueTest {}
-    impl CompactPayload for CacheableIndexValueTest {
-        fn from_raw(raw: u64) -> Self {
-            CacheableIndexValueTest(raw != 0)
-        }
-
-        fn into_raw(self) -> u64 {
-            self.0 as u64
-        }
-    }
     impl DiskIndexValue for CacheableIndexValueTest {}
     impl IsCached for CacheableIndexValueTest {
         fn is_cached(&self) -> bool {
