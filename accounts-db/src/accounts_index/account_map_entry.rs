@@ -10,11 +10,17 @@ use {
         mem::ManuallyDrop,
         ops::Deref,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             RwLock, RwLockReadGuard, RwLockWriteGuard,
         },
     },
 };
+
+pub static SINGLETONS: AtomicU64 = AtomicU64::new(0);
+pub static LISTS: AtomicU64 = AtomicU64::new(0);
+pub static LISTS_ALLOCS: AtomicU64 = AtomicU64::new(0);
+pub static LARGE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+pub static COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// one entry in the in-mem accounts index
 /// Represents the value for an account key in the in-memory accounts index
@@ -164,13 +170,25 @@ impl<T: Copy + Debug> Debug for AccountMapEntry<T> {
 
 impl<T: Copy> Drop for AccountMapEntry<T> {
     fn drop(&mut self) {
-        if !self.meta.is_single.load(Ordering::Acquire) {
+        let l = if !self.meta.is_single.load(Ordering::Acquire) {
             // Make drop panic-resistant
             if let Ok(mut slot_list) = self.slot_list.write() {
+                if unsafe { slot_list.dynamic.0.is_some() } {
+                    LISTS.fetch_sub(1, Ordering::Relaxed);
+                }
+                let l = unsafe { slot_list.dynamic.0.as_ref().map(|l| l.len()).unwrap_or(0) };
+
                 // Safety: we operate on &mut self, so is_single==false won't change since above check
-                unsafe { ManuallyDrop::drop(&mut slot_list.dynamic) }
+                unsafe { ManuallyDrop::drop(&mut slot_list.dynamic) };
+                l
+            } else {
+                0
             }
-        }
+        } else {
+            SINGLETONS.fetch_sub(1, Ordering::Relaxed);
+            1
+        };
+        COUNTS[l.min(10)].fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -205,9 +223,18 @@ union SlotListRepr<T: Copy> {
 impl<T: Copy> SlotListRepr<T> {
     fn from_list(slot_list: SlotList<T>) -> (bool, Self) {
         if slot_list.len() == 1 {
+            SINGLETONS.fetch_add(1, Ordering::Relaxed);
+
             let single = slot_list[0];
             (true, Self { single })
         } else {
+            if !slot_list.is_empty() {
+                LISTS.fetch_add(1, Ordering::Relaxed);
+                LISTS_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                if slot_list.len() > 4 {
+                    LARGE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let dynamic = ManuallyDrop::new(SlotListDynamic::new(slot_list.into_vec()));
             (false, Self { dynamic })
         }
@@ -271,16 +298,31 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
     /// Append element to the end of slot list
     pub fn push(&mut self, item: (Slot, T)) {
         if self.swap_is_single(false) {
+            COUNTS[1].fetch_sub(1, Ordering::Relaxed);
+            COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            SINGLETONS.fetch_sub(1, Ordering::Relaxed);
+            LISTS.fetch_add(1, Ordering::Relaxed);
+            LISTS_ALLOCS.fetch_add(1, Ordering::Relaxed);
             let existing_item = unsafe { self.repr_guard.single };
             self.repr_guard.dynamic =
                 ManuallyDrop::new(SlotListDynamic::new(vec![existing_item, item]))
         } else {
             match unsafe { self.repr_guard.dynamic.0.as_mut() } {
                 None => {
+                    SINGLETONS.fetch_add(1, Ordering::Relaxed);
+                    COUNTS[0].fetch_sub(1, Ordering::Relaxed);
+                    COUNTS[1].fetch_add(1, Ordering::Relaxed);
                     self.store_is_single(true);
                     self.repr_guard.single = item
                 }
-                Some(slot_list) => slot_list.push(item),
+                Some(slot_list) => {
+                    COUNTS[slot_list.len().min(10)].fetch_sub(1, Ordering::Relaxed);
+                    if slot_list.capacity() <= 4 {
+                        LARGE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    slot_list.push(item);
+                    COUNTS[slot_list.len().min(10)].fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -295,6 +337,10 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
         if self.is_single() {
             let single_mut = unsafe { &mut self.repr_guard.single };
             if !f(single_mut) {
+                SINGLETONS.fetch_sub(1, Ordering::Relaxed);
+                COUNTS[0].fetch_add(1, Ordering::Relaxed);
+                COUNTS[1].fetch_sub(1, Ordering::Relaxed);
+
                 self.store_is_single(false);
                 // representation wasn't dynamic before, so no need to handle dropping existing value
                 self.repr_guard.dynamic = ManuallyDrop::new(SlotListDynamic::empty());
@@ -303,7 +349,9 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
                 1
             }
         } else if let Some(slot_list) = unsafe { self.repr_guard.dynamic.0.as_mut() } {
+            COUNTS[slot_list.len().min(10)].fetch_sub(1, Ordering::Relaxed);
             slot_list.retain_mut(f);
+            COUNTS[slot_list.len().min(10)].fetch_add(1, Ordering::Relaxed);
             slot_list.len()
         } else {
             0
@@ -314,6 +362,8 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
         if !self.is_single() {
             if let Some(slot_list) = unsafe { self.repr_guard.dynamic.0.as_mut() } {
                 if slot_list.len() == 1 {
+                    SINGLETONS.fetch_add(1, Ordering::Relaxed);
+                    LISTS.fetch_sub(1, Ordering::Relaxed);
                     let item = slot_list.pop().unwrap();
                     unsafe { ManuallyDrop::drop(&mut self.repr_guard.dynamic) };
                     self.repr_guard.single = item;

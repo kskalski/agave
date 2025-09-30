@@ -1228,6 +1228,20 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             info!("secondary index: {:?}", AccountIndex::SplTokenOwner);
             self.spl_token_owner_index.log_contents();
         }
+        log::info!(
+            "KAMIL: s={} m={} - allocs {}, large allocs {}",
+            account_map_entry::SINGLETONS.load(Ordering::Relaxed),
+            account_map_entry::LISTS.load(Ordering::Relaxed),
+            account_map_entry::LISTS_ALLOCS.load(Ordering::Relaxed),
+            account_map_entry::LARGE_ALLOCS.load(Ordering::Relaxed),
+        );
+        log::info!(
+            "KAMILC: {:?}",
+            account_map_entry::COUNTS
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+        );
     }
 
     pub(crate) fn update_secondary_indexes(
