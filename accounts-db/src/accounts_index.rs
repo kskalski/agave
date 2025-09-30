@@ -1228,6 +1228,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             info!("secondary index: {:?}", AccountIndex::SplTokenOwner);
             self.spl_token_owner_index.log_contents();
         }
+        log::info!(
+            "KAMIL: {} {}",
+            account_map_entry::SINGLETONS.load(Ordering::Relaxed),
+            account_map_entry::LISTS.load(Ordering::Relaxed)
+        );
     }
 
     pub(crate) fn update_secondary_indexes(

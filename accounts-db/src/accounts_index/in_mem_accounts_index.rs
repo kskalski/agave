@@ -3,7 +3,7 @@ use {
         accounts_index::{
             account_map_entry::{
                 AccountMapEntry, AccountMapEntryMeta, PreAllocatedAccountMapEntry,
-                SlotListWriteGuard,
+                SlotListWriteGuard, LISTS, SINGLETONS,
             },
             DiskIndexValue, IndexValue, ReclaimsSlotList, RefCount, SlotList, UpsertReclaim,
         },
@@ -1202,6 +1202,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             assert_eq!(current_age, self.storage.current_age());
             self.set_has_aged(current_age, can_advance_age);
         }
+        log::info!(
+            "KAMIL: {} {}",
+            SINGLETONS.load(Ordering::Relaxed),
+            LISTS.load(Ordering::Relaxed)
+        );
     }
 
     // evict keys in 'evictions' from in-mem cache, likely due to age

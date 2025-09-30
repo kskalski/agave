@@ -10,11 +10,14 @@ use {
         mem::ManuallyDrop,
         ops::Deref,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         },
     },
 };
+
+pub static SINGLETONS: AtomicU64 = AtomicU64::new(0);
+pub static LISTS: AtomicU64 = AtomicU64::new(0);
 
 /// one entry in the in-mem accounts index
 /// Represents the value for an account key in the in-memory accounts index
@@ -163,11 +166,14 @@ impl<T: Copy> Debug for AccountMapEntry<T> {
 impl<T: Copy> Drop for AccountMapEntry<T> {
     fn drop(&mut self) {
         if !self.meta.is_single.load(Ordering::Acquire) {
+            LISTS.fetch_sub(1, Ordering::Relaxed);
             // Make drop panic-resistant
             if let Ok(mut slot_list) = self.slot_list.write() {
                 // Safety: we operate on &mut self, so is_single==false won't change since above check
                 unsafe { ManuallyDrop::drop(&mut slot_list.multiple) }
             }
+        } else {
+            SINGLETONS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -187,10 +193,12 @@ impl<T: Copy> SlotListRepr<T> {
     fn from_list(slot_list: SlotList<T>) -> (bool, Self) {
         let is_single = slot_list.len() == 1;
         let this = if is_single {
+            SINGLETONS.fetch_add(1, Ordering::Relaxed);
             Self {
                 single: slot_list[0],
             }
         } else {
+            LISTS.fetch_add(1, Ordering::Relaxed);
             Self {
                 multiple: ManuallyDrop::new(Box::new(slot_list.to_vec())),
             }
@@ -281,6 +289,8 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
     fn change_to_multiple(&mut self) -> &mut Vec<(Slot, T)> {
         if self.meta.is_single.swap(false, Ordering::AcqRel) {
             let single = unsafe { self.repr_guard.single };
+            SINGLETONS.fetch_sub(1, Ordering::Relaxed);
+            LISTS.fetch_add(1, Ordering::Relaxed);
             self.repr_guard.multiple = ManuallyDrop::new(Box::new(vec![single]));
         }
         unsafe { self.repr_guard.multiple.as_mut() }
@@ -295,6 +305,8 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
                 unsafe { ManuallyDrop::drop(list) };
                 self.repr_guard.single = item;
                 self.meta.is_single.store(true, Ordering::Release);
+                SINGLETONS.fetch_add(1, Ordering::Relaxed);
+                LISTS.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }

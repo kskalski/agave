@@ -3598,6 +3598,7 @@ impl AccountsDb {
             ("selected_count", num_selected, i64),
             ("deferred_to_next_round_count", pended_counts, i64)
         );
+        self.accounts_index.log_secondary_indexes();
 
         num_selected
     }
