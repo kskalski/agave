@@ -355,6 +355,7 @@ impl RingOp<SequentialFileReaderState> for ReadOp {
         .offset(*file_off as u64)
         .ioprio(IO_PRIO_BE_HIGHEST)
         .build()
+        .flags(squeue::Flags::ASYNC)
     }
 
     fn complete(
