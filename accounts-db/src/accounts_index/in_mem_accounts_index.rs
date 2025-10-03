@@ -32,15 +32,15 @@ pub struct StartupStats {
 }
 
 #[derive(Debug)]
-pub struct PossibleEvictions<T: IndexValue> {
+pub struct PossibleEvictions {
     /// vec per age in the future, up to size 'ages_to_stay_in_cache'
-    possible_evictions: Vec<FlushScanResult<T>>,
+    possible_evictions: Vec<FlushScanResult>,
     /// next index to use into 'possible_evictions'
     /// if 'index' >= 'possible_evictions.len()', then there are no available entries
     index: usize,
 }
 
-impl<T: IndexValue> PossibleEvictions<T> {
+impl PossibleEvictions {
     fn new(max_ages: Age) -> Self {
         Self {
             possible_evictions: (0..max_ages).map(|_| FlushScanResult::default()).collect(),
@@ -49,7 +49,7 @@ impl<T: IndexValue> PossibleEvictions<T> {
     }
 
     /// remove the possible evictions. This is required because we need ownership of the Arc strong counts to transfer to caller so entries can be removed from the accounts index
-    fn get_possible_evictions(&mut self) -> Option<FlushScanResult<T>> {
+    fn get_possible_evictions(&mut self) -> Option<FlushScanResult> {
         self.possible_evictions.get_mut(self.index).map(|result| {
             self.index += 1;
             // remove the list from 'possible_evictions'
@@ -73,10 +73,10 @@ impl<T: IndexValue> PossibleEvictions<T> {
     }
 
     /// insert 'entry' at 'relative_age' in the future into 'possible_evictions'
-    fn insert(&mut self, relative_age: Age, key: Pubkey, entry: Arc<AccountMapEntry<T>>) {
+    fn insert(&mut self, relative_age: Age, key: Pubkey) {
         let index = self.index + (relative_age as usize);
         let list = &mut self.possible_evictions[index];
-        list.evictions_age_possible.push((key, entry));
+        list.evictions_age_possible.push(key);
     }
 }
 
@@ -162,9 +162,9 @@ struct StartupInfo<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 
 #[derive(Default, Debug)]
 /// result from scanning in-mem index during flush
-struct FlushScanResult<T> {
+struct FlushScanResult {
     /// pubkeys whose age indicates they may be evicted now, pending further checks.
-    evictions_age_possible: Vec<(Pubkey, Arc<AccountMapEntry<T>>)>,
+    evictions_age_possible: Vec<Pubkey>,
 }
 
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T, U> {
@@ -933,7 +933,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                 continue;
             }
 
-            possible_evictions.insert(0, *k, Arc::clone(v));
+            possible_evictions.insert(0, *k);
         }
     }
 
@@ -946,7 +946,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         startup: bool,
         _flush_guard: &FlushGuard,
         ages_flushing_now: Age,
-    ) -> FlushScanResult<T> {
+    ) -> FlushScanResult {
         let mut possible_evictions = self.possible_evictions.write().unwrap();
         possible_evictions.reset(1);
         let m;
@@ -1128,9 +1128,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             let m = Measure::start("flush_update");
             let evictions_age = evictions_age_possible
                 .into_iter()
-                .filter_map(|(k, v)| {
+                .filter_map(|pubkey| {
                     // consider whether to write to disk for all the items we may evict
                     let mut mse = Measure::start("flush_should_evict");
+                    let Some(v) = self.map_internal.read().unwrap().get(&pubkey) else {
+                        return None;
+                    };
                     let should_evict = self.should_evict_from_mem(
                         current_age,
                         &v,
@@ -1175,7 +1178,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                                 // since we know slot_list.len() == 1, we can create a stack-allocated array for single element.
                                 let (slot, info) = slot_list[0];
                                 let disk_entry = [(slot, info.into())];
-                                disk.try_write(&k, (&disk_entry, ref_count.into()))
+                                disk.try_write(&pubkey, (&disk_entry, ref_count.into()))
                             };
                             match disk_resize {
                                 Ok(_) => {
@@ -1193,7 +1196,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                             }
                         }
                     }
-                    Some(k)
+                    Some(pubkey)
                 })
                 .collect();
             Self::update_time_stat(&self.stats().flush_update_us, m);
