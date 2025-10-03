@@ -18,6 +18,7 @@ use {
 
 pub static SINGLETONS: AtomicU64 = AtomicU64::new(0);
 pub static LISTS: AtomicU64 = AtomicU64::new(0);
+pub static LISTS_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 /// one entry in the in-mem accounts index
 /// Represents the value for an account key in the in-memory accounts index
@@ -199,6 +200,7 @@ impl<T: Copy> SlotListRepr<T> {
             }
         } else {
             LISTS.fetch_add(1, Ordering::Relaxed);
+            LISTS_ALLOCS.fetch_add(1, Ordering::Relaxed);
             Self {
                 multiple: ManuallyDrop::new(Box::new(slot_list.to_vec())),
             }
@@ -291,6 +293,7 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
             let single = unsafe { self.repr_guard.single };
             SINGLETONS.fetch_sub(1, Ordering::Relaxed);
             LISTS.fetch_add(1, Ordering::Relaxed);
+            LISTS_ALLOCS.fetch_add(1, Ordering::Relaxed);
             self.repr_guard.multiple = ManuallyDrop::new(Box::new(vec![single]));
         }
         unsafe { self.repr_guard.multiple.as_mut() }

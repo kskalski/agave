@@ -1229,9 +1229,10 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             self.spl_token_owner_index.log_contents();
         }
         log::info!(
-            "KAMIL: {} {}",
+            "KAMIL: s={} m={} - allocs {}",
             account_map_entry::SINGLETONS.load(Ordering::Relaxed),
-            account_map_entry::LISTS.load(Ordering::Relaxed)
+            account_map_entry::LISTS.load(Ordering::Relaxed),
+            account_map_entry::LISTS_ALLOCS.load(Ordering::Relaxed),
         );
     }
 
