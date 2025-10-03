@@ -73,10 +73,10 @@ impl PossibleEvictions {
     }
 
     /// insert 'entry' at 'relative_age' in the future into 'possible_evictions'
-    fn insert(&mut self, relative_age: Age, key: Pubkey) {
+    fn insert(&mut self, relative_age: Age, key: Pubkey, is_dirty: bool) {
         let index = self.index + (relative_age as usize);
         let list = &mut self.possible_evictions[index];
-        list.evictions_age_possible.push(key);
+        list.evictions_age_possible.push((key, is_dirty));
     }
 }
 
@@ -164,7 +164,7 @@ struct StartupInfo<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 /// result from scanning in-mem index during flush
 struct FlushScanResult {
     /// pubkeys whose age indicates they may be evicted now, pending further checks.
-    evictions_age_possible: Vec<Pubkey>,
+    evictions_age_possible: Vec<(Pubkey, bool)>,
 }
 
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T, U> {
@@ -928,12 +928,14 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         ages_flushing_now: Age,
     ) {
         for (k, v) in iter {
-            if !startup && current_age.wrapping_sub(v.age()) > ages_flushing_now {
+            if !startup
+                && (current_age.wrapping_sub(v.age()) > ages_flushing_now || v.ref_count() > 1)
+            {
                 // not planning to evict this item from memory within 'ages_flushing_now' ages
                 continue;
             }
 
-            possible_evictions.insert(0, *k);
+            possible_evictions.insert(0, *k, v.dirty());
         }
     }
 
@@ -1128,20 +1130,8 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             let m = Measure::start("flush_update");
             let evictions_age = evictions_age_possible
                 .into_iter()
-                .filter_map(|pubkey| {
+                .filter_map(|(pubkey, is_dirty)| {
                     // consider whether to write to disk for all the items we may evict
-                    let mut mse = Measure::start("flush_should_evict");
-                    let Some(v) = self.map_internal.read().unwrap().get(&pubkey) else {
-                        return None;
-                    };
-                    let should_evict = self.should_evict_from_mem(
-                        current_age,
-                        &v,
-                        startup,
-                        true,
-                        ages_flushing_now,
-                    );
-                    mse.stop();
                     flush_should_evict_us += mse.as_us();
                     if !should_evict {
                         // not evicting, so don't write, even if dirty
