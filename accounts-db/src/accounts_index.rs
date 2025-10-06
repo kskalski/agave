@@ -203,7 +203,7 @@ pub trait IsCached {
     fn is_cached(&self) -> bool;
 }
 
-pub trait IndexValue: 'static + IsCached + IsZeroLamport + DiskIndexValue + Copy {}
+pub trait IndexValue: 'static + IsCached + IsZeroLamport + DiskIndexValue {}
 
 pub trait DiskIndexValue:
     'static + Clone + Debug + PartialEq + Copy + Default + Sync + Send

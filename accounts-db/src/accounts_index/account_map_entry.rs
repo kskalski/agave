@@ -19,7 +19,7 @@ use {
 /// one entry in the in-mem accounts index
 /// Represents the value for an account key in the in-memory accounts index
 #[derive(Debug)]
-pub struct AccountMapEntry<T: Copy> {
+pub struct AccountMapEntry<T> {
     /// number of alive slots that contain >= 1 instances of account data for this pubkey
     /// where alive represents a slot that has not yet been removed by clean via AccountsDB::clean_stored_dead_slots() for containing no up to date account information
     ref_count: AtomicRefCount,
