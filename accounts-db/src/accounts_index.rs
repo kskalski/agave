@@ -1737,7 +1737,10 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
 pub mod tests {
     use {
         super::*,
-        crate::bucket_map_holder::BucketMapHolder,
+        crate::{
+            accounts_index::account_map_entry::AccountMapEntryMeta,
+            bucket_map_holder::BucketMapHolder,
+        },
         secondary::DashMapSecondaryIndexEntry,
         solana_account::{AccountSharedData, WritableAccount},
         solana_pubkey::PUBKEY_BYTES,
