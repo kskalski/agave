@@ -1364,14 +1364,14 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 // this is no longer the default case
                 let mut duplicates_from_in_memory = vec![];
                 items.for_each(|(pubkey, account_info)| {
-                    let flat_index =
-                        u32::from_ne_bytes(std::array::from_fn(|i| pubkey.as_array()[i]));
-                    self.flat_map[flat_index as usize].fetch_add(1, Ordering::Relaxed);
                     let new_entry =
                         PreAllocatedAccountMapEntry::new(slot, account_info, storage, use_disk);
                     match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
                         InsertNewEntryResults::DidNotExist => {
                             num_did_not_exist += 1;
+                            let flat_index =
+                                u32::from_ne_bytes(std::array::from_fn(|i| pubkey.as_array()[i]));
+                            self.flat_map[flat_index as usize].fetch_add(1, Ordering::Relaxed);
                         }
                         InsertNewEntryResults::Existed {
                             other_slot,
