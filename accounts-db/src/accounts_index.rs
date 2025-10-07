@@ -1238,7 +1238,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             .collect();
         m.sort();
         m.dedup_by_key(|a| *a);
-        info!("COUNTS {:?}", self.flat_map);
+        info!("COUNTS {:?}", m);
     }
 
     pub(crate) fn update_secondary_indexes(
