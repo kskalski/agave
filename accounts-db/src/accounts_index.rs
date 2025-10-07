@@ -340,7 +340,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             purge_older_root_entries_one_slot_list: AtomicUsize::default(),
             account_maps,
             bin_calculator,
-            flat_map: Vec::from_iter((0..u32::MAX).map(|_| AtomicU32::new(0))),
+            flat_map: Vec::from_iter((0..u32::MAX as usize + 1).map(|_| AtomicU32::new(0))),
             program_id_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
                 "program_id_index_stats",
             ),
