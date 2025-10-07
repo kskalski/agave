@@ -1240,6 +1240,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 if x > 1000 {
                     info!("flat_map index {}: {}", i, x);
                 }
+                x
             })
             .collect();
         m.sort();
