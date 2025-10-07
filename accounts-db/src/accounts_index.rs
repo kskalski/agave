@@ -311,6 +311,8 @@ pub struct AccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 
     storage: AccountsIndexStorage<T, U>,
 
+    flat_map: Vec<AtomicU32>,
+
     /// when a scan's accumulated data exceeds this limit, abort the scan
     pub scan_results_limit_bytes: Option<usize>,
 
@@ -338,6 +340,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             purge_older_root_entries_one_slot_list: AtomicUsize::default(),
             account_maps,
             bin_calculator,
+            flat_map: Vec::from_iter((0..u32::MAX).map(|_| AtomicU32::new(0))),
             program_id_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
                 "program_id_index_stats",
             ),
@@ -1228,6 +1231,14 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             info!("secondary index: {:?}", AccountIndex::SplTokenOwner);
             self.spl_token_owner_index.log_contents();
         }
+        let mut m: Vec<_> = self
+            .flat_map
+            .iter()
+            .map(|x| x.load(Ordering::Relaxed))
+            .collect();
+        m.sort();
+        m.dedup_by_key(|a| *a);
+        info!("COUNTS {:?}", self.flat_map);
     }
 
     pub(crate) fn update_secondary_indexes(
@@ -1353,6 +1364,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 // this is no longer the default case
                 let mut duplicates_from_in_memory = vec![];
                 items.for_each(|(pubkey, account_info)| {
+                    let flat_index =
+                        u32::from_ne_bytes(std::array::from_fn(|i| pubkey.as_array()[i]));
+                    self.flat_map[flat_index as usize].fetch_add(1, Ordering::Relaxed);
                     let new_entry =
                         PreAllocatedAccountMapEntry::new(slot, account_info, storage, use_disk);
                     match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
