@@ -147,6 +147,16 @@ impl<T> Deref for SlotListReadGuard<'_, T> {
     }
 }
 
+impl<T> SlotListReadGuard<'_, T> {
+    #[cfg(test)]
+    pub fn clone_list(&self) -> SlotList<T>
+    where
+        T: Copy,
+    {
+        self.0.iter().copied().collect()
+    }
+}
+
 /// Holds slot list lock for writing and provides mutable API translating changes to the slot list.
 #[derive(Debug)]
 pub struct SlotListWriteGuard<'a, T>(RwLockWriteGuard<'a, SlotList<T>>);
