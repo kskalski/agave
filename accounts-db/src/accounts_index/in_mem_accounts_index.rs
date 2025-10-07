@@ -163,7 +163,7 @@ struct StartupInfo<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 
 #[derive(Default, Debug)]
 /// result from scanning in-mem index during flush
-struct FlushScanResult<T: IndexValue> {
+struct FlushScanResult<T> {
     /// pubkeys whose age indicates they may be evicted now, pending further checks.
     evictions_age_possible: Vec<(Pubkey, Arc<AccountMapEntry<T>>)>,
 }
@@ -1523,7 +1523,7 @@ mod tests {
                 1,
                 "other_slot: {other_slot:?}"
             );
-            assert_eq!(slot_list.cloned_list(), SlotList::from([at_new_slot]));
+            assert_eq!(slot_list.clone_list(), SlotList::from([at_new_slot]));
             assert!(reclaims.is_empty());
         }
 
@@ -1552,7 +1552,7 @@ mod tests {
             0,
             "other_slot: {other_slot:?}"
         );
-        assert_eq!(slot_list.cloned_list(), SlotList::from([at_new_slot]));
+        assert_eq!(slot_list.clone_list(), SlotList::from([at_new_slot]));
         assert_eq!(reclaims, expected_reclaims);
 
         // nothing will exist at this slot
@@ -1622,8 +1622,8 @@ mod tests {
                         AccountMapEntryMeta::default(),
                     );
                     let mut slot_list = entry.slot_list_write_lock();
-                    let mut expected = slot_list.cloned_list();
-                    let original = slot_list.cloned_list();
+                    let mut expected = slot_list.clone_list();
+                    let original = slot_list.clone_list();
                     let mut reclaims = ReclaimsSlotList::new();
 
                     let result = InMemAccountsIndex::<u64, u64>::update_slot_list(
@@ -1634,7 +1634,7 @@ mod tests {
                         &mut reclaims,
                         reclaim,
                     );
-                    let mut slot_list = slot_list.cloned_list();
+                    let mut slot_list = slot_list.clone_list();
 
                     // calculate expected reclaims
                     let mut expected_reclaims = ReclaimsSlotList::new();
@@ -1895,7 +1895,7 @@ mod tests {
                 1,
                 "other_slot: {other_slot:?}"
             );
-            assert_eq!(slot_list.cloned_list(), SlotList::from([at_new_slot]));
+            assert_eq!(slot_list.clone_list(), SlotList::from([at_new_slot]));
             assert!(reclaims.is_empty());
         }
 
@@ -1924,7 +1924,7 @@ mod tests {
             0,
             "other_slot: {other_slot:?}"
         );
-        assert_eq!(slot_list.cloned_list(), SlotList::from([at_new_slot]));
+        assert_eq!(slot_list.clone_list(), SlotList::from([at_new_slot]));
         assert_eq!(reclaims, expected_reclaims);
 
         // nothing will exist at this slot
@@ -2000,8 +2000,8 @@ mod tests {
                         AccountMapEntryMeta::default(),
                     );
                     let mut slot_list = entry.slot_list_write_lock();
-                    let mut expected = slot_list.cloned_list();
-                    let original = slot_list.cloned_list();
+                    let mut expected = slot_list.clone_list();
+                    let original = slot_list.clone_list();
                     let mut reclaims = ReclaimsSlotList::new();
 
                     let result = InMemAccountsIndex::<u64, u64>::update_slot_list(
@@ -2012,7 +2012,7 @@ mod tests {
                         &mut reclaims,
                         reclaim,
                     );
-                    let mut slot_list = slot_list.cloned_list();
+                    let mut slot_list = slot_list.clone_list();
 
                     // calculate expected reclaims
                     let mut expected_reclaims = ReclaimsSlotList::new();

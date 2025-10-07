@@ -3382,7 +3382,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, None);
         assert!(reclaims.is_empty());
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
         );
 
@@ -3395,7 +3395,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, None);
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
         );
         // Add a later root that is not in the list, should not affect the outcome
@@ -3405,7 +3405,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, None);
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
         );
 
@@ -3416,7 +3416,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, Some(6));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
         );
 
@@ -3426,7 +3426,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, Some(5));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
         );
 
@@ -3437,7 +3437,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, Some(2));
         assert!(reclaims.is_empty());
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
         );
 
@@ -3448,7 +3448,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, Some(1));
         assert!(reclaims.is_empty());
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
         );
 
@@ -3459,7 +3459,7 @@ pub mod tests {
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, Some(7));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
         assert_eq!(
-            slot_list.cloned_list(),
+            slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
         );
     }

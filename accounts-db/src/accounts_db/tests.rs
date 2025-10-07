@@ -6449,7 +6449,7 @@ fn test_clean_old_storages_with_reclaims_rooted() {
     let slot_list = accounts_db
         .accounts_index
         .get_bin(&pubkey)
-        .slot_list_mut(&pubkey, |slot_list| slot_list.cloned_list())
+        .slot_list_mut(&pubkey, |slot_list| slot_list.clone_list())
         .unwrap();
     assert_eq!(slot_list.len(), slots.len());
     assert!(slot_list.iter().map(|(slot, _)| slot).eq(slots.iter()));
@@ -6462,7 +6462,7 @@ fn test_clean_old_storages_with_reclaims_rooted() {
     let slot_list = accounts_db
         .accounts_index
         .get_bin(&pubkey)
-        .slot_list_mut(&pubkey, |slot_list| slot_list.cloned_list())
+        .slot_list_mut(&pubkey, |slot_list| slot_list.clone_list())
         .unwrap();
     assert_eq!(slot_list.len(), 1);
     assert!(slot_list
@@ -6508,7 +6508,7 @@ fn test_clean_old_storages_with_reclaims_unrooted() {
     let slot_list = accounts_db
         .accounts_index
         .get_bin(&pubkey)
-        .slot_list_mut(&pubkey, |slot_list| slot_list.cloned_list())
+        .slot_list_mut(&pubkey, |slot_list| slot_list.clone_list())
         .unwrap();
     assert_eq!(slot_list.len(), slots.len());
     assert!(slot_list.iter().map(|(slot, _)| slot).eq(slots.iter()));
@@ -6520,7 +6520,7 @@ fn test_clean_old_storages_with_reclaims_unrooted() {
     let slot_list = accounts_db
         .accounts_index
         .get_bin(&pubkey)
-        .slot_list_mut(&pubkey, |slot_list| slot_list.cloned_list())
+        .slot_list_mut(&pubkey, |slot_list| slot_list.clone_list())
         .unwrap();
     assert_eq!(slot_list.len(), slots.len());
     assert!(slot_list.iter().map(|(slot, _)| slot).eq(slots.iter()));

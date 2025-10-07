@@ -162,7 +162,7 @@ impl<T> SlotListWriteGuard<'_, T> {
     where
         F: FnMut(&mut (Slot, T)) -> bool,
     {
-        self.0.retain_mut(f)
+        self.0.retain(f)
     }
 
     /// Removes and returns the element at position `index` within the list, shifting all elements after it to the left.
@@ -187,7 +187,7 @@ impl<T> SlotListWriteGuard<'_, T> {
     }
 
     #[cfg(test)]
-    pub fn cloned_list(&self) -> SlotList<T>
+    pub fn clone_list(&self) -> SlotList<T>
     where
         T: Copy,
     {
