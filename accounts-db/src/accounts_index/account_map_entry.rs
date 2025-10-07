@@ -167,7 +167,7 @@ impl<T> SlotListWriteGuard<'_, T> {
         self.0.push(item);
     }
 
-    /// Retains only the elements specified by the predicate, passing a mutable reference to it.
+    /// Retains only the elements specified by the predicate.
     pub fn retain<F>(&mut self, f: F)
     where
         F: FnMut(&mut (Slot, T)) -> bool,
