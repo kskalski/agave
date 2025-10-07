@@ -316,6 +316,8 @@ pub struct AccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
 
     storage: AccountsIndexStorage<T, U>,
 
+    flat_map: Vec<AtomicU32>,
+
     /// when a scan's accumulated data exceeds this limit, abort the scan
     pub scan_results_limit_bytes: Option<usize>,
 
@@ -343,6 +345,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             purge_older_root_entries_one_slot_list: AtomicUsize::default(),
             account_maps,
             bin_calculator,
+            flat_map: Vec::from_iter((0..u32::MAX as usize + 1).map(|_| AtomicU32::new(0))),
             program_id_index: SecondaryIndex::<RwLockSecondaryIndexEntry>::new(
                 "program_id_index_stats",
             ),
@@ -1232,6 +1235,21 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             info!("secondary index: {:?}", AccountIndex::SplTokenOwner);
             self.spl_token_owner_index.log_contents();
         }
+        let mut m: Vec<_> = self
+            .flat_map
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let x = x.load(Ordering::Relaxed);
+                if x > 1000 {
+                    info!("flat_map index {}: {}", i, x);
+                }
+                x
+            })
+            .collect();
+        m.sort();
+        m.dedup_by_key(|a| *a);
+        info!("COUNTS {:?}", m);
     }
 
     pub(crate) fn update_secondary_indexes(
@@ -1362,6 +1380,10 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                     match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
                         InsertNewEntryResults::DidNotExist => {
                             num_did_not_exist += 1;
+                            let flat_index = u32::from_ne_bytes(std::array::from_fn(|i| {
+                                pubkey.as_array()[i + 14]
+                            }));
+                            self.flat_map[flat_index as usize].fetch_add(1, Ordering::Relaxed);
                         }
                         InsertNewEntryResults::Existed {
                             other_slot,
