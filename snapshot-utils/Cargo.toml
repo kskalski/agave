@@ -19,6 +19,5 @@ name = "agave_snapshot_utils"
 
 [dependencies]
 lz4 = { workspace = true }
-strum = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
 zstd = { workspace = true }
