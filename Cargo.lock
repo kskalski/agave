@@ -201,6 +201,7 @@ version = "3.1.0"
 dependencies = [
  "agave-feature-set",
  "agave-reserved-account-keys",
+ "agave-snapshot-utils",
  "agave-syscalls",
  "assert_cmd",
  "bs58",
@@ -334,6 +335,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-snapshot-utils"
+version = "3.1.0"
+dependencies = [
+ "lz4",
+ "strum",
+ "strum_macros",
+ "zstd",
+]
+
+[[package]]
 name = "agave-store-histogram"
 version = "3.1.0"
 dependencies = [
@@ -457,6 +468,7 @@ name = "agave-validator"
 version = "3.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "agave-snapshot-utils",
  "assert_cmd",
  "chrono",
  "clap 2.33.3",
@@ -8156,6 +8168,7 @@ dependencies = [
  "agave-reserved-account-keys",
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
+ "agave-snapshot-utils",
  "agave-transaction-view",
  "agave-verified-packet-receiver",
  "agave-votor",
@@ -8462,6 +8475,7 @@ dependencies = [
 name = "solana-download-utils"
 version = "3.1.0"
 dependencies = [
+ "agave-snapshot-utils",
  "log",
  "solana-clock",
  "solana-file-download",
@@ -9291,6 +9305,7 @@ dependencies = [
 name = "solana-local-cluster"
 version = "3.1.0"
 dependencies = [
+ "agave-snapshot-utils",
  "assert_matches",
  "crossbeam-channel",
  "fs_extra",
@@ -10047,6 +10062,7 @@ version = "3.1.0"
 dependencies = [
  "agave-feature-set",
  "agave-reserved-account-keys",
+ "agave-snapshot-utils",
  "base64 0.22.1",
  "bincode",
  "bs58",
@@ -10320,6 +10336,7 @@ dependencies = [
  "agave-feature-set",
  "agave-precompiles",
  "agave-reserved-account-keys",
+ "agave-snapshot-utils",
  "agave-syscalls",
  "agave-transaction-view",
  "ahash 0.8.11",
@@ -11221,6 +11238,7 @@ name = "solana-test-validator"
 version = "3.1.0"
 dependencies = [
  "agave-feature-set",
+ "agave-snapshot-utils",
  "base64 0.22.1",
  "bincode",
  "crossbeam-channel",

@@ -152,6 +152,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-snapshot-utils"
+version = "3.1.0"
+dependencies = [
+ "lz4",
+ "strum",
+ "strum_macros",
+ "zstd",
+]
+
+[[package]]
 name = "agave-syscalls"
 version = "3.1.0"
 dependencies = [
@@ -212,6 +222,7 @@ name = "agave-validator"
 version = "3.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "agave-snapshot-utils",
  "chrono",
  "clap",
  "console 0.16.1",
@@ -6434,6 +6445,7 @@ dependencies = [
  "agave-feature-set",
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
+ "agave-snapshot-utils",
  "agave-transaction-view",
  "agave-verified-packet-receiver",
  "agave-votor",
@@ -6661,6 +6673,7 @@ dependencies = [
 name = "solana-download-utils"
 version = "3.1.0"
 dependencies = [
+ "agave-snapshot-utils",
  "log",
  "solana-clock",
  "solana-file-download",
@@ -7906,6 +7919,7 @@ name = "solana-rpc"
 version = "3.1.0"
 dependencies = [
  "agave-feature-set",
+ "agave-snapshot-utils",
  "base64 0.22.1",
  "bincode",
  "bs58",
@@ -8093,6 +8107,7 @@ dependencies = [
  "agave-feature-set",
  "agave-precompiles",
  "agave-reserved-account-keys",
+ "agave-snapshot-utils",
  "agave-syscalls",
  "ahash 0.8.11",
  "aquamarine",
@@ -9614,6 +9629,7 @@ name = "solana-test-validator"
 version = "3.1.0"
 dependencies = [
  "agave-feature-set",
+ "agave-snapshot-utils",
  "base64 0.22.1",
  "bincode",
  "crossbeam-channel",
