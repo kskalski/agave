@@ -157,7 +157,6 @@ version = "3.1.0"
 dependencies = [
  "lz4",
  "strum",
- "strum_macros",
  "zstd",
 ]
 
