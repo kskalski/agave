@@ -2,6 +2,7 @@
 name = "agave-snapshot-utils"
 description = "Agave snapshot utils"
 documentation = "https://docs.rs/agave-snapshot-utils"
+publish = false
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
