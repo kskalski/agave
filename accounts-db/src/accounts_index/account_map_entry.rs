@@ -287,12 +287,6 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
         mem::replace(stored_item_mut, item)
     }
 
-    /// Clears the list, removing all elements.
-    #[cfg(test)]
-    pub fn clear(&mut self) {
-        self.change_to_multiple().clear();
-    }
-
     fn change_to_multiple(&mut self) -> &mut Vec<(Slot, T)> {
         if self.meta.is_single.swap(false, Ordering::AcqRel) {
             let single = unsafe { self.repr_guard.single };
@@ -312,6 +306,11 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
                 self.meta.is_single.store(true, Ordering::Release);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.change_to_multiple().clear();
     }
 
     #[cfg(test)]
