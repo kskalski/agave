@@ -17,7 +17,7 @@ crate-type = ["lib"]
 name = "solana_download_utils"
 
 [dependencies]
-agave-snapshot-utils = { workspace = true }
+agave-snapshots = { workspace = true }
 log = { workspace = true }
 solana-clock = { workspace = true }
 solana-file-download = { workspace = true }

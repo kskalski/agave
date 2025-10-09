@@ -1,8 +1,7 @@
 [package]
-name = "agave-snapshot-utils"
+name = "agave-snapshots"
 description = "Agave snapshot utils"
-documentation = "https://docs.rs/agave-snapshot-utils"
-publish = false
+documentation = "https://docs.rs/agave-snapshots"
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
@@ -15,7 +14,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 crate-type = ["lib"]
-name = "agave_snapshot_utils"
+name = "agave_snapshots"
 
 [dependencies]
 lz4 = { workspace = true }

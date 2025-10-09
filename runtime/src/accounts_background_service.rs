@@ -716,7 +716,7 @@ mod test {
     use {
         super::*,
         crate::{genesis_utils::create_genesis_config, snapshot_config::SnapshotConfig},
-        agave_snapshot_utils::SnapshotInterval,
+        agave_snapshots::SnapshotInterval,
         crossbeam_channel::unbounded,
         solana_account::AccountSharedData,
         solana_epoch_schedule::EpochSchedule,

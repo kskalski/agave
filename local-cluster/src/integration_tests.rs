@@ -16,7 +16,7 @@ use {
         local_cluster::{ClusterConfig, LocalCluster},
         validator_configs::*,
     },
-    agave_snapshot_utils::SnapshotInterval,
+    agave_snapshots::SnapshotInterval,
     log::*,
     solana_account::AccountSharedData,
     solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,

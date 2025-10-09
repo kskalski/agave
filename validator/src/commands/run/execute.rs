@@ -6,7 +6,7 @@ use {
         commands::{run::args::RunArgs, FromClapArgMatches},
         ledger_lockfile, lock_ledger,
     },
-    agave_snapshot_utils::{ArchiveFormat, SnapshotInterval},
+    agave_snapshots::{ArchiveFormat, SnapshotInterval},
     clap::{crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, ArgMatches},
     crossbeam_channel::unbounded,
     log::*,

@@ -4,7 +4,7 @@ use {
         cli::{hash_validator, port_range_validator, port_validator, DefaultArgs},
         commands::{FromClapArgMatches, Result},
     },
-    agave_snapshot_utils::SUPPORTED_ARCHIVE_COMPRESSION,
+    agave_snapshots::SUPPORTED_ARCHIVE_COMPRESSION,
     clap::{values_t, App, Arg, ArgMatches},
     solana_accounts_db::utils::create_and_canonicalize_directory,
     solana_clap_utils::{

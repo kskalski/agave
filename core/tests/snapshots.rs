@@ -2,7 +2,7 @@
 
 use {
     crate::snapshot_utils::create_tmp_accounts_dir_for_tests,
-    agave_snapshot_utils::SnapshotInterval,
+    agave_snapshots::SnapshotInterval,
     crossbeam_channel::unbounded,
     itertools::Itertools,
     log::{info, trace},

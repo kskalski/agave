@@ -1,6 +1,6 @@
 pub use solana_file_download::DownloadProgressRecord;
 use {
-    agave_snapshot_utils::{ArchiveFormat, ZstdConfig},
+    agave_snapshots::{ArchiveFormat, ZstdConfig},
     log::*,
     solana_clock::Slot,
     solana_file_download::{download_file, DownloadProgressCallbackOption},

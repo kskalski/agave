@@ -31,7 +31,7 @@ use {
         tpu::{ForwardingClientOption, Tpu, TpuSockets, DEFAULT_TPU_COALESCE},
         tvu::{Tvu, TvuConfig, TvuSockets},
     },
-    agave_snapshot_utils::SnapshotInterval,
+    agave_snapshots::SnapshotInterval,
     anyhow::{anyhow, Context, Result},
     crossbeam_channel::{bounded, unbounded, Receiver},
     quinn::Endpoint,

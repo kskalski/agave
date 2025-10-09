@@ -5,7 +5,7 @@ use {
         snapshot_hash::SnapshotHash,
         snapshot_utils::{self, Result},
     },
-    agave_snapshot_utils::ArchiveFormat,
+    agave_snapshots::ArchiveFormat,
     solana_clock::Slot,
     std::{cmp::Ordering, path::PathBuf},
 };

@@ -7,7 +7,7 @@ use {
         bank_forks::SetRootError,
         snapshot_config::SnapshotConfig,
     },
-    agave_snapshot_utils::SnapshotInterval,
+    agave_snapshots::SnapshotInterval,
     log::*,
     solana_clock::Slot,
     solana_measure::measure::Measure,

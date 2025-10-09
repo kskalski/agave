@@ -1,6 +1,6 @@
 use {
     crate::commands,
-    agave_snapshot_utils::DEFAULT_ARCHIVE_COMPRESSION,
+    agave_snapshots::DEFAULT_ARCHIVE_COMPRESSION,
     clap::{crate_description, crate_name, App, AppSettings, Arg, ArgMatches, SubCommand},
     solana_accounts_db::{
         accounts_db::{

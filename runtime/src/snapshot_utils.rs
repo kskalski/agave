@@ -19,7 +19,7 @@ use {
             get_slot_and_append_vec_id, SnapshotStorageRebuilder,
         },
     },
-    agave_snapshot_utils::{ArchiveFormat, ArchiveFormatDecompressor},
+    agave_snapshots::{ArchiveFormat, ArchiveFormatDecompressor},
     crossbeam_channel::{Receiver, Sender},
     log::*,
     regex::Regex,
@@ -2570,7 +2570,7 @@ pub fn create_tmp_accounts_dir_for_tests() -> (TempDir, PathBuf) {
 mod tests {
     use {
         super::*,
-        agave_snapshot_utils::ZstdConfig,
+        agave_snapshots::ZstdConfig,
         assert_matches::assert_matches,
         bincode::{deserialize_from, serialize_into},
         std::{convert::TryFrom, mem::size_of},

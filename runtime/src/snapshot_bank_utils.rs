@@ -33,7 +33,7 @@ use {
         },
         status_cache,
     },
-    agave_snapshot_utils::ArchiveFormat,
+    agave_snapshots::ArchiveFormat,
     log::*,
     solana_accounts_db::{
         accounts_db::{AccountsDbConfig, AtomicAccountsFileId},
