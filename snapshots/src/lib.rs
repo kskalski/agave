@@ -1,3 +1,5 @@
+#![cfg(feature = "agave-unstable-api")]
+
 mod archive_format;
 mod snapshot_interval;
 

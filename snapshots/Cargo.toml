@@ -16,6 +16,10 @@ targets = ["x86_64-unknown-linux-gnu"]
 crate-type = ["lib"]
 name = "agave_snapshots"
 
+[features]
+agave-unstable-api = []
+default = ["agave-unstable-api"]
+
 [dependencies]
 lz4 = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
