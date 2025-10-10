@@ -277,6 +277,9 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
             if !f(single_mut) {
                 self.meta.is_single.store(false, Ordering::Release);
                 self.repr_guard.multiple = ManuallyDrop::new(Box::new(vec![]));
+                LISTS.fetch_add(1, Ordering::Relaxed);
+                LISTS_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                SINGLETONS.fetch_sub(1, Ordering::Relaxed);
                 0
             } else {
                 1
