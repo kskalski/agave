@@ -1498,7 +1498,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             let roots_tracker = &self.roots_tracker.read().unwrap();
             newest_root_in_slot_list = Self::get_newest_root_in_slot_list(
                 &roots_tracker.alive_roots,
-                slot_list,
+                &slot_list,
                 max_clean_root_inclusive,
             );
             max_clean_root_inclusive.unwrap_or_else(|| roots_tracker.alive_roots.max_inclusive())
@@ -1532,7 +1532,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     ) -> bool {
         let mut is_slot_list_empty = false;
         let missing_in_accounts_index = self
-            .slot_list_mut(pubkey, |mut slot_list| {
+            .slot_list_mut(pubkey, |slot_list| {
                 is_slot_list_empty =
                     self.purge_older_root_entries(slot_list, reclaims, max_clean_root_inclusive);
             })
@@ -3380,13 +3380,13 @@ pub mod tests {
         let mut reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(entry.slot_list_write_lock(), &mut reclaims, None));
         assert!(reclaims.is_empty());
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
-            entry.slot_list_lock_read_len().as_ref(),
-            &SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
+            slot_list.clone_list(),
+            SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
         );
 
         // Add a later root, earlier slots should be reclaimed
-        let mut slot_list = entry.slot_list_write_lock();
         slot_list.assign([(1, true), (2, true), (5, true), (9, true)]);
         index.add_root(1);
         // Note 2 is not a root
@@ -3394,6 +3394,7 @@ pub mod tests {
         reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, None));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
             slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
@@ -3404,6 +3405,7 @@ pub mod tests {
         reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, None));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
             slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
@@ -3415,6 +3417,7 @@ pub mod tests {
         reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, Some(6)));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
             slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
@@ -3425,6 +3428,7 @@ pub mod tests {
         reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, Some(5)));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
             slot_list.clone_list(),
             SlotList::from_iter([(5, true), (9, true)])
@@ -3436,6 +3440,7 @@ pub mod tests {
         reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, Some(2)));
         assert!(reclaims.is_empty());
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
             slot_list.clone_list(),
             SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
@@ -3447,6 +3452,7 @@ pub mod tests {
         reclaims = ReclaimsSlotList::new();
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, Some(1)));
         assert!(reclaims.is_empty());
+        let mut slot_list = entry.slot_list_write_lock();
         assert_eq!(
             slot_list.clone_list(),
             SlotList::from_iter([(1, true), (2, true), (5, true), (9, true)])
@@ -3459,8 +3465,8 @@ pub mod tests {
         assert!(!index.purge_older_root_entries(slot_list, &mut reclaims, Some(7)));
         assert_eq!(reclaims, ReclaimsSlotList::from([(1, true), (2, true)]));
         assert_eq!(
-            slot_list.clone_list(),
-            SlotList::from_iter([(5, true), (9, true)])
+            entry.slot_list_read_lock().as_ref(),
+            &[(5, true), (9, true)]
         );
     }
 
@@ -3691,8 +3697,8 @@ pub mod tests {
         // was outdated by the update in the later slot, the primary account key is still alive,
         // so both secondary keys will still be kept alive.
         index.add_root(later_slot);
-        index.slot_list_mut(&account_key, |mut slot_list| {
-            index.purge_older_root_entries(&mut slot_list, &mut ReclaimsSlotList::new(), None)
+        index.slot_list_mut(&account_key, |slot_list| {
+            index.purge_older_root_entries(slot_list, &mut ReclaimsSlotList::new(), None)
         });
 
         check_secondary_index_mapping_correct(
