@@ -300,18 +300,18 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
     }
 
     fn try_change_to_single(&mut self) {
-        if !self.meta.is_single.load(Ordering::Acquire) {
-            let list = unsafe { &mut self.repr_guard.multiple };
-            if list.len() == 1 {
-                assert_eq!(list.len(), 1);
-                let item = list.pop().unwrap();
-                unsafe { ManuallyDrop::drop(list) };
-                self.repr_guard.single = item;
-                self.meta.is_single.store(true, Ordering::Release);
-                SINGLETONS.fetch_add(1, Ordering::Relaxed);
-                LISTS.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+        // if !self.meta.is_single.load(Ordering::Acquire) {
+        //     let list = unsafe { &mut self.repr_guard.multiple };
+        //     if list.len() == 1 {
+        //         assert_eq!(list.len(), 1);
+        //         let item = list.pop().unwrap();
+        //         unsafe { ManuallyDrop::drop(list) };
+        //         self.repr_guard.single = item;
+        //         self.meta.is_single.store(true, Ordering::Release);
+        //         SINGLETONS.fetch_add(1, Ordering::Relaxed);
+        //         LISTS.fetch_sub(1, Ordering::Relaxed);
+        //     }
+        // }
     }
 
     #[cfg(test)]
