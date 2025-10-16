@@ -130,9 +130,12 @@ impl<T: IndexValue> AccountMapEntry<T> {
     /// they return is dropped.
     pub fn slot_list_read_lock(&self) -> SlotListReadGuard<'_, T> {
         let repr_guard = self.slot_list.read().unwrap();
+        let is_single = self.meta.is_single.load(Ordering::Relaxed);
+        let single = is_single.then(|| (0, unsafe { repr_guard.single.1 }));
         SlotListReadGuard {
             repr_guard,
-            is_single: self.meta.is_single.load(Ordering::Relaxed),
+            is_single,
+            single,
         }
     }
 
@@ -141,9 +144,13 @@ impl<T: IndexValue> AccountMapEntry<T> {
     /// Do not call any locking function (`slot_list_*lock*`) on the same `AccountMapEntry` until accessor
     /// they return is dropped.
     pub fn slot_list_write_lock(&self) -> SlotListWriteGuard<'_, T> {
+        let repr_guard = self.slot_list.write().unwrap();
+        let is_single = self.meta.is_single.load(Ordering::Relaxed);
+        let single = is_single.then(|| (0, unsafe { repr_guard.single.1 }));
         SlotListWriteGuard {
-            repr_guard: self.slot_list.write().unwrap(),
+            repr_guard,
             meta: &self.meta,
+            single,
         }
     }
 }
@@ -153,6 +160,7 @@ impl<T: Copy + Debug> Debug for AccountMapEntry<T> {
         let slot_list_maybe_locked = self.slot_list.try_read().map(|rl| SlotListReadGuard {
             repr_guard: rl,
             is_single: self.meta.is_single.load(Ordering::Relaxed),
+            single: None,
         });
         f.debug_struct("AccountMapEntry")
             .field("meta", &self.meta)
@@ -212,37 +220,37 @@ impl<T: Copy> SlotListRepr<T> {
             (false, Self { dynamic })
         }
     }
-
-    // Safety: `is_single` needs to match current representation mode, thus this function is unsafe
-    unsafe fn as_slice(&self, is_single: bool) -> &[(Slot, T)] {
-        unsafe {
-            if is_single {
-                std::slice::from_ref(&self.single)
-            } else {
-                match self.dynamic.0.as_ref() {
-                    Some(slot_list) => slot_list.as_slice(),
-                    None => &[],
-                }
-            }
-        }
-    }
 }
 
 /// Holds slot list lock for reading and provides read access interpreting its representation.
 pub struct SlotListReadGuard<'a, T: Copy> {
     repr_guard: RwLockReadGuard<'a, SlotListRepr<T>>,
     is_single: bool,
+    single: Option<(Slot, T)>,
 }
 
 impl<T: Copy> Deref for SlotListReadGuard<'_, T> {
     type Target = [(Slot, T)];
 
     fn deref(&self) -> &Self::Target {
-        unsafe { SlotListRepr::as_slice(&self.repr_guard, self.is_single) }
+        unsafe { self.as_slice(self.is_single) }
     }
 }
 
 impl<T: Copy> SlotListReadGuard<'_, T> {
+    unsafe fn as_slice(&self, is_single: bool) -> &[(Slot, T)] {
+        unsafe {
+            if is_single {
+                std::slice::from_ref(self.single.as_ref().unwrap())
+            } else {
+                match self.repr_guard.dynamic.0.as_ref() {
+                    Some(slot_list) => slot_list.as_slice(),
+                    None => &[],
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn clone_list(&self) -> SlotList<T>
     where
@@ -265,9 +273,23 @@ impl<T: Copy + Debug> Debug for SlotListReadGuard<'_, T> {
 pub struct SlotListWriteGuard<'a, T: Copy> {
     repr_guard: RwLockWriteGuard<'a, SlotListRepr<T>>,
     meta: &'a AccountMapEntryMeta,
+    single: Option<(Slot, T)>,
 }
 
 impl<T: Copy> SlotListWriteGuard<'_, T> {
+    unsafe fn as_slice(&self, is_single: bool) -> &[(Slot, T)] {
+        unsafe {
+            if is_single {
+                std::slice::from_ref(self.single.as_ref().unwrap())
+            } else {
+                match self.repr_guard.dynamic.0.as_ref() {
+                    Some(slot_list) => slot_list.as_slice(),
+                    None => &[],
+                }
+            }
+        }
+    }
+
     /// Append element to the end of slot list
     pub fn push(&mut self, item: (Slot, T)) {
         if self.swap_is_single(false) {
@@ -278,6 +300,7 @@ impl<T: Copy> SlotListWriteGuard<'_, T> {
             match unsafe { self.repr_guard.dynamic.0.as_mut() } {
                 None => {
                     self.store_is_single(true);
+                    self.single = Some(item);
                     self.repr_guard.single = item
                 }
                 Some(slot_list) => slot_list.push(item),
@@ -377,7 +400,7 @@ impl<T: Copy> Deref for SlotListWriteGuard<'_, T> {
 
     fn deref(&self) -> &Self::Target {
         let is_single = self.meta.is_single.load(Ordering::Acquire);
-        unsafe { SlotListRepr::as_slice(&self.repr_guard, is_single) }
+        unsafe { self.as_slice(is_single) }
     }
 }
 
