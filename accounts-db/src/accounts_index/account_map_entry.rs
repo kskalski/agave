@@ -222,6 +222,7 @@ union SlotListRepr<T: Copy> {
 
 impl<T: Copy> SlotListRepr<T> {
     fn from_list(slot_list: SlotList<T>) -> (bool, Self) {
+        COUNTS[slot_list.len()].fetch_add(1, Ordering::Relaxed);
         if slot_list.len() == 1 {
             SINGLETONS.fetch_add(1, Ordering::Relaxed);
 
