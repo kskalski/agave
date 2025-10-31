@@ -1393,9 +1393,10 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                     match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
                         InsertNewEntryResults::DidNotExist => {
                             num_did_not_exist += 1;
-                            let flat_index = u32::from_ne_bytes(std::array::from_fn(|i| {
-                                pubkey.as_array()[i + 14]
+                            let flat_index = u64::from_ne_bytes(std::array::from_fn(|i| {
+                                pubkey.as_array()[i + 12]
                             }));
+                            let flat_index: u32 = (flat_index as u32) ^ ((flat_index >> 4) as u32);
                             self.flat_map[flat_index as usize].fetch_add(1, Ordering::Relaxed);
                         }
                         InsertNewEntryResults::Existed {
