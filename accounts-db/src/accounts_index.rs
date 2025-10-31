@@ -1248,8 +1248,20 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             })
             .collect();
         m.sort();
-        let mut prev_val = 0;
-        m.retain_mut(|(val, cnt)| *a);
+        let mut prev_val = (0, 0);
+        m.retain_mut(|(val, cnt)| {
+            if prev_val.0 == *val {
+                prev_val.1 += *cnt;
+                false
+            } else {
+                let new_val = (*val, *cnt);
+                *val = prev_val.0;
+                *cnt = prev_val.1;
+                prev_val = new_val;
+                true
+            }
+        });
+        m.push(prev_val);
         info!("COUNTS {:?}", m);
     }
 
