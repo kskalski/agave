@@ -1244,11 +1244,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 if x > 1000 {
                     info!("flat_map index {}: {}", i, x);
                 }
-                x
+                (x, 1)
             })
             .collect();
         m.sort();
-        m.dedup_by_key(|a| *a);
+        let mut prev_val = 0;
+        m.retain_mut(|(val, cnt)| *a);
         info!("COUNTS {:?}", m);
     }
 
