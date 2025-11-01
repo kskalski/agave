@@ -32,6 +32,7 @@ use {
     std::{
         collections::{btree_map::BTreeMap, HashSet},
         fmt::Debug,
+        hash::{DefaultHasher, Hasher as _},
         num::NonZeroUsize,
         ops::{Bound, Range, RangeBounds},
         path::PathBuf,
@@ -1393,9 +1394,13 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                     match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
                         InsertNewEntryResults::DidNotExist => {
                             num_did_not_exist += 1;
-                            let flat_index = u32::from_ne_bytes(std::array::from_fn(|i| {
-                                pubkey.as_array()[i + 12]
-                            }));
+                            let mut h = DefaultHasher::new();
+                            h.write(pubkey.as_array());
+                            let hash = h.finish();
+                            let flat_index = (hash as u32) ^ ((hash >> 4) as u32);
+                            // let flat_index = u32::from_ne_bytes(std::array::from_fn(|i| {
+                            //     pubkey.as_array()[i + 12]
+                            // }));
                             self.flat_map[flat_index as usize].fetch_add(1, Ordering::Relaxed);
                         }
                         InsertNewEntryResults::Existed {
