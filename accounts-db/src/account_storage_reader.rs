@@ -38,11 +38,11 @@ pub fn storage_file_buf_reader<'a>(
 ) -> io::Result<StorageFileBufReader<'a>> {
     #[cfg(target_os = "linux")]
     {
-        buffered_reader::SequentialFileReaderBuilder::new()
-            .shared_sqpoll(io_setup.shared_sqpoll_fd())
-            .use_direct_io(io_setup.use_direct_io && !use_page_cache)
-            .use_registered_buffers(io_setup.use_registered_io_uring_buffers)
-            .build(max_buf_size)
+        buffered_reader::new_io_uring_file_buf_reader(
+            max_buf_size,
+            io_setup.use_direct_io && !use_page_cache,
+            io_setup,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {

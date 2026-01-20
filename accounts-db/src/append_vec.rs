@@ -27,6 +27,7 @@ use {
             RequiredLenBufRead as _,
         },
         file_io::{read_into_buffer, write_buffer_to_file},
+        io_setup::IoSetupState,
     },
     log::*,
     meta::{AccountMeta, StoredAccountNoData, StoredMeta},
@@ -62,6 +63,9 @@ const _: () = assert!(
 );
 
 pub const MAXIMUM_APPEND_VEC_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
+
+/// Size of buffer for use in stack-based `FileBufRead` reader
+const READER_STACK_BUFFER_SIZE: usize = PAGE_SIZE * 8;
 
 pub type Result<T> = std::result::Result<T, AppendVecError>;
 
@@ -1052,18 +1056,40 @@ impl AppendVec {
     }
 }
 
-/// Create a reusable buffered reader tuned for scanning storages with account data.
+/// Create a buffered reader for ad-hoc scanning of storag(es) with account data.
+///
+/// This reader is stack-based and tries to avoid unnecessary allocations, meant to be used
+/// for short-lived operations.
 pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> {
     // 128KiB covers a reasonably large distribution of typical account sizes.
     // In a recent sample, 99.98% of accounts' data lengths were less than or equal to 128KiB.
     const MIN_CAPACITY: usize = 1024 * 128;
     const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
-    const BUFFER_SIZE: usize = PAGE_SIZE * 8;
     BufReaderWithOverflow::new(
-        BufferedReader::<BUFFER_SIZE>::new(),
+        BufferedReader::<READER_STACK_BUFFER_SIZE>::new(),
         MIN_CAPACITY,
         MAX_CAPACITY,
     )
+}
+
+/// Create a reusable buffered reader tuned for scanning over multiple storages with account data.
+///
+/// This reader will pre-allocate necessary buffers for reading large accounts and read-ahead data
+/// as much as possible.
+pub(crate) fn full_scan_accounts_reader<'a>(
+    max_buf_size: usize,
+    io_setup: &IoSetupState,
+) -> io::Result<impl RequiredLenBufFileRead<'a> + use<'a>> {
+    const OVERFLOW_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
+    // Index generation scans each storage once and the data is not hot in the page
+    // cache, so read via the shared storage reader with `use_page_cache = false`.
+    let reader =
+        crate::account_storage_reader::storage_file_buf_reader(max_buf_size, false, io_setup)?;
+    Ok(BufReaderWithOverflow::new(
+        reader,
+        OVERFLOW_CAPACITY,
+        OVERFLOW_CAPACITY,
+    ))
 }
 
 /// The per-account hash, stored in the AppendVec.

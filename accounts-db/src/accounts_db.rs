@@ -63,7 +63,7 @@ use {
         u64_align,
         utils::{self, create_account_shared_data},
     },
-    agave_fs::buffered_reader::RequiredLenBufFileRead,
+    agave_fs::{buffered_reader::RequiredLenBufFileRead, io_setup::IoSetupState},
     ahash::{HashMapExt as _, HashSetExt as _},
     bv::BitVec,
     dashmap::DashMap,
@@ -111,6 +111,11 @@ const DEFAULT_NUM_DIRS: u32 = 4;
 // setup instructions at https://docs.anza.xyz/operations/guides/validator-start allowing use of
 // several io_uring instances with fixed buffers for large disk IO operations.
 pub const TOTAL_IO_URING_BUFFERS_SIZE_LIMIT: usize = 2_000_000_000;
+
+// Per-thread buffer size used by the account file readers during index generation.
+// Kept small and constant so that we don't schedule too much outstanding I/O at once,
+// keeping the head of the processing queue available.
+const INDEX_GENERATION_READER_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 // When getting accounts for shrinking from the index, this is the # of accounts to lookup per thread.
 // This allows us to split up accounts index accesses across multiple threads.
@@ -5185,6 +5190,10 @@ impl AccountsDb {
         let exit_logger = AtomicBool::new(false);
         let num_processed = AtomicU64::new(0);
         let num_threads = num_cpus::get();
+        let io_setup = IoSetupState::default();
+        // Use a small, constant per-thread buffer so that we don't schedule too much
+        // outstanding I/O at once and the head of the processing queue stays available.
+        let reader_buf_size = INDEX_GENERATION_READER_BUF_SIZE;
         let mut index_time = Measure::start("index");
         thread::scope(|s| {
             let thread_handles = (0..num_threads)
@@ -5195,7 +5204,9 @@ impl AccountsDb {
                             let mut thread_accum = IndexGenerationAccumulator::with_slots_capacity(
                                 num_storages.div_ceil(num_threads),
                             );
-                            let mut reader = append_vec::new_scan_accounts_reader();
+                            let mut reader =
+                                append_vec::full_scan_accounts_reader(reader_buf_size, &io_setup)
+                                    .expect("create reader");
                             for next_item in storages_orderer.iter() {
                                 let storage = next_item.storage;
                                 self.generate_index_for_slot(

@@ -463,13 +463,7 @@ pub fn large_file_buf_reader(
 ) -> io::Result<impl BufRead + use<>> {
     #[cfg(target_os = "linux")]
     {
-        assert!(agave_io_uring::io_uring_supported());
-
-        let mut reader = SequentialFileReaderBuilder::new()
-            .shared_sqpoll(io_setup.shared_sqpoll_fd())
-            .use_direct_io(io_setup.use_direct_io)
-            .use_registered_buffers(io_setup.use_registered_io_uring_buffers)
-            .build(buf_size)?;
+        let mut reader = new_io_uring_file_buf_reader(buf_size, io_setup.use_direct_io, io_setup)?;
         reader.set_path(path)?;
         Ok(reader)
     }
@@ -480,6 +474,25 @@ pub fn large_file_buf_reader(
         let _ = io_setup;
         Ok(BufReader::with_capacity(buf_size, file))
     }
+}
+
+/// Build an io-uring backed [`SequentialFileReader`] with `buf_size` of read-ahead
+/// buffering, applying the shared sqpoll / registered-buffer settings from `io_setup`.
+///
+/// This is the single place that configures the io-uring reader; higher-level helpers
+/// such as [`large_file_buf_reader`] delegate to it.
+#[cfg(target_os = "linux")]
+pub fn new_io_uring_file_buf_reader<'a>(
+    buf_size: usize,
+    use_direct_io: bool,
+    io_setup: &IoSetupState,
+) -> io::Result<SequentialFileReader<'a>> {
+    assert!(agave_io_uring::io_uring_supported());
+    SequentialFileReaderBuilder::new()
+        .shared_sqpoll(io_setup.shared_sqpoll_fd())
+        .use_direct_io(use_direct_io)
+        .use_registered_buffers(io_setup.use_registered_io_uring_buffers)
+        .build(buf_size)
 }
 
 #[cfg(test)]
