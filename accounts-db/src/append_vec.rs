@@ -23,7 +23,7 @@ use {
     agave_fs::{
         FileInfo, FileSize,
         buffered_reader::{
-            BufReaderWithOverflow, BufferedReader, FileBufRead as _, RequiredLenBufFileRead,
+            BufReaderWithOverflow, BufferedReader, FileBufRead, RequiredLenBufFileRead,
             RequiredLenBufRead as _,
         },
         file_io::{read_into_buffer, write_buffer_to_file},
@@ -1053,6 +1053,13 @@ impl AppendVec {
     /// Returns the way to access this accounts file when archiving
     pub(crate) fn open_file_for_archive(&self) -> OpenFileForArchive<'_> {
         OpenFileForArchive::Borrowed(&self.file)
+    }
+
+    pub(crate) fn prefetch_in_reader<'a>(
+        &'a self,
+        reader: &mut impl FileBufRead<'a>,
+    ) -> io::Result<()> {
+        reader.add_file_to_prefetch(&self.file, self.file_size)
     }
 }
 

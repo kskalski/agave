@@ -6,7 +6,11 @@ use {
         append_vec::{AppendVec, AppendVecError},
         storable_accounts::StorableAccounts,
     },
-    agave_fs::{FileInfo, buffered_reader::RequiredLenBufFileRead, file_io::open_for_reading},
+    agave_fs::{
+        FileInfo,
+        buffered_reader::{FileBufRead, RequiredLenBufFileRead},
+        file_io::open_for_reading,
+    },
     solana_account::AccountSharedData,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
@@ -250,6 +254,15 @@ impl AccountsFile {
             Ok(match self {
                 Self::AppendVec(av) => av.open_file_for_archive(),
             })
+        }
+    }
+
+    pub(crate) fn prefetch_in_reader<'a>(
+        &'a self,
+        reader: &mut impl FileBufRead<'a>,
+    ) -> io::Result<()> {
+        match self {
+            Self::AppendVec(append_vec) => append_vec.prefetch_in_reader(reader),
         }
     }
 }

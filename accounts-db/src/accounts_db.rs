@@ -5207,7 +5207,20 @@ impl AccountsDb {
                             let mut reader =
                                 append_vec::full_scan_accounts_reader(reader_buf_size, &io_setup)
                                     .expect("create reader");
-                            for next_item in storages_orderer.iter() {
+                            let mut storages_orderer = storages_orderer.iter().peekable();
+                            if let Some(peeked_item) = storages_orderer.peek() {
+                                peeked_item
+                                    .storage
+                                    .prefetch_in_reader(&mut reader)
+                                    .expect("prefetch");
+                            }
+                            while let Some(next_item) = storages_orderer.next() {
+                                if let Some(peeked_item) = storages_orderer.peek() {
+                                    peeked_item
+                                        .storage
+                                        .prefetch_in_reader(&mut reader)
+                                        .expect("prefetch");
+                                }
                                 let storage = next_item.storage;
                                 self.generate_index_for_slot(
                                     &mut reader,
