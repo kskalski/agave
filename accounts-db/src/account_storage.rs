@@ -421,7 +421,7 @@ impl<'a> AccountStoragesConcurrentConsumer<'a> {
 
     /// Takes the next `AccountStorageEntry` moving shared consume position
     /// until the end of the entries source is reached.
-    pub fn next(&'a self) -> Option<NextItem<'a>> {
+    pub fn next_item(&'a self) -> Option<NextItem<'a>> {
         let position = self.current_position.fetch_add(1, Ordering::Relaxed);
         if position < self.orderer.entries_len() {
             // SAFETY: We have ensured `position` is in range.
@@ -446,7 +446,7 @@ impl<'a> AccountStoragesConcurrentConsumer<'a> {
             type Item = NextItem<'i>;
 
             fn next(&mut self) -> Option<Self::Item> {
-                self.consumer.next()
+                self.consumer.next_item()
             }
         }
         Iter { consumer: self }

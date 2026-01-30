@@ -9,12 +9,15 @@ use {
             error::TieredStorageError, hot::HOT_FORMAT, index::IndexOffset, TieredStorage,
         },
     },
-    agave_fs::{buffered_reader::RequiredLenBufFileRead, FileInfo},
+    agave_fs::{
+        buffered_reader::{FileBufRead, RequiredLenBufFileRead},
+        FileInfo,
+    },
     solana_account::AccountSharedData,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     std::{
-        mem,
+        io, mem,
         path::{Path, PathBuf},
     },
     thiserror::Error,
@@ -348,6 +351,16 @@ impl AccountsFile {
                     .expect("must be a reader when archiving")
                     .data_for_archive(),
             ),
+        }
+    }
+
+    pub(crate) fn prefetch_in_reader<'a>(
+        &'a self,
+        reader: &mut impl FileBufRead<'a>,
+    ) -> io::Result<()> {
+        match self {
+            Self::AppendVec(append_vec) => append_vec.pretch_in_reader(reader),
+            Self::TieredStorage(_) => Ok(()),
         }
     }
 }

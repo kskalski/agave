@@ -71,6 +71,8 @@ pub trait FileBufRead<'a>: BufRead {
     /// from the file (unless EOF is reached).
     fn set_file(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()>;
 
+    fn add_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()>;
+
     /// Returns the current file offset corresponding to the start of the buffer
     /// that will be returned by the next call to `fill_buf`.
     ///
@@ -149,6 +151,10 @@ impl<'a, const N: usize> BufferedReader<'a, N> {
 impl<'a, const N: usize> FileBufRead<'a> for BufferedReader<'a, N> {
     fn set_file(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
         self.do_set_file(file, read_limit);
+        Ok(())
+    }
+
+    fn add_prefetch(&mut self, _: &'a File, _: FileSize) -> io::Result<()> {
         Ok(())
     }
 
@@ -340,6 +346,10 @@ impl<'a, R: FileBufRead<'a>> FileBufRead<'a> for BufReaderWithOverflow<R> {
     fn set_file(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
         self.overflow_buf.clear();
         self.reader.set_file(file, read_limit)
+    }
+
+    fn add_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
+        self.reader.add_prefetch(file, read_limit)
     }
 
     fn get_file_offset(&self) -> FileSize {

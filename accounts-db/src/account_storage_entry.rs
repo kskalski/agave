@@ -5,9 +5,11 @@ use {
         accounts_file::{AccountsFile, AccountsFileError, AccountsFileProvider, StorageAccess},
         obsolete_accounts::ObsoleteAccounts,
     },
+    agave_fs::buffered_reader::FileBufRead,
     solana_clock::Slot,
     solana_nohash_hasher::IntSet,
     std::{
+        io,
         path::Path,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -245,6 +247,13 @@ impl AccountStorageEntry {
     /// Returns the path to the underlying accounts storage file
     pub fn path(&self) -> &Path {
         self.accounts.path()
+    }
+
+    pub(crate) fn prefetch_in_reader<'a>(
+        &'a self,
+        reader: &mut impl FileBufRead<'a>,
+    ) -> io::Result<()> {
+        self.accounts.prefetch_in_reader(reader)
     }
 }
 

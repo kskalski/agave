@@ -23,7 +23,7 @@ use {
     },
     agave_fs::{
         buffered_reader::{
-            BufReaderWithOverflow, BufferedReader, FileBufRead as _, RequiredLenBufFileRead,
+            BufReaderWithOverflow, BufferedReader, FileBufRead, RequiredLenBufFileRead,
             RequiredLenBufRead as _,
         },
         file_io::{read_into_buffer, write_buffer_to_file},
@@ -1335,6 +1335,16 @@ impl AppendVec {
             AppendVecFileBacking::File(_file) => InternalsForArchive::FileIo(self.path()),
             // note this returns the entire mmap slice, even bytes that we consider invalid
             AppendVecFileBacking::Mmap(mmap) => InternalsForArchive::Mmap(mmap),
+        }
+    }
+
+    pub(crate) fn pretch_in_reader<'a>(
+        &'a self,
+        reader: &mut impl FileBufRead<'a>,
+    ) -> io::Result<()> {
+        match &self.backing {
+            AppendVecFileBacking::File(file) => reader.add_prefetch(file, self.file_size),
+            AppendVecFileBacking::Mmap(_) => Ok(()),
         }
     }
 }

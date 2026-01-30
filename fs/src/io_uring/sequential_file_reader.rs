@@ -458,6 +458,10 @@ impl<'a> FileBufRead<'a> for SequentialFileReader<'a> {
         Ok(())
     }
 
+    fn add_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
+        self.add_file_to_prefetch(file, read_limit)
+    }
+
     fn get_file_offset(&self) -> FileSize {
         self.state.current_offset
     }
