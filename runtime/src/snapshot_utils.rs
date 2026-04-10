@@ -725,7 +725,11 @@ fn deserialize_obsolete_accounts(
     let obsolete_accounts_path = bank_snapshot_dir
         .as_ref()
         .join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
-    let obsolete_accounts_file = fs::File::open(&obsolete_accounts_path)?;
+    let obsolete_accounts_file = agave_fs::buffered_reader::large_file_buf_reader(
+        &obsolete_accounts_path,
+        4 << 20,
+        &IoSetupState::default(),
+    )?;
     // If the file is too large return error
     let obsolete_accounts_file_metadata = fs::metadata(&obsolete_accounts_path)?;
     if obsolete_accounts_file_metadata.len() > maximum_obsolete_accounts_file_size {

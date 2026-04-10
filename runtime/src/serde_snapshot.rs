@@ -383,12 +383,12 @@ where
     wincode::config::serialize_into(WriteAdapter::new(writer), value, MaxStreamSizeConfig::new())
 }
 
-pub(crate) fn deserialize_wincode_from<R, T>(reader: R) -> wincode::ReadResult<T>
+pub(crate) fn deserialize_wincode_from<'a, R, T>(reader: R) -> wincode::ReadResult<T>
 where
-    R: Read,
+    R: wincode::io::Reader<'a>,
     T: SchemaReadOwned<MaxStreamSizeConfig, Dst = T>,
 {
-    wincode::config::deserialize_from(io::BufReader::new(reader), MaxStreamSizeConfig::new())
+    wincode::config::deserialize_from(reader, MaxStreamSizeConfig::new())
 }
 
 pub(crate) fn deserialize_from<R, T>(reader: R) -> bincode::Result<T>

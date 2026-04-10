@@ -22,6 +22,7 @@ use {
         path::Path,
         slice,
     },
+    wincode::io::Reader,
 };
 
 // Based on transfers seen with `dd bs=SIZE` for NVME drives: values >=64KiB are fine,
@@ -846,6 +847,38 @@ impl RingOp<BuffersState> for ReadOp {
             };
         }
 
+        Ok(())
+    }
+}
+
+impl<'a> Reader<'a> for SequentialFileReader<'a> {
+    fn copy_into_slice(
+        &mut self,
+        mut dst: &mut [mem::MaybeUninit<u8>],
+    ) -> wincode::io::ReadResult<()> {
+        while !dst.is_empty() {
+            if self.state.current_buf_pos == self.state.current_buf_len
+                && !self.wait_current_buf_full()?
+            {
+                return Err(wincode::io::read_size_limit(dst.len()));
+            }
+            let amt = dst
+                .len()
+                .min((self.state.current_buf_len - self.state.current_buf_pos) as usize);
+
+            // At this point we must have data or be at EOF.
+            let current_buf = self.ring.context().get_fast(self.state.current_buf_index);
+            let (copy_dst, rest) = dst.split_at_mut(amt);
+            copy_dst.copy_from_slice(unsafe {
+                mem::transmute::<&[u8], &[std::mem::MaybeUninit<u8>]>(current_buf.slice(
+                    self.state.current_buf_pos,
+                    self.state.current_buf_pos + amt as IoSize,
+                ))
+            });
+
+            self.state.consume(amt);
+            dst = rest;
+        }
         Ok(())
     }
 }

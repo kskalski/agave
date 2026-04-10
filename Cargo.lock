@@ -109,6 +109,7 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
+ "wincode",
 ]
 
 [[package]]

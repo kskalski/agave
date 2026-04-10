@@ -391,11 +391,11 @@ impl<R: BufRead> RequiredLenBufRead for BufReaderWithOverflow<R> {
 
 /// Open file at `path` with buffering reader using `buf_size` memory and doing
 /// read-ahead IO reads (if `io_uring` is supported by the platform)
-pub fn large_file_buf_reader(
+pub fn large_file_buf_reader<'a>(
     path: &Path,
     buf_size: usize,
     io_setup: &IoSetupState,
-) -> io::Result<impl BufRead + use<>> {
+) -> io::Result<impl BufRead + wincode::io::Reader<'a> + use<'a>> {
     #[cfg(target_os = "linux")]
     {
         assert!(agave_io_uring::io_uring_supported());
