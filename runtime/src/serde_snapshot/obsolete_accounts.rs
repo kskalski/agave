@@ -93,6 +93,10 @@ impl SerdeObsoleteAccountsMap {
         SerdeObsoleteAccountsMap { map }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
     pub(crate) fn into_dashmap(self) -> DashMap<Slot, SerdeObsoleteAccounts> {
         self.map.into_iter().collect()
     }

@@ -770,14 +770,16 @@ fn deserialize_obsolete_accounts(
     bank_snapshot_dir: impl AsRef<Path>,
     maximum_obsolete_accounts_file_size: u64,
 ) -> Result<SerdeObsoleteAccountsMap> {
+    let t = std::time::Instant::now();
     let obsolete_accounts_path = bank_snapshot_dir
         .as_ref()
         .join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
-    let obsolete_accounts_reader = ReadAdapter::new(large_file_buf_reader(
-        &obsolete_accounts_path,
-        OBSOLETE_ACCOUNTS_READ_BUF_SIZE,
-        &IoSetupState::default(),
-    )?);
+    let obsolete_accounts_reader = //BufReader::new(fs::File::open(&obsolete_accounts_path)?);
+    ReadAdapter::new(large_file_buf_reader(
+    &obsolete_accounts_path,
+    OBSOLETE_ACCOUNTS_READ_BUF_SIZE,
+    &IoSetupState::default(),
+       )?);
     // If the file is too large return error
     let obsolete_accounts_file_metadata = fs::metadata(&obsolete_accounts_path)?;
     if obsolete_accounts_file_metadata.len() > maximum_obsolete_accounts_file_size {
@@ -789,10 +791,52 @@ fn deserialize_obsolete_accounts(
         );
         return Err(IoError::other(error_message).into());
     }
+    let map = serde_snapshot::deserialize_wincode_from(obsolete_accounts_reader)?;
+    info!("deserialized obsolete accounts in {:?}", t.elapsed());
 
-    Ok(serde_snapshot::deserialize_wincode_from(
-        obsolete_accounts_reader,
-    )?)
+    Ok(map)
+}
+
+/// Read obsolete accounts from `path` using a plain `BufReader`. Returns the entry count.
+/// Kept `#[inline(never)]` so the code path is visible as a distinct symbol in assembly.
+#[inline(never)]
+pub fn read_obsolete_accounts_bufreader(
+    path: &Path,
+    maximum_obsolete_accounts_file_size: u64,
+) -> Result<usize> {
+    let file_len = fs::metadata(path)?.len();
+    if file_len > maximum_obsolete_accounts_file_size {
+        return Err(IoError::other(format!(
+            "too large obsolete accounts file: {file_len} bytes"
+        ))
+        .into());
+    }
+    let reader = BufReader::new(fs::File::open(path)?);
+    let map: SerdeObsoleteAccountsMap = serde_snapshot::deserialize_wincode_from(reader)?;
+    Ok(map.len())
+}
+
+/// Read obsolete accounts from `path` using `large_file_buf_reader` (io-uring). Returns the entry count.
+/// Kept `#[inline(never)]` so the code path is visible as a distinct symbol in assembly.
+#[inline(never)]
+pub fn read_obsolete_accounts_large_file_buf_reader(
+    path: &Path,
+    maximum_obsolete_accounts_file_size: u64,
+) -> Result<usize> {
+    let file_len = fs::metadata(path)?.len();
+    if file_len > maximum_obsolete_accounts_file_size {
+        return Err(IoError::other(format!(
+            "too large obsolete accounts file: {file_len} bytes"
+        ))
+        .into());
+    }
+    let reader = ReadAdapter::new(large_file_buf_reader(
+        path,
+        OBSOLETE_ACCOUNTS_READ_BUF_SIZE,
+        &IoSetupState::default(),
+    )?);
+    let map: SerdeObsoleteAccountsMap = serde_snapshot::deserialize_wincode_from(reader)?;
+    Ok(map.len())
 }
 
 pub fn serialize_snapshot_data_file<F>(
@@ -2733,6 +2777,18 @@ mod tests {
             let obsolete_accounts = deserialized_accounts.remove(&storage.slot()).unwrap().1;
             assert!(obsolete_accounts.into_tuple().2 == 0);
         }
+    }
+
+    #[test]
+    fn deser_obosl() {
+        let t = std::time::Instant::now();
+        let map = deserialize_obsolete_accounts(
+            "/mnt/plain/agave_target/tmp/",
+            MAX_OBSOLETE_ACCOUNTS_FILE_SIZE,
+        )
+        .unwrap();
+        println!("deser {:?}", t.elapsed());
+        println!("map {}", map.into_dashmap().len());
     }
 
     #[test]

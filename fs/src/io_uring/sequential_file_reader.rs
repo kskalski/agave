@@ -62,7 +62,6 @@ impl<'sp> SequentialFileReaderBuilder<'sp> {
     /// Override the default size of a single IO read operation
     ///
     /// This influences the concurrency, since buffer is divided into chunks of this size.
-    #[cfg(test)]
     pub fn read_capacity(mut self, read_capacity: IoSize) -> Self {
         self.read_capacity = read_capacity;
         self
@@ -570,6 +569,7 @@ impl SequentialFileReaderState {
 
     fn consume_or_skip(&mut self, amt: usize) {
         if amt == 0 || self.files.is_empty() {
+            std::hint::cold_path();
             return;
         }
         self.current_offset += amt as FileSize;
@@ -579,6 +579,7 @@ impl SequentialFileReaderState {
             self.current_buf_pos += amt as IoSize;
             self.current_buf_remaining = new_remaining as IoSize;
         } else {
+            std::hint::cold_path();
             self.current_buf_pos += self.current_buf_remaining;
             self.current_buf_remaining = 0;
             // Keep track of any bytes left to consume beyond current buffer, they will be
