@@ -36,6 +36,7 @@ use {
             stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         },
         account_storage_entry::AccountStorageEntry,
+        account_storage_reader::{AccountStorageReader, storage_file_buf_reader},
         accounts_cache::{AccountsCache, CachedAccount, SlotCache, SlotStatus},
         accounts_db::stats::{
             AccountsStats, CleanAccountsStats, FlushStats, LoadAccountsStats,
@@ -63,7 +64,7 @@ use {
         u64_align,
         utils::{self, create_account_shared_data},
     },
-    agave_fs::buffered_reader::RequiredLenBufFileRead,
+    agave_fs::{buffered_reader::RequiredLenBufFileRead, io_setup::IoSetupState},
     bv::BitVec,
     dashmap::{DashMap, DashSet},
     log::*,
@@ -6062,6 +6063,56 @@ impl AccountsDb {
         }
     }
 
+    /// Reads every storage through `AccountStorageReader` and pipes tar entries through
+    /// a zstd encoder into `io::sink()`. Mirrors the single-threaded read+tar+zstd path
+    /// used by `snapshots::archive::archive_snapshot`, but drops the encoded bytes
+    /// instead of writing them to a file, so the read+compress side can be tuned
+    /// without paying for output IO.
+    pub fn read_archive_storages_into_sink(
+        storages: &[Arc<AccountStorageEntry>],
+        io_setup: &IoSetupState,
+        zstd_compression_level: i32,
+    ) {
+        const ACCOUNTS_DIR: &str = "accounts";
+        const ACCOUNT_STORAGE_MAX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+        const INTERLEAVE_TAR_ENTRIES_SMALL_TO_LARGE_RATIO: (usize, usize) = (4, 1);
+
+        let mut timer = Measure::start("read_archive_storages_into_sink");
+        let storages_orderer = AccountStoragesOrderer::with_small_to_large_ratio(
+            storages,
+            INTERLEAVE_TAR_ENTRIES_SMALL_TO_LARGE_RATIO,
+        );
+        let mut encoder = zstd::stream::Encoder::new(io::sink(), zstd_compression_level)
+            .expect("create zstd encoder");
+        {
+            let mut archive = tar::Builder::new(&mut encoder);
+            archive.sparse(false);
+            let mut buf_reader = storage_file_buf_reader(ACCOUNT_STORAGE_MAX_BUFFER_SIZE, io_setup)
+                .expect("init storage buf reader");
+            for storage in storages_orderer.iter() {
+                let path_in_archive = Path::new(ACCOUNTS_DIR)
+                    .join(AccountsFile::file_name(storage.slot(), storage.id()));
+                let reader = AccountStorageReader::new(storage, None, &mut buf_reader)
+                    .expect("AccountStorageReader::new");
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path_in_archive).expect("set tar path");
+                header.set_size(reader.len() as u64);
+                header.set_cksum();
+                archive
+                    .append(&header, reader)
+                    .expect("append storage to tar");
+            }
+            archive.into_inner().expect("finish tar archive");
+        }
+        encoder.finish().expect("finish zstd encoder");
+        timer.stop();
+        info!(
+            "read_archive_storages_into_sink: read {} storages in {} ms",
+            storages.len(),
+            timer.as_ms(),
+        );
+    }
+
     pub fn generate_index(
         &self,
         limit_load_slot_count_from_snapshot: Option<usize>,
@@ -6077,6 +6128,12 @@ impl AccountsDb {
         let num_storages = storages.len();
 
         self.accounts_index.set_startup(Startup::Startup);
+
+        Self::read_archive_storages_into_sink(
+            &storages,
+            &IoSetupState::default().with_buffers_registered(true),
+            0,
+        );
 
         let mut total_accum = IndexGenerationAccumulator::with_slots_capacity(num_storages);
         let storages_orderer =
