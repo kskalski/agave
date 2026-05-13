@@ -24,7 +24,7 @@ pub fn storage_file_buf_reader<'a>(
     max_buf_size: usize,
     use_page_cache: bool,
     io_setup: &IoSetupState,
-) -> io::Result<impl FileBufRead<'a> + use<'a>> {
+) -> io::Result<buffered_reader::SequentialFileReader<'a>> {
     #[cfg(target_os = "linux")]
     let reader = buffered_reader::SequentialFileReaderBuilder::new()
         .shared_sqpoll(io_setup.shared_sqpoll_fd())

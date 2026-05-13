@@ -13,6 +13,7 @@
 //!
 //! When reading full accounts data whose sizes exceed the small stack buffer, the `BufReaderWithOverflow`
 //! should be used, which supports dynamically allocated buffer for preparing contiguous data slices.
+pub use crate::io_uring::sequential_file_reader::SequentialFileReader;
 #[cfg(target_os = "linux")]
 pub use crate::io_uring::sequential_file_reader::SequentialFileReaderBuilder;
 use {

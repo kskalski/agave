@@ -251,7 +251,7 @@ impl<'a> SequentialFileReader<'a> {
         Ok(())
     }
 
-    fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
+    pub fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
         self.add_file_by_fd(file.as_raw_fd(), read_limit)
     }
 

@@ -6089,7 +6089,24 @@ impl AccountsDb {
             archive.sparse(false);
             let mut buf_reader = storage_file_buf_reader(ACCOUNT_STORAGE_MAX_BUFFER_SIZE, io_setup)
                 .expect("init storage buf reader");
-            for storage in storages_orderer.iter() {
+            let mut iter = storages_orderer.iter().peekable();
+            if let Some(next) = iter.peek() {
+                buf_reader
+                    .add_file_to_prefetch(
+                        next.accounts.internals_for_archive().file,
+                        next.accounts.len() as u64,
+                    )
+                    .unwrap();
+            }
+            while let Some(storage) = iter.next() {
+                if let Some(next) = iter.peek() {
+                    buf_reader
+                        .add_file_to_prefetch(
+                            next.accounts.internals_for_archive().file,
+                            next.accounts.len() as u64,
+                        )
+                        .unwrap();
+                }
                 let path_in_archive = Path::new(ACCOUNTS_DIR)
                     .join(AccountsFile::file_name(storage.slot(), storage.id()));
                 let reader = AccountStorageReader::new(storage, None, &mut buf_reader)
