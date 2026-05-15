@@ -36,6 +36,7 @@ const DEFAULT_MAX_IOWQ_WORKERS: u32 = 2;
 const DIRECT_IO_READ_LEN_ALIGNMENT: IoSize = 4096;
 
 /// Utility for building `SequentialFileReader` with specified tuning options.
+#[derive(Debug, Default)]
 pub struct SequentialFileReaderBuilder<'sp> {
     read_capacity: IoSize,
     max_iowq_workers: u32,
