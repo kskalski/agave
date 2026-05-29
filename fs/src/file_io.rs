@@ -267,6 +267,72 @@ impl FileCreator for SyncIoFileCreator<'_> {
     }
 }
 
+/// An asynchronous queue for file opening.
+pub trait FileOpener {
+    /// Schedule opening an existing file at `path`.
+    ///
+    /// `parent_dir_handle` is assumed to be a parent directory of `path` such that file may be
+    /// opened using optimized kernel API to open `path.file_name()` inside `parent_dir_handle`.
+    fn schedule_open_at_dir(
+        &mut self,
+        path: PathBuf,
+        _parent_dir_handle: Arc<File>,
+    ) -> io::Result<()>;
+
+    /// Schedule opening every file directly contained in `dir_path`.
+    ///
+    /// Opens `dir_path` once and reuses its handle to open each entry via the optimized
+    /// `schedule_open_at_dir` path.
+    fn schedule_open_dir_files(&mut self, dir_path: &Path) -> io::Result<()> {
+        let dir_handle = Arc::new(File::open(dir_path)?);
+        for entry in fs::read_dir(dir_path)? {
+            self.schedule_open_at_dir(entry?.path(), dir_handle.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Waits for all operations to be completed
+    fn drain(&mut self) -> io::Result<()>;
+}
+
+pub struct SyncIoFileOpener<'a> {
+    file_open: Box<dyn FnMut(FileInfo) + 'a>,
+}
+
+impl FileOpener for SyncIoFileOpener<'_> {
+    fn schedule_open_at_dir(
+        &mut self,
+        path: PathBuf,
+        _parent_dir_handle: Arc<File>,
+    ) -> io::Result<()> {
+        let file = File::open(&path)?;
+        let file_info = FileInfo::new_from_path_and_file(path, file)?;
+        (self.file_open)(file_info);
+        Ok(())
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn file_opener<'a>(file_open: impl FnMut(FileInfo) + 'a) -> io::Result<impl FileOpener + 'a> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::io_uring::file_opener::IoUringFileOpener;
+
+        assert!(agave_io_uring::io_uring_supported());
+        let io_uring_opener = IoUringFileOpener::new(file_open)?;
+        Ok(io_uring_opener)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(SyncIoFileOpener {
+            file_open: Box::new(file_open),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -494,5 +560,24 @@ mod tests {
         assert_eq!(&read_buf, contents);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_file_opener() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_file1_path = temp_dir.path().join("file1");
+        fs::write(&temp_file1_path, "file1").unwrap();
+
+        let mut opener = file_opener(|file_info| {
+            assert_eq!(file_info.path, temp_file1_path);
+        })
+        .unwrap();
+        opener
+            .schedule_open_at_dir(
+                temp_file1_path.clone(),
+                Arc::new(File::open(temp_dir.path()).unwrap()),
+            )
+            .unwrap();
+        opener.drain().unwrap();
     }
 }

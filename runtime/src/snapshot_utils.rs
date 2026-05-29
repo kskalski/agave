@@ -17,6 +17,7 @@ use {
         FileInfo, FileSize,
         buffered_reader::large_file_buf_reader,
         buffered_writer::{SizeLimitedWriter, large_file_buf_writer},
+        file_io::{self, FileOpener},
         io_setup::IoSetupState,
     },
     agave_snapshots::{
@@ -33,7 +34,7 @@ use {
         snapshot_hash::SnapshotHash,
         streaming_unarchive_snapshot,
     },
-    crossbeam_channel::Receiver,
+    crossbeam_channel::{Receiver, SendError},
     log::*,
     regex::Regex,
     semver::Version,
@@ -57,7 +58,7 @@ use {
         num::NonZeroUsize,
         path::{Path, PathBuf},
         str::FromStr,
-        sync::{Arc, LazyLock},
+        sync::{Arc, LazyLock, OnceLock},
         thread,
     },
     tempfile::TempDir,
@@ -1313,15 +1314,24 @@ fn spawn_streaming_snapshot_dir_files(
             let snapshot_version_file_info = FileInfo::new_from_path(snapshot_version_path)?;
             file_sender.send(snapshot_version_file_info)?;
 
-            for account_path in account_paths {
-                for dir_entry_result in fs::read_dir(account_path)? {
-                    let dir_entry = dir_entry_result?;
-                    let path = dir_entry.path();
-                    let file_info = FileInfo::new_from_path(path)?;
-                    file_sender.send(file_info)?;
+            let first_failed_send = OnceLock::<PathBuf>::new();
+            let first_failed_send_ref = &first_failed_send;
+            let mut file_opener = file_io::file_opener(move |file_info| {
+                if let Err(SendError(FileInfo { path, .. })) = file_sender.send(file_info) {
+                    let _ = first_failed_send_ref.set(path);
                 }
+            })?;
+            for account_path in account_paths {
+                file_opener.schedule_open_dir_files(&account_path)?;
             }
-            Ok::<_, SnapshotError>(())
+            file_opener.drain()?;
+            // Drop the opener (and its borrow of `first_failed_send`) before consuming the cell.
+            drop(file_opener);
+
+            if let Some(path) = first_failed_send.into_inner() {
+                return Err(SnapshotError::CrossbeamSend(SendError(path)));
+            }
+            Ok(())
         })
         .expect("should spawn thread");
 
