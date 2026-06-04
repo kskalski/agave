@@ -734,6 +734,7 @@ fn serialize_obsolete_accounts(
 fn deserialize_obsolete_accounts(
     bank_snapshot_dir: impl AsRef<Path>,
     maximum_obsolete_accounts_file_size: u64,
+    io_setup: &IoSetupState,
 ) -> Result<SerdeObsoleteAccountsMap> {
     let obsolete_accounts_path = bank_snapshot_dir
         .as_ref()
@@ -741,7 +742,7 @@ fn deserialize_obsolete_accounts(
     let obsolete_accounts_reader = ReadAdapter::new(large_file_buf_reader(
         &obsolete_accounts_path,
         AUX_SNAPSHOT_FILE_READ_BUF_SIZE,
-        &IoSetupState::default(),
+        io_setup,
     )?);
     // If the file is too large return error
     let obsolete_accounts_file_metadata = fs::metadata(&obsolete_accounts_path)?;
@@ -793,11 +794,12 @@ fn serialize_storages_list_to_snapshot(
 fn deserialize_storages_list(
     storages_list_path: &Path,
     maximum_storages_list_file_size: u64,
+    io_setup: &IoSetupState,
 ) -> Result<StoragesList> {
     let storages_list_reader = ReadAdapter::new(large_file_buf_reader(
         storages_list_path,
         AUX_SNAPSHOT_FILE_READ_BUF_SIZE,
-        &IoSetupState::default(),
+        io_setup,
     )?);
     // If the file is too large return error
     let storages_list_file_metadata = fs::metadata(storages_list_path)?;
@@ -1481,6 +1483,7 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
     snapshot_info: &BankSnapshotInfo,
     account_paths: &[PathBuf],
     next_append_vec_id: Arc<AtomicAccountsFileId>,
+    io_setup: &IoSetupState,
 ) -> Result<(
     AccountStorageMap,
     BankFieldsToDeserialize,
@@ -1495,7 +1498,13 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
         .fastboot_version
         .as_ref()
         .is_some_and(|fastboot_version| fastboot_version.major >= 2)
-        .then(|| deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE))
+        .then(|| {
+            deserialize_obsolete_accounts(
+                bank_snapshot_dir,
+                MAX_OBSOLETE_ACCOUNTS_FILE_SIZE,
+                io_setup,
+            )
+        })
         .transpose()
         .map_err(|err| {
             IoError::other(format!(
@@ -1518,7 +1527,7 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
         migrate_legacy_hardlinks(bank_snapshot_dir, account_paths)?;
     }
     let storages_list =
-        deserialize_storages_list(&storages_list_path, MAX_STORAGES_LIST_FILE_SIZE)?;
+        deserialize_storages_list(&storages_list_path, MAX_STORAGES_LIST_FILE_SIZE, io_setup)?;
     prune_stale_storages(account_paths, storages_list)?;
 
     let snapshot_file_path = snapshot_info.snapshot_path();
@@ -2718,10 +2727,13 @@ mod tests {
         .unwrap();
 
         // Deserialize
-        let mut deserialized_accounts =
-            deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE)
-                .unwrap()
-                .into_hashmap();
+        let mut deserialized_accounts = deserialize_obsolete_accounts(
+            bank_snapshot_dir,
+            MAX_OBSOLETE_ACCOUNTS_FILE_SIZE,
+            &IoSetupState::default(),
+        )
+        .unwrap()
+        .into_hashmap();
 
         // Verify
         for storage in &snapshot_storages {
@@ -2797,7 +2809,7 @@ mod tests {
 
         // Set a very low maximum file size for deserialization
         // This should panic
-        deserialize_obsolete_accounts(bank_snapshot_dir, 100).unwrap();
+        deserialize_obsolete_accounts(bank_snapshot_dir, 100, &IoSetupState::default()).unwrap();
     }
 
     #[test]

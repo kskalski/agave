@@ -376,6 +376,8 @@ pub fn bank_from_snapshot_dir(
         bank_snapshot.snapshot_dir.display()
     );
 
+    let io_setup = IoSetupState::default().with_shared_sqpoll()?;
+
     // Storages from this snapshot already live under `account_paths`; the storages list
     // inside the bank snapshot dir tells us which ones belong to it, and stale files
     // (e.g. from later slots) are pruned by `rebuild_storages_from_snapshot_dir`.
@@ -387,6 +389,7 @@ pub fn bank_from_snapshot_dir(
             bank_snapshot,
             account_paths,
             next_append_vec_id.clone(),
+            &io_setup,
         )?,
         "rebuild storages from snapshot dir"
     );
