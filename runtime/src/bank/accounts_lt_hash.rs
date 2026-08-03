@@ -66,6 +66,14 @@ impl Bank {
             if prev_account.is_none() && curr_account.is_none() {
                 // the account was ephemeral; skip it
             } else {
+                // If the previous and current versions are identical, this account was written
+                // by the transaction but not actually modified. This is what the
+                // `bank-accounts_lt_hash.mean_num_accounts_unmodified` metric counts; the
+                // mix_out/mix_in of an unchanged account cancel out and cost us cycles for no
+                // reason. Log context + a backtrace so the offending code path can be found.
+                if prev_account == curr_account {
+                    debug_log_unmodified_account(self.slot(), address, prev_account.as_ref());
+                }
                 // the account was modified; enqueue this update
                 async_progress.spawn(
                     thread_pool,
@@ -144,6 +152,11 @@ impl Bank {
             if prev_account.is_none() && curr_account.is_none() {
                 // the account was ephemeral; skip it
             } else {
+                // See enqueue_on_chain_accounts_lt_hash_updates() for details; an identical
+                // prev/curr means the account was written but not modified.
+                if prev_account == curr_account {
+                    debug_log_unmodified_account(self.slot(), address, prev_account.as_ref());
+                }
                 // the account was modified; enqueue this update
                 async_progress.spawn(
                     thread_pool_for_hashing_accounts,
@@ -210,6 +223,43 @@ impl Bank {
             ),
         );
     }
+}
+
+/// Debug instrumentation for `bank-accounts_lt_hash.mean_num_accounts_unmodified`.
+///
+/// Emits a backtrace plus account context when an account is written by a transaction (or other
+/// on/off-chain event) without actually being modified, i.e. its previous and current versions are
+/// identical. Enable at runtime by setting the `AGAVE_DEBUG_UNMODIFIED_ACCOUNTS` env var (any
+/// non-empty value) so the (relatively expensive) backtrace capture stays off by default.
+fn debug_log_unmodified_account(
+    slot: solana_clock::Slot,
+    address: &Pubkey,
+    account: Option<&AccountSharedData>,
+) {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("AGAVE_DEBUG_UNMODIFIED_ACCOUNTS").is_some());
+    if !*ENABLED {
+        return;
+    }
+
+    let (lamports, owner, data_len, executable, rent_epoch) = match account {
+        Some(account) => (
+            account.lamports(),
+            *account.owner(),
+            account.data().len(),
+            account.executable(),
+            account.rent_epoch(),
+        ),
+        // Both prev and curr being None is the ephemeral case handled by the caller, so an
+        // equal-but-None pair should not reach here; guard just in case.
+        None => Default::default(),
+    };
+    eprintln!(
+        "unmodified account written in lt_hash update: slot={slot} address={address} \
+         lamports={lamports} owner={owner} data_len={data_len} executable={executable} \
+         rent_epoch={rent_epoch}\n{}",
+        std::backtrace::Backtrace::force_capture(),
+    );
 }
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
