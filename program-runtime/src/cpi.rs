@@ -1154,7 +1154,13 @@ fn update_callee_account(
     } else {
         // The redundant check helps to avoid the expensive data comparison if we can
         match callee_account.can_data_be_resized(caller_account.serialized_data.len()) {
-            Ok(()) => callee_account.set_data_from_slice(caller_account.serialized_data)?,
+            // DEBUG(unmodified accounts): only write (and thus touch) when the data actually
+            // changed. The previous unconditional write marked no-op writes as modified;
+            // see bank-accounts_lt_hash.mean_num_accounts_unmodified.
+            Ok(()) if callee_account.get_data() != caller_account.serialized_data => {
+                callee_account.set_data_from_slice(caller_account.serialized_data)?
+            }
+            Ok(()) => {}
             Err(err) if callee_account.get_data() != caller_account.serialized_data => {
                 return Err(Box::new(err));
             }

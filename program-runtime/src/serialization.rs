@@ -463,7 +463,13 @@ fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>>(
                     .ok_or(InstructionError::InvalidArgument)?;
                 // The redundant check helps to avoid the expensive data comparison if we can
                 match borrowed_account.can_data_be_resized(pre_len) {
-                    Ok(()) => borrowed_account.set_data_from_slice(data)?,
+                    // DEBUG(unmodified accounts): only write (and thus touch) when the data
+                    // actually changed. The previous unconditional write marked no-op writes
+                    // as modified; see bank-accounts_lt_hash.mean_num_accounts_unmodified.
+                    Ok(()) if borrowed_account.get_data() != data => {
+                        borrowed_account.set_data_from_slice(data)?
+                    }
+                    Ok(()) => {}
                     Err(err) if borrowed_account.get_data() != data => return Err(err),
                     _ => {}
                 }
@@ -665,7 +671,13 @@ fn deserialize_parameters_for_abiv1<I: IntoIterator<Item = usize>>(
                     .ok_or(InstructionError::InvalidArgument)?;
                 // The redundant check helps to avoid the expensive data comparison if we can
                 match borrowed_account.can_data_be_resized(post_len) {
-                    Ok(()) => borrowed_account.set_data_from_slice(data)?,
+                    // DEBUG(unmodified accounts): only write (and thus touch) when the data
+                    // actually changed. The previous unconditional write marked no-op writes
+                    // as modified; see bank-accounts_lt_hash.mean_num_accounts_unmodified.
+                    Ok(()) if borrowed_account.get_data() != data => {
+                        borrowed_account.set_data_from_slice(data)?
+                    }
+                    Ok(()) => {}
                     Err(err) if borrowed_account.get_data() != data => return Err(err),
                     _ => {}
                 }
