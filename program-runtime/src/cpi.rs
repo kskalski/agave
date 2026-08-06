@@ -1148,12 +1148,11 @@ fn update_callee_account(
             // pointer to data may have changed, so caller must be updated
             must_update_caller = true;
         }
-        if !account_data_direct_mapping
-            && callee_account.can_data_be_changed().is_ok()
-            // DEBUG(unmodified accounts): only write (and thus touch) on a real change.
-            && callee_account.get_data() != caller_account.serialized_data
-        {
-            callee_account.set_data_from_slice(caller_account.serialized_data)?;
+        if !account_data_direct_mapping && callee_account.can_data_be_changed().is_ok() {
+            solana_transaction_context::debug_unmodified::write_data_observed(
+                &mut callee_account,
+                caller_account.serialized_data,
+            )?;
         }
     } else {
         // The redundant check helps to avoid the expensive data comparison if we can
@@ -1161,10 +1160,10 @@ fn update_callee_account(
             // DEBUG(unmodified accounts): only write (and thus touch) when the data actually
             // changed. The previous unconditional write marked no-op writes as modified;
             // see bank-accounts_lt_hash.mean_num_accounts_unmodified.
-            Ok(()) if callee_account.get_data() != caller_account.serialized_data => {
-                callee_account.set_data_from_slice(caller_account.serialized_data)?
-            }
-            Ok(()) => {}
+            Ok(()) => solana_transaction_context::debug_unmodified::write_data_observed(
+                &mut callee_account,
+                caller_account.serialized_data,
+            )?,
             Err(err) if callee_account.get_data() != caller_account.serialized_data => {
                 return Err(Box::new(err));
             }

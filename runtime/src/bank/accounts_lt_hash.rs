@@ -9,6 +9,7 @@ use {
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
+    solana_transaction_context::debug_unmodified,
     std::{
         array, hint,
         mem::size_of,
@@ -71,7 +72,7 @@ impl Bank {
                 // `bank-accounts_lt_hash.mean_num_accounts_unmodified` metric counts; the
                 // mix_out/mix_in of an unchanged account cancel out and cost us cycles for no
                 // reason.
-                if debug_unmodified_accounts_enabled() && prev_account == curr_account {
+                if debug_unmodified::enabled() && prev_account == curr_account {
                     // Count how many times this account appears across the batch, to tell a
                     // no-op write apart from several writes that net out. Only done when the
                     // debug instrumentation is on, since it is O(batch len) per hit.
@@ -100,6 +101,11 @@ impl Bank {
 
         // reclaim the seen accounts hashset
         seen_accounts_freelist.try_push(seen_accounts);
+
+        // This batch has been attributed; start the next one with a clean slate. Execution and
+        // commit for a batch happen on the same thread, so the per-account counts recorded
+        // during execution are still visible above.
+        debug_unmodified::clear_batch();
     }
 
     /// Enqueues the accounts lt hash updates for `accounts` to the accounts hasher thread pool.
@@ -167,7 +173,7 @@ impl Bank {
                 // See enqueue_on_chain_accounts_lt_hash_updates() for details; an identical
                 // prev/curr means the account was written but not modified. This path forbids
                 // duplicates, so occurrences is always 1.
-                if debug_unmodified_accounts_enabled() && prev_account == curr_account {
+                if debug_unmodified::enabled() && prev_account == curr_account {
                     debug_log_unmodified_account(
                         self.slot(),
                         address,
@@ -240,18 +246,41 @@ impl Bank {
                 seen_accounts_freelist_stats.capacity_bytes,
                 i64
             ),
+            // Cumulative attribution of unmodified-account writes. Round trips are inherent to
+            // the transactions themselves; no-op writes are suppressible at the write site, and
+            // `suppressed_noop_writes` counts the ones already being suppressed.
+            (
+                "unmodified_lamports_roundtrip",
+                debug_unmodified::lamports_roundtrip(),
+                i64
+            ),
+            (
+                "unmodified_data_roundtrip",
+                debug_unmodified::data_roundtrip(),
+                i64
+            ),
+            (
+                "unmodified_noop_data_write",
+                debug_unmodified::noop_data_write(),
+                i64
+            ),
+            (
+                "unmodified_inconsistent",
+                debug_unmodified::inconsistent(),
+                i64
+            ),
+            (
+                "unmodified_unattributed",
+                debug_unmodified::unattributed(),
+                i64
+            ),
+            (
+                "noop_data_writes_seen",
+                debug_unmodified::noop_data_writes_seen(),
+                i64
+            ),
         );
     }
-}
-
-/// Whether the unmodified-accounts debug instrumentation is enabled.
-///
-/// Gated on the `AGAVE_DEBUG_UNMODIFIED_ACCOUNTS` env var (any non-empty value) so the extra
-/// work stays off by default. Callers check this *before* computing any diagnostic context.
-fn debug_unmodified_accounts_enabled() -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("AGAVE_DEBUG_UNMODIFIED_ACCOUNTS").is_some());
-    *ENABLED
 }
 
 /// Debug instrumentation for `bank-accounts_lt_hash.mean_num_accounts_unmodified`.
@@ -288,16 +317,24 @@ fn debug_log_unmodified_account(
         // equal-but-None pair should not reach here; guard just in case.
         None => Default::default(),
     };
+    // Attribute the event to the field writes recorded for this account during the batch.
+    // `num_occurrences > 1` means several transactions wrote it and their net effect cancels,
+    // which is inherent to batching rather than a touch-tracking issue.
+    let changes = debug_unmodified::changes_for(address);
     let cause = if num_occurrences > 1 {
         "batch-netting"
     } else {
-        "no-op-write"
+        let cause = debug_unmodified::classify(&changes);
+        debug_unmodified::count(cause);
+        cause.as_str()
     };
     eprintln!(
         "unmodified account written in lt_hash update: cause={cause} slot={slot} \
          address={address} lamports={lamports} owner={owner} data_len={data_len} \
          executable={executable} rent_epoch={rent_epoch} num_occurrences={num_occurrences} \
-         batch_len={batch_len}",
+         batch_len={batch_len} changes_lamports={} changes_data={} changes_data_len={} \
+         changes_owner={}",
+        changes.lamports, changes.data, changes.data_len, changes.owner,
     );
 }
 

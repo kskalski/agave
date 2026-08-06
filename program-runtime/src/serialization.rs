@@ -466,10 +466,10 @@ fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>>(
                     // DEBUG(unmodified accounts): only write (and thus touch) when the data
                     // actually changed. The previous unconditional write marked no-op writes
                     // as modified; see bank-accounts_lt_hash.mean_num_accounts_unmodified.
-                    Ok(()) if borrowed_account.get_data() != data => {
-                        borrowed_account.set_data_from_slice(data)?
-                    }
-                    Ok(()) => {}
+                    Ok(()) => solana_transaction_context::debug_unmodified::write_data_observed(
+                        &mut borrowed_account,
+                        data,
+                    )?,
                     Err(err) if borrowed_account.get_data() != data => return Err(err),
                     _ => {}
                 }
@@ -478,10 +478,10 @@ fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>>(
                 let data = buffer
                     .get(start..start + pre_len)
                     .ok_or(InstructionError::InvalidArgument)?;
-                // DEBUG(unmodified accounts): only write (and thus touch) on a real change.
-                if borrowed_account.get_data() != data {
-                    borrowed_account.set_data_from_slice(data)?;
-                }
+                solana_transaction_context::debug_unmodified::write_data_observed(
+                    &mut borrowed_account,
+                    data,
+                )?;
             } else if borrowed_account.get_data().len() != pre_len {
                 borrowed_account.set_data_length(pre_len)?;
             }
@@ -677,10 +677,10 @@ fn deserialize_parameters_for_abiv1<I: IntoIterator<Item = usize>>(
                     // DEBUG(unmodified accounts): only write (and thus touch) when the data
                     // actually changed. The previous unconditional write marked no-op writes
                     // as modified; see bank-accounts_lt_hash.mean_num_accounts_unmodified.
-                    Ok(()) if borrowed_account.get_data() != data => {
-                        borrowed_account.set_data_from_slice(data)?
-                    }
-                    Ok(()) => {}
+                    Ok(()) => solana_transaction_context::debug_unmodified::write_data_observed(
+                        &mut borrowed_account,
+                        data,
+                    )?,
                     Err(err) if borrowed_account.get_data() != data => return Err(err),
                     _ => {}
                 }
@@ -689,10 +689,10 @@ fn deserialize_parameters_for_abiv1<I: IntoIterator<Item = usize>>(
                 let data = buffer
                     .get(start..start + post_len)
                     .ok_or(InstructionError::InvalidArgument)?;
-                // DEBUG(unmodified accounts): only write (and thus touch) on a real change.
-                if borrowed_account.get_data() != data {
-                    borrowed_account.set_data_from_slice(data)?;
-                }
+                solana_transaction_context::debug_unmodified::write_data_observed(
+                    &mut borrowed_account,
+                    data,
+                )?;
             } else if borrowed_account.get_data().len() != post_len {
                 borrowed_account.set_data_length(post_len)?;
             }

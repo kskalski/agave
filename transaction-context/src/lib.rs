@@ -3,6 +3,7 @@
 #![deny(clippy::indexing_slicing)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod debug_unmodified;
 pub mod instruction;
 pub mod instruction_accounts;
 pub mod transaction_accounts;

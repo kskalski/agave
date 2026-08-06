@@ -17,6 +17,8 @@ use {
 /// addresses and/or owner program ids to match, or to `*` to trace everything (very noisy).
 /// Only real changes are logged; `set_lamports()` calls that leave the value alone return before
 /// this point and never set the touched flag.
+///
+/// This is the per-event view; `debug_unmodified` keeps the aggregate counts.
 fn debug_trace_lamports_change(address: &Pubkey, owner: &Pubkey, old: u64, new: u64) {
     static FILTER: LazyLock<Option<String>> =
         LazyLock::new(|| std::env::var("AGAVE_DEBUG_LAMPORTS_TRACE").ok());
@@ -130,6 +132,7 @@ impl BorrowedInstructionAccount<'_, '_> {
         if self.get_owner().to_bytes() == pubkey {
             return Ok(());
         }
+        crate::debug_unmodified::record_owner_change(self.get_key());
         self.touch()?;
         self.account.copy_into_owner_from_slice(pubkey);
         Ok(())
@@ -163,6 +166,7 @@ impl BorrowedInstructionAccount<'_, '_> {
             .add_lamports_delta(lamports_balance)?;
 
         debug_trace_lamports_change(self.get_key(), self.get_owner(), old_lamports, lamports);
+        crate::debug_unmodified::record_lamports_change(self.get_key());
 
         self.touch()?;
         self.account.set_lamports(lamports);
@@ -196,6 +200,7 @@ impl BorrowedInstructionAccount<'_, '_> {
     /// Returns a writable slice of the account data (transaction wide)
     pub fn get_data_mut(&mut self) -> Result<&mut [u8], InstructionError> {
         self.can_data_be_changed()?;
+        crate::debug_unmodified::record_data_change(self.get_key());
         self.touch()?;
         self.make_data_mut();
         Ok(self.account.data_as_mut_slice())
@@ -207,6 +212,7 @@ impl BorrowedInstructionAccount<'_, '_> {
     /// replace the account data with it.
     pub fn set_data_from_slice(&mut self, data: &[u8]) -> Result<(), InstructionError> {
         self.can_data_be_resized(data.len())?;
+        crate::debug_unmodified::record_data_change(self.get_key());
         self.touch()?;
         self.update_accounts_resize_delta(data.len())?;
         // Note that we intentionally don't call self.make_data_mut() here.  make_data_mut() will
@@ -227,6 +233,7 @@ impl BorrowedInstructionAccount<'_, '_> {
         if self.get_data().len() == new_length {
             return Ok(());
         }
+        crate::debug_unmodified::record_data_len_change(self.get_key());
         self.touch()?;
         self.update_accounts_resize_delta(new_length)?;
         self.account.resize(new_length, 0);
@@ -242,6 +249,7 @@ impl BorrowedInstructionAccount<'_, '_> {
             return Ok(());
         }
 
+        crate::debug_unmodified::record_data_change(self.get_key());
         self.touch()?;
         self.update_accounts_resize_delta(new_len)?;
         // Even if extend_from_slice never reduces capacity, still realloc using
