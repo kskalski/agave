@@ -478,7 +478,10 @@ fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>>(
                 let data = buffer
                     .get(start..start + pre_len)
                     .ok_or(InstructionError::InvalidArgument)?;
-                borrowed_account.set_data_from_slice(data)?;
+                // DEBUG(unmodified accounts): only write (and thus touch) on a real change.
+                if borrowed_account.get_data() != data {
+                    borrowed_account.set_data_from_slice(data)?;
+                }
             } else if borrowed_account.get_data().len() != pre_len {
                 borrowed_account.set_data_length(pre_len)?;
             }
@@ -686,7 +689,10 @@ fn deserialize_parameters_for_abiv1<I: IntoIterator<Item = usize>>(
                 let data = buffer
                     .get(start..start + post_len)
                     .ok_or(InstructionError::InvalidArgument)?;
-                borrowed_account.set_data_from_slice(data)?;
+                // DEBUG(unmodified accounts): only write (and thus touch) on a real change.
+                if borrowed_account.get_data() != data {
+                    borrowed_account.set_data_from_slice(data)?;
+                }
             } else if borrowed_account.get_data().len() != post_len {
                 borrowed_account.set_data_length(post_len)?;
             }

@@ -1148,7 +1148,11 @@ fn update_callee_account(
             // pointer to data may have changed, so caller must be updated
             must_update_caller = true;
         }
-        if !account_data_direct_mapping && callee_account.can_data_be_changed().is_ok() {
+        if !account_data_direct_mapping
+            && callee_account.can_data_be_changed().is_ok()
+            // DEBUG(unmodified accounts): only write (and thus touch) on a real change.
+            && callee_account.get_data() != caller_account.serialized_data
+        {
             callee_account.set_data_from_slice(caller_account.serialized_data)?;
         }
     } else {

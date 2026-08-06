@@ -70,9 +70,21 @@ impl Bank {
                 // by the transaction but not actually modified. This is what the
                 // `bank-accounts_lt_hash.mean_num_accounts_unmodified` metric counts; the
                 // mix_out/mix_in of an unchanged account cancel out and cost us cycles for no
-                // reason. Log context + a backtrace so the offending code path can be found.
-                if prev_account == curr_account {
-                    debug_log_unmodified_account(self.slot(), address, prev_account.as_ref());
+                // reason.
+                if debug_unmodified_accounts_enabled() && prev_account == curr_account {
+                    // Count how many times this account appears across the batch, to tell a
+                    // no-op write apart from several writes that net out. Only done when the
+                    // debug instrumentation is on, since it is O(batch len) per hit.
+                    let num_occurrences = (0..accounts.len())
+                        .filter(|index| accounts.pubkey(*index) == address)
+                        .count();
+                    debug_log_unmodified_account(
+                        self.slot(),
+                        address,
+                        prev_account.as_ref(),
+                        num_occurrences,
+                        accounts.len(),
+                    );
                 }
                 // the account was modified; enqueue this update
                 async_progress.spawn(
@@ -153,9 +165,16 @@ impl Bank {
                 // the account was ephemeral; skip it
             } else {
                 // See enqueue_on_chain_accounts_lt_hash_updates() for details; an identical
-                // prev/curr means the account was written but not modified.
-                if prev_account == curr_account {
-                    debug_log_unmodified_account(self.slot(), address, prev_account.as_ref());
+                // prev/curr means the account was written but not modified. This path forbids
+                // duplicates, so occurrences is always 1.
+                if debug_unmodified_accounts_enabled() && prev_account == curr_account {
+                    debug_log_unmodified_account(
+                        self.slot(),
+                        address,
+                        prev_account.as_ref(),
+                        1,
+                        accounts.len(),
+                    );
                 }
                 // the account was modified; enqueue this update
                 async_progress.spawn(
@@ -225,23 +244,38 @@ impl Bank {
     }
 }
 
+/// Whether the unmodified-accounts debug instrumentation is enabled.
+///
+/// Gated on the `AGAVE_DEBUG_UNMODIFIED_ACCOUNTS` env var (any non-empty value) so the extra
+/// work stays off by default. Callers check this *before* computing any diagnostic context.
+fn debug_unmodified_accounts_enabled() -> bool {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("AGAVE_DEBUG_UNMODIFIED_ACCOUNTS").is_some());
+    *ENABLED
+}
+
 /// Debug instrumentation for `bank-accounts_lt_hash.mean_num_accounts_unmodified`.
 ///
-/// Emits a backtrace plus account context when an account is written by a transaction (or other
-/// on/off-chain event) without actually being modified, i.e. its previous and current versions are
-/// identical. Enable at runtime by setting the `AGAVE_DEBUG_UNMODIFIED_ACCOUNTS` env var (any
-/// non-empty value) so the (relatively expensive) backtrace capture stays off by default.
+/// Logs when an account is written but not actually modified, i.e. its previous and current
+/// versions are identical.
+///
+/// No backtrace is captured: every on-chain occurrence comes through the single call site in
+/// `commit_transactions()`, so the stack is invariant and tells us nothing.
+///
+/// `num_occurrences` is the key discriminator between the two possible causes:
+/// - `1` => a single write of identical content, i.e. the SVM marked the account touched for a
+///   no-op write (program/loader wrote the same bytes back).
+/// - `>1` => the account was written by several transactions in this batch whose net effect
+///   cancels out. `prev` is read from the accounts db *before* `store_accounts_seq()` runs for
+///   the batch, and dedup keeps only the latest version, so an A->B->A round trip lands here.
+///   This cause is inherent to batching and is not a touch-tracking bug.
 fn debug_log_unmodified_account(
     slot: solana_clock::Slot,
     address: &Pubkey,
     account: Option<&AccountSharedData>,
+    num_occurrences: usize,
+    batch_len: usize,
 ) {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("AGAVE_DEBUG_UNMODIFIED_ACCOUNTS").is_some());
-    if !*ENABLED {
-        return;
-    }
-
     let (lamports, owner, data_len, executable, rent_epoch) = match account {
         Some(account) => (
             account.lamports(),
@@ -254,11 +288,16 @@ fn debug_log_unmodified_account(
         // equal-but-None pair should not reach here; guard just in case.
         None => Default::default(),
     };
+    let cause = if num_occurrences > 1 {
+        "batch-netting"
+    } else {
+        "no-op-write"
+    };
     eprintln!(
-        "unmodified account written in lt_hash update: slot={slot} address={address} \
-         lamports={lamports} owner={owner} data_len={data_len} executable={executable} \
-         rent_epoch={rent_epoch}\n{}",
-        std::backtrace::Backtrace::force_capture(),
+        "unmodified account written in lt_hash update: cause={cause} slot={slot} \
+         address={address} lamports={lamports} owner={owner} data_len={data_len} \
+         executable={executable} rent_epoch={rent_epoch} num_occurrences={num_occurrences} \
+         batch_len={batch_len}",
     );
 }
 
