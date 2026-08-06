@@ -6,7 +6,32 @@ use {
     solana_account::{ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
+    std::sync::LazyLock,
 };
+
+/// DEBUG: traces every *effective* lamports change, to verify whether accounts reported by
+/// `bank-accounts_lt_hash.mean_num_accounts_unmodified` are the result of an A->B->A round trip
+/// within a single transaction (e.g. a flash loan) rather than a no-op write.
+///
+/// Enable by setting `AGAVE_DEBUG_LAMPORTS_TRACE` to a comma-separated list of base58 account
+/// addresses and/or owner program ids to match, or to `*` to trace everything (very noisy).
+/// Only real changes are logged; `set_lamports()` calls that leave the value alone return before
+/// this point and never set the touched flag.
+fn debug_trace_lamports_change(address: &Pubkey, owner: &Pubkey, old: u64, new: u64) {
+    static FILTER: LazyLock<Option<String>> =
+        LazyLock::new(|| std::env::var("AGAVE_DEBUG_LAMPORTS_TRACE").ok());
+    let Some(filter) = FILTER.as_deref() else {
+        return;
+    };
+    if filter != "*"
+        && !filter.contains(&address.to_string())
+        && !filter.contains(&owner.to_string())
+    {
+        return;
+    }
+    let delta = (new as i128).saturating_sub(old as i128);
+    eprintln!("lamports_change: address={address} owner={owner} old={old} new={new} delta={delta}");
+}
 
 /// Contains account meta data which varies between instruction.
 ///
@@ -136,6 +161,8 @@ impl BorrowedInstructionAccount<'_, '_> {
         self.transaction_context
             .accounts
             .add_lamports_delta(lamports_balance)?;
+
+        debug_trace_lamports_change(self.get_key(), self.get_owner(), old_lamports, lamports);
 
         self.touch()?;
         self.account.set_lamports(lamports);
