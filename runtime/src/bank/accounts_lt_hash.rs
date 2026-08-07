@@ -332,9 +332,9 @@ fn debug_log_unmodified_account(
         "unmodified account written in lt_hash update: cause={cause} slot={slot} \
          address={address} lamports={lamports} owner={owner} data_len={data_len} \
          executable={executable} rent_epoch={rent_epoch} num_occurrences={num_occurrences} \
-         batch_len={batch_len} changes_lamports={} changes_data={} changes_data_len={} \
-         changes_owner={}",
-        changes.lamports, changes.data, changes.data_len, changes.owner,
+         batch_len={batch_len} changes_lamports={} changes_data={} changes_data_noop={} \
+         changes_data_len={} changes_owner={}",
+        changes.lamports, changes.data, changes.data_noop, changes.data_len, changes.owner,
     );
 }
 
