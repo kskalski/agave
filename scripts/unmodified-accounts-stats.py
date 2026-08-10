@@ -13,6 +13,9 @@ Usage:
     scripts/unmodified-accounts-stats.py validator.log
     journalctl -u agave -o cat | scripts/unmodified-accounts-stats.py
     scripts/unmodified-accounts-stats.py validator.log --by-owner --csv slots.csv
+
+Use --by-owner to rank the programs, then scripts/unmodified-accounts-drill.py to drill into
+one of them.
 """
 
 import argparse
@@ -97,6 +100,14 @@ def pct(n, total):
     return f"{100.0 * n / total:5.1f}%" if total else "    -"
 
 
+def human_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TiB"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("log", nargs="?", type=argparse.FileType("r", errors="replace"),
@@ -104,6 +115,8 @@ def main():
     ap.add_argument("--by-owner", action="store_true", help="break down by owner program")
     ap.add_argument("--by-address", action="store_true", help="list the most frequent accounts")
     ap.add_argument("--top", type=int, default=15, help="rows in the owner/address tables")
+    ap.add_argument("--sort-owners-by", choices=("events", "bytes"), default="events",
+                    help="rank owner programs by event count or by bytes copied for nothing")
     ap.add_argument("--slots", type=int, default=20, help="per-slot rows to print (0 for all)")
     ap.add_argument("--csv", help="write the full per-slot table to this file")
     args = ap.parse_args()
@@ -128,8 +141,15 @@ def main():
         totals[cause] += 1
         totals["total"] += 1
         addresses_per_slot[slot].add(event.get("address", "?"))
-        by_owner[event.get("owner", "?")][cause] += 1
-        by_owner[event.get("owner", "?")]["total"] += 1
+        owner = event.get("owner", "?")
+        by_owner[owner][cause] += 1
+        by_owner[owner]["total"] += 1
+        # Bytes memcpy'd for nothing. changes_data_noop is the byte-identical subset of
+        # changes_data, and each such write copies data_len bytes. Bytes rank the programs
+        # differently from events, since one big account outweighs many small ones.
+        by_owner[owner]["wasted_bytes"] += (
+            event.get("changes_data_noop", 0) * max(0, event.get("data_len", 0))
+        )
         by_address[event.get("address", "?")] += 1
 
     if not totals["total"]:
@@ -196,11 +216,16 @@ def main():
     print()
 
     if args.by_owner:
-        print(f"top {args.top} owner programs")
-        ranked = sorted(by_owner.items(), key=lambda kv: -kv[1]["total"])[: args.top]
+        key = "wasted_bytes" if args.sort_owners_by == "bytes" else "total"
+        total_wasted = sum(c["wasted_bytes"] for c in by_owner.values())
+        print(f"top {args.top} owner programs (by {args.sort_owners_by})")
+        ranked = sorted(by_owner.items(), key=lambda kv: -kv[1][key])[: args.top]
         for owner, counts in ranked:
             causes = " ".join(f"{c}={counts[c]}" for c in all_causes if counts[c])
-            print(f"  {counts['total']:8d}  {pct(counts['total'], n)}  {owner}  {causes}")
+            print(f"  {counts['total']:8d}  {pct(counts['total'], n)}  "
+                  f"{human_bytes(counts['wasted_bytes']):>10}  "
+                  f"{pct(counts['wasted_bytes'], total_wasted)}  {owner}  {causes}")
+        print(f"  columns: events, share of events, bytes copied for nothing, share of bytes")
         print()
 
     if args.by_address:
