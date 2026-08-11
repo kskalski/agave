@@ -166,7 +166,9 @@ def main():
         by_write_program[write_program]["total"] += 1
         by_write_program[write_program][f"depth{write_depth}"] += 1
         by_write_depth[write_depth] += 1
-        # a round trip whose writes came from different instructions
+        # The account was written by more than one instruction. That is a round trip only when
+        # the writes really changed the bytes; several instructions each writing it back
+        # unchanged lands here too, and is the more common shape.
         if event.get("write_ix", "-") != event.get("write_ix_last", "-"):
             spans_instructions += 1
 
