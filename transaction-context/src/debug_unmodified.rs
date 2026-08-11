@@ -199,7 +199,7 @@ thread_local! {
 fn record(
     address: &Pubkey,
     site: Option<WriteSite>,
-    location: &'static Location<'static>,
+    location: Option<&'static Location<'static>>,
     field: impl Fn(&mut FieldChanges),
 ) {
     if !enabled() {
@@ -210,7 +210,9 @@ fn record(
         let entry = changes.entry(*address).or_default();
         field(entry);
         entry.note_site(site);
-        entry.locations.record(location);
+        if let Some(location) = location {
+            entry.locations.record(location);
+        }
     });
 }
 
@@ -219,7 +221,7 @@ pub fn record_lamports_change(
     site: Option<WriteSite>,
     location: &'static Location<'static>,
 ) {
-    record(address, site, location, |c| c.lamports = c.lamports.saturating_add(1));
+    record(address, site, Some(location), |c| c.lamports = c.lamports.saturating_add(1));
 }
 
 pub fn record_data_change(
@@ -227,7 +229,7 @@ pub fn record_data_change(
     site: Option<WriteSite>,
     location: &'static Location<'static>,
 ) {
-    record(address, site, location, |c| c.data = c.data.saturating_add(1));
+    record(address, site, Some(location), |c| c.data = c.data.saturating_add(1));
 }
 
 pub fn record_data_len_change(
@@ -235,7 +237,7 @@ pub fn record_data_len_change(
     site: Option<WriteSite>,
     location: &'static Location<'static>,
 ) {
-    record(address, site, location, |c| c.data_len = c.data_len.saturating_add(1));
+    record(address, site, Some(location), |c| c.data_len = c.data_len.saturating_add(1));
 }
 
 pub fn record_owner_change(
@@ -243,7 +245,7 @@ pub fn record_owner_change(
     site: Option<WriteSite>,
     location: &'static Location<'static>,
 ) {
-    record(address, site, location, |c| c.owner = c.owner.saturating_add(1));
+    record(address, site, Some(location), |c| c.owner = c.owner.saturating_add(1));
 }
 
 fn record_noop_data_write(
@@ -252,6 +254,10 @@ fn record_noop_data_write(
     location: &'static Location<'static>,
 ) {
     inc_noop_data_writes_seen();
+    // Attributing the location here as well would double count: unless the write is suppressed,
+    // set_data_from_slice_at() runs straight after and records the same location for the same
+    // write. When it is suppressed there is no follow-up, so this is the only chance.
+    let location = suppress_noop_data_writes().then_some(location);
     record(address, site, location, |c| {
         c.data_noop = c.data_noop.saturating_add(1)
     });
