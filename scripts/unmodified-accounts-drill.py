@@ -30,12 +30,16 @@ What the derived columns mean:
   wasted      Each no-op write on a still-shared buffer costs an allocation plus a memcpy of
               data_len bytes (AccountSharedData::set_data_from_slice falls back to to_vec() when
               the Arc is shared). Bytes, not events, are what the fix actually saves.
-  write_*     Where the write came from, which is not the same as who owns the account. A DEX
-              CPI-ing into Token writes a Token-owned account while the DEX is executing.
-              write_depth is 1 for a top-level instruction returning and 2+ inside CPI, which
-              separates the deserialize_parameters path from the update_callee_account one.
-              write_ix and write_ix_last differ when one instruction changed the account and a
-              later one changed it back.
+  write_locs  The source locations that performed the writes, as file:line xN. This is the
+              authoritative answer for which code path wrote: stack height cannot tell
+              deserialize_parameters() apart from update_callee_account(), since both run while
+              the writing instruction is still current.
+  write_*     Where in the transaction the write came from. The program is whoever was
+              executing, not necessarily the account owner: a DEX CPI-ing into Token writes a
+              Token-owned account while the DEX executes. write_ix and write_ix_last differ when
+              more than one instruction wrote the account. Note write_ix is drawn from a
+              different counter for top-level and CPI instructions, so values are only
+              comparable within the same stack height.
 """
 
 import argparse
@@ -120,6 +124,7 @@ def main():
     writes_per_event = Counter()
     by_write_program = defaultdict(Counter)
     by_write_depth = Counter()
+    by_write_loc = Counter()
     spans_instructions = 0
     len_wasted_bytes = Counter()
     noop_writes = 0
@@ -162,10 +167,14 @@ def main():
             wasted_bytes += noop * data_len
 
         write_program = event.get("write_program", "-")
-        write_depth = event.get("write_depth", "-")
+        write_depth = event.get("write_stack_height", event.get("write_depth", "-"))
         by_write_program[write_program]["total"] += 1
         by_write_program[write_program][f"depth{write_depth}"] += 1
         by_write_depth[write_depth] += 1
+        for chunk in event.get("write_locs", "-").split(","):
+            loc, _, count = chunk.rpartition("x")
+            if loc and count.isdigit():
+                by_write_loc[loc] += int(count)
         # The account was written by more than one instruction. That is a round trip only when
         # the writes really changed the bytes; several instructions each writing it back
         # unchanged lands here too, and is the more common shape.
@@ -218,11 +227,19 @@ def main():
         print("  each no-op write on a shared buffer is one allocation plus a memcpy of that size")
         print()
 
+    if by_write_loc:
+        print("write locations   (which code path performed the write)")
+        print(f"  {'writes':>12}  {'share':>6}  location")
+        loc_total = sum(by_write_loc.values())
+        for loc, count in by_write_loc.most_common(args.top):
+            print(f"  {count:>12}  {pct(count, loc_total)}  {loc}")
+        print()
+
     if any(k != "-" for k in by_write_depth):
-        print("write depth   (1 = top-level instruction return, 2+ = inside CPI)")
+        print("instruction stack height   (1 = top-level, 2+ = inside CPI)")
         for depth, n in sorted(by_write_depth.items(), key=lambda kv: str(kv[0])):
-            label = {"1": "1  deserialize_parameters", "-": "-  not captured"}.get(
-                str(depth), f"{depth}  CPI update_callee_account")
+            label = {"1": "1  top-level instruction", "-": "-  not captured"}.get(
+                str(depth), f"{depth}  inside CPI")
             print(f"  {label:<32} {n:>12}  {pct(n, total)}")
         if spans_instructions:
             print(f"  {'writes from different instructions':<32} {spans_instructions:>12}  "

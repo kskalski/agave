@@ -115,6 +115,7 @@ impl BorrowedInstructionAccount<'_, '_> {
     }
 
     /// Assignes the owner of this account (transaction wide)
+    #[track_caller]
     pub fn set_owner(&mut self, pubkey: &[u8]) -> Result<(), InstructionError> {
         // Only the owner can assign a new owner
         if !self.is_owned_by_current_program() {
@@ -132,7 +133,11 @@ impl BorrowedInstructionAccount<'_, '_> {
         if self.get_owner().to_bytes() == pubkey {
             return Ok(());
         }
-        crate::debug_unmodified::record_owner_change(self.get_key(), self.debug_write_site());
+        crate::debug_unmodified::record_owner_change(
+            self.get_key(),
+            self.debug_write_site(),
+            std::panic::Location::caller(),
+        );
         self.touch()?;
         self.account.copy_into_owner_from_slice(pubkey);
         Ok(())
@@ -152,6 +157,7 @@ impl BorrowedInstructionAccount<'_, '_> {
     }
 
     /// Overwrites the number of lamports of this account (transaction wide)
+    #[track_caller]
     pub fn set_lamports(&mut self, lamports: u64) -> Result<(), InstructionError> {
         // An account not owned by the program cannot have its balance decrease
         if !self.is_owned_by_current_program() && lamports < self.get_lamports() {
@@ -173,7 +179,11 @@ impl BorrowedInstructionAccount<'_, '_> {
             .add_lamports_delta(lamports_balance)?;
 
         debug_trace_lamports_change(self.get_key(), self.get_owner(), old_lamports, lamports);
-        crate::debug_unmodified::record_lamports_change(self.get_key(), self.debug_write_site());
+        crate::debug_unmodified::record_lamports_change(
+            self.get_key(),
+            self.debug_write_site(),
+            std::panic::Location::caller(),
+        );
 
         self.touch()?;
         self.account.set_lamports(lamports);
@@ -205,9 +215,14 @@ impl BorrowedInstructionAccount<'_, '_> {
     }
 
     /// Returns a writable slice of the account data (transaction wide)
+    #[track_caller]
     pub fn get_data_mut(&mut self) -> Result<&mut [u8], InstructionError> {
         self.can_data_be_changed()?;
-        crate::debug_unmodified::record_data_change(self.get_key(), self.debug_write_site());
+        crate::debug_unmodified::record_data_change(
+            self.get_key(),
+            self.debug_write_site(),
+            std::panic::Location::caller(),
+        );
         self.touch()?;
         self.make_data_mut();
         Ok(self.account.data_as_mut_slice())
@@ -217,9 +232,25 @@ impl BorrowedInstructionAccount<'_, '_> {
     ///
     /// Call this when you have a slice of data you do not own and want to
     /// replace the account data with it.
+    #[track_caller]
     pub fn set_data_from_slice(&mut self, data: &[u8]) -> Result<(), InstructionError> {
+        self.set_data_from_slice_at(data, std::panic::Location::caller())
+    }
+
+    /// As `set_data_from_slice()`, but attributing the write to `location` rather than to the
+    /// immediate caller. Lets `write_data_observed()` report the loader/CPI site that really
+    /// originated the write instead of itself.
+    pub fn set_data_from_slice_at(
+        &mut self,
+        data: &[u8],
+        location: &'static std::panic::Location<'static>,
+    ) -> Result<(), InstructionError> {
         self.can_data_be_resized(data.len())?;
-        crate::debug_unmodified::record_data_change(self.get_key(), self.debug_write_site());
+        crate::debug_unmodified::record_data_change(
+            self.get_key(),
+            self.debug_write_site(),
+            location,
+        );
         self.touch()?;
         self.update_accounts_resize_delta(data.len())?;
         // Note that we intentionally don't call self.make_data_mut() here.  make_data_mut() will
@@ -234,13 +265,18 @@ impl BorrowedInstructionAccount<'_, '_> {
     /// Resizes the account data (transaction wide)
     ///
     /// Fills it with zeros at the end if is extended or truncates at the end otherwise.
+    #[track_caller]
     pub fn set_data_length(&mut self, new_length: usize) -> Result<(), InstructionError> {
         self.can_data_be_resized(new_length)?;
         // don't touch the account if the length does not change
         if self.get_data().len() == new_length {
             return Ok(());
         }
-        crate::debug_unmodified::record_data_len_change(self.get_key(), self.debug_write_site());
+        crate::debug_unmodified::record_data_len_change(
+            self.get_key(),
+            self.debug_write_site(),
+            std::panic::Location::caller(),
+        );
         self.touch()?;
         self.update_accounts_resize_delta(new_length)?;
         self.account.resize(new_length, 0);
@@ -248,6 +284,7 @@ impl BorrowedInstructionAccount<'_, '_> {
     }
 
     /// Appends all elements in a slice to the account
+    #[track_caller]
     pub fn extend_from_slice(&mut self, data: &[u8]) -> Result<(), InstructionError> {
         let new_len = self.get_data().len().saturating_add(data.len());
         self.can_data_be_resized(new_len)?;
@@ -256,7 +293,11 @@ impl BorrowedInstructionAccount<'_, '_> {
             return Ok(());
         }
 
-        crate::debug_unmodified::record_data_change(self.get_key(), self.debug_write_site());
+        crate::debug_unmodified::record_data_change(
+            self.get_key(),
+            self.debug_write_site(),
+            std::panic::Location::caller(),
+        );
         self.touch()?;
         self.update_accounts_resize_delta(new_len)?;
         // Even if extend_from_slice never reduces capacity, still realloc using

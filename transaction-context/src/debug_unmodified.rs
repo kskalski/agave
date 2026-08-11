@@ -27,12 +27,79 @@ use {
     std::{
         cell::RefCell,
         collections::HashMap,
+        panic::Location,
         sync::{
             LazyLock,
             atomic::{AtomicU64, Ordering},
         },
     },
 };
+
+/// How many distinct code locations to remember per account. There are only a handful of
+/// write-back call sites, so this never realistically overflows.
+const MAX_TRACKED_LOCATIONS: usize = 6;
+
+/// Counts of writes per originating code location.
+///
+/// The location comes from `#[track_caller]` on the setters, so it is the call site in the
+/// loader or CPI code rather than somewhere inside `transaction-context`. This is what actually
+/// distinguishes `deserialize_parameters()` from `update_callee_account()`; the instruction stack
+/// height cannot, because both run while the *writing* instruction is current.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocationCounts {
+    entries: [Option<(&'static Location<'static>, u16)>; MAX_TRACKED_LOCATIONS],
+    /// Writes whose location did not fit in `entries`.
+    pub overflow: u16,
+}
+
+impl LocationCounts {
+    fn record(&mut self, location: &'static Location<'static>) {
+        for slot in self.entries.iter_mut() {
+            match slot {
+                Some((existing, count))
+                    if existing.file() == location.file() && existing.line() == location.line() =>
+                {
+                    *count = count.saturating_add(1);
+                    return;
+                }
+                Some(_) => continue,
+                None => {
+                    *slot = Some((location, 1));
+                    return;
+                }
+            }
+        }
+        self.overflow = self.overflow.saturating_add(1);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&'static Location<'static>, u16)> + '_ {
+        self.entries.iter().flatten().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries[0].is_none()
+    }
+
+    /// Renders as `serialization.rs:672x2,cpi.rs:1152x1`, dropping directories so the field stays
+    /// short enough to keep one event on one line.
+    pub fn render(&self) -> String {
+        let mut rendered: Vec<String> = self
+            .iter()
+            .map(|(location, count)| {
+                let file = location.file().rsplit('/').next().unwrap_or(location.file());
+                format!("{file}:{}x{count}", location.line())
+            })
+            .collect();
+        if self.overflow > 0 {
+            rendered.push(format!("overflow x{}", self.overflow));
+        }
+        if rendered.is_empty() {
+            "-".to_string()
+        } else {
+            rendered.join(",")
+        }
+    }
+}
 
 /// Whether the instrumentation is enabled, via the `AGAVE_DEBUG_UNMODIFIED_ACCOUNTS` env var.
 ///
@@ -105,6 +172,8 @@ pub struct FieldChanges {
     /// and together they say which instruction changed the account and which changed it back.
     pub first_write: Option<WriteSite>,
     pub last_write: Option<WriteSite>,
+    /// Which code locations performed the writes, and how many each did.
+    pub locations: LocationCounts,
 }
 
 impl FieldChanges {
@@ -127,7 +196,12 @@ thread_local! {
     static CHANGES: RefCell<HashMap<Pubkey, FieldChanges>> = RefCell::new(HashMap::new());
 }
 
-fn record(address: &Pubkey, site: Option<WriteSite>, field: impl Fn(&mut FieldChanges)) {
+fn record(
+    address: &Pubkey,
+    site: Option<WriteSite>,
+    location: &'static Location<'static>,
+    field: impl Fn(&mut FieldChanges),
+) {
     if !enabled() {
         return;
     }
@@ -136,28 +210,51 @@ fn record(address: &Pubkey, site: Option<WriteSite>, field: impl Fn(&mut FieldCh
         let entry = changes.entry(*address).or_default();
         field(entry);
         entry.note_site(site);
+        entry.locations.record(location);
     });
 }
 
-pub fn record_lamports_change(address: &Pubkey, site: Option<WriteSite>) {
-    record(address, site, |c| c.lamports = c.lamports.saturating_add(1));
+pub fn record_lamports_change(
+    address: &Pubkey,
+    site: Option<WriteSite>,
+    location: &'static Location<'static>,
+) {
+    record(address, site, location, |c| c.lamports = c.lamports.saturating_add(1));
 }
 
-pub fn record_data_change(address: &Pubkey, site: Option<WriteSite>) {
-    record(address, site, |c| c.data = c.data.saturating_add(1));
+pub fn record_data_change(
+    address: &Pubkey,
+    site: Option<WriteSite>,
+    location: &'static Location<'static>,
+) {
+    record(address, site, location, |c| c.data = c.data.saturating_add(1));
 }
 
-pub fn record_data_len_change(address: &Pubkey, site: Option<WriteSite>) {
-    record(address, site, |c| c.data_len = c.data_len.saturating_add(1));
+pub fn record_data_len_change(
+    address: &Pubkey,
+    site: Option<WriteSite>,
+    location: &'static Location<'static>,
+) {
+    record(address, site, location, |c| c.data_len = c.data_len.saturating_add(1));
 }
 
-pub fn record_owner_change(address: &Pubkey, site: Option<WriteSite>) {
-    record(address, site, |c| c.owner = c.owner.saturating_add(1));
+pub fn record_owner_change(
+    address: &Pubkey,
+    site: Option<WriteSite>,
+    location: &'static Location<'static>,
+) {
+    record(address, site, location, |c| c.owner = c.owner.saturating_add(1));
 }
 
-fn record_noop_data_write(address: &Pubkey, site: Option<WriteSite>) {
+fn record_noop_data_write(
+    address: &Pubkey,
+    site: Option<WriteSite>,
+    location: &'static Location<'static>,
+) {
     inc_noop_data_writes_seen();
-    record(address, site, |c| c.data_noop = c.data_noop.saturating_add(1));
+    record(address, site, location, |c| {
+        c.data_noop = c.data_noop.saturating_add(1)
+    });
 }
 
 /// Writes `data` into `account`, observing whether the write is a no-op.
@@ -165,18 +262,22 @@ fn record_noop_data_write(address: &Pubkey, site: Option<WriteSite>) {
 /// Byte-identical writes are counted and, unless suppression is enabled, still performed so the
 /// touched flag matches production. This is the single place the loader and CPI write-back paths
 /// should go through.
+#[track_caller]
 pub fn write_data_observed(
     account: &mut BorrowedInstructionAccount<'_, '_>,
     data: &[u8],
 ) -> Result<(), InstructionError> {
+    // Forwarded explicitly rather than relying on #[track_caller] chaining, so the recorded
+    // location is the loader/CPI call site and not this function.
+    let location = Location::caller();
     if compare_before_write() && account.get_data() == data {
         let site = current_write_site(account.transaction_context);
-        record_noop_data_write(account.get_key(), site);
+        record_noop_data_write(account.get_key(), site, location);
         if suppress_noop_data_writes() {
             return Ok(());
         }
     }
-    account.set_data_from_slice(data)
+    account.set_data_from_slice_at(data, location)
 }
 
 /// Returns the changes recorded for `address` so far in the current batch.
@@ -335,6 +436,27 @@ mod tests {
         );
         assert!(!UnmodifiedCause::LamportsRoundTrip.is_suppressible());
         assert!(UnmodifiedCause::NoopDataWrite.is_suppressible());
+    }
+
+    #[test]
+    fn test_location_counts_dedup_and_render() {
+        let mut counts = LocationCounts::default();
+        // two writes from one site, one from another
+        let a = Location::caller();
+        counts.record(a);
+        counts.record(a);
+        assert_eq!(counts.iter().count(), 1);
+        assert_eq!(counts.iter().next().unwrap().1, 2);
+        // rendering keeps only the file name, not the directory
+        let rendered = counts.render();
+        assert!(!rendered.contains('/'), "{rendered}");
+        assert!(rendered.ends_with("x2"), "{rendered}");
+    }
+
+    #[test]
+    fn test_location_counts_empty_renders_dash() {
+        assert_eq!(LocationCounts::default().render(), "-");
+        assert!(LocationCounts::default().is_empty());
     }
 
     #[test]

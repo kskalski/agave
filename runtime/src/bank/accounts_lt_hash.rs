@@ -329,9 +329,11 @@ fn debug_log_unmodified_account(
         debug_unmodified::count(cause);
         cause.as_str()
     };
-    // Where in the transaction the writes came from. For a round trip the first and last sites
-    // differ, naming the instruction that changed the account and the one that changed it back.
-    // The program here is whoever was executing, which is not necessarily the account's owner.
+    // Where the writes came from. write_locs is the authoritative answer for *which code path*
+    // wrote: the instruction stack height cannot tell deserialize_parameters() apart from
+    // update_callee_account(), because both run while the writing instruction is still current.
+    // The instruction fields say *where in the transaction*; the program is whoever was
+    // executing, which is not necessarily the account's owner.
     let (first_ix, first_depth, first_program) = site_fields(changes.first_write);
     let (last_ix, last_depth, last_program) = site_fields(changes.last_write);
 
@@ -340,10 +342,16 @@ fn debug_log_unmodified_account(
          address={address} lamports={lamports} owner={owner} data_len={data_len} \
          executable={executable} rent_epoch={rent_epoch} num_occurrences={num_occurrences} \
          batch_len={batch_len} changes_lamports={} changes_data={} changes_data_noop={} \
-         changes_data_len={} changes_owner={} write_ix={first_ix} write_depth={first_depth} \
-         write_program={first_program} write_ix_last={last_ix} write_depth_last={last_depth} \
+         changes_data_len={} changes_owner={} write_locs={} \
+         write_ix={first_ix} write_stack_height={first_depth} write_program={first_program} \
+         write_ix_last={last_ix} write_stack_height_last={last_depth} \
          write_program_last={last_program}",
-        changes.lamports, changes.data, changes.data_noop, changes.data_len, changes.owner,
+        changes.lamports,
+        changes.data,
+        changes.data_noop,
+        changes.data_len,
+        changes.owner,
+        changes.locations.render(),
     );
 }
 
