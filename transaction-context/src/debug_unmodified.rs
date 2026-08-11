@@ -21,7 +21,7 @@
 //! same thread; the runtime reads them during commit and then clears them for the next batch.
 
 use {
-    crate::instruction_accounts::BorrowedInstructionAccount,
+    crate::{instruction_accounts::BorrowedInstructionAccount, transaction::TransactionContext},
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     std::{
@@ -59,6 +59,35 @@ fn compare_before_write() -> bool {
     enabled() || suppress_noop_data_writes()
 }
 
+/// Where in a transaction a write happened.
+///
+/// Both write-back paths run while the *writing* program's instruction is still current:
+/// `deserialize_parameters()` runs as an instruction returns but before it is popped, and
+/// `update_callee_account()` runs during CPI setup before the callee is pushed. So the current
+/// instruction context names the program that performed the write, not the account's owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteSite {
+    /// Index of the instruction in the transaction's instruction trace, CPIs included.
+    pub trace_index: u16,
+    /// 1 for a top-level instruction, higher inside CPI.
+    pub stack_height: u8,
+    /// The program executing when the write happened.
+    pub program: Pubkey,
+}
+
+/// Captures where execution currently is, or `None` when instrumentation is off.
+pub fn current_write_site(transaction_context: &TransactionContext) -> Option<WriteSite> {
+    if !enabled() {
+        return None;
+    }
+    let instruction_context = transaction_context.get_current_instruction_context().ok()?;
+    Some(WriteSite {
+        trace_index: transaction_context.get_current_instruction_index().ok()? as u16,
+        stack_height: instruction_context.get_stack_height() as u8,
+        program: *instruction_context.get_program_key().ok()?,
+    })
+}
+
 /// Number of *effective* changes to each field of one account during the current batch.
 ///
 /// Only changes that actually set the touched flag are counted; setters that early-return
@@ -72,6 +101,10 @@ pub struct FieldChanges {
     pub data_noop: u32,
     pub data_len: u32,
     pub owner: u32,
+    /// Where the first and last write to this account happened. For a round trip these differ,
+    /// and together they say which instruction changed the account and which changed it back.
+    pub first_write: Option<WriteSite>,
+    pub last_write: Option<WriteSite>,
 }
 
 impl FieldChanges {
@@ -81,41 +114,50 @@ impl FieldChanges {
     pub fn real_data_writes(&self) -> u32 {
         self.data.saturating_sub(self.data_noop)
     }
+
+    fn note_site(&mut self, site: Option<WriteSite>) {
+        if let Some(site) = site {
+            self.first_write.get_or_insert(site);
+            self.last_write = Some(site);
+        }
+    }
 }
 
 thread_local! {
     static CHANGES: RefCell<HashMap<Pubkey, FieldChanges>> = RefCell::new(HashMap::new());
 }
 
-fn record(address: &Pubkey, field: impl Fn(&mut FieldChanges)) {
+fn record(address: &Pubkey, site: Option<WriteSite>, field: impl Fn(&mut FieldChanges)) {
     if !enabled() {
         return;
     }
     CHANGES.with(|changes| {
         let mut changes = changes.borrow_mut();
-        field(changes.entry(*address).or_default());
+        let entry = changes.entry(*address).or_default();
+        field(entry);
+        entry.note_site(site);
     });
 }
 
-pub fn record_lamports_change(address: &Pubkey) {
-    record(address, |c| c.lamports = c.lamports.saturating_add(1));
+pub fn record_lamports_change(address: &Pubkey, site: Option<WriteSite>) {
+    record(address, site, |c| c.lamports = c.lamports.saturating_add(1));
 }
 
-pub fn record_data_change(address: &Pubkey) {
-    record(address, |c| c.data = c.data.saturating_add(1));
+pub fn record_data_change(address: &Pubkey, site: Option<WriteSite>) {
+    record(address, site, |c| c.data = c.data.saturating_add(1));
 }
 
-pub fn record_data_len_change(address: &Pubkey) {
-    record(address, |c| c.data_len = c.data_len.saturating_add(1));
+pub fn record_data_len_change(address: &Pubkey, site: Option<WriteSite>) {
+    record(address, site, |c| c.data_len = c.data_len.saturating_add(1));
 }
 
-pub fn record_owner_change(address: &Pubkey) {
-    record(address, |c| c.owner = c.owner.saturating_add(1));
+pub fn record_owner_change(address: &Pubkey, site: Option<WriteSite>) {
+    record(address, site, |c| c.owner = c.owner.saturating_add(1));
 }
 
-fn record_noop_data_write(address: &Pubkey) {
+fn record_noop_data_write(address: &Pubkey, site: Option<WriteSite>) {
     inc_noop_data_writes_seen();
-    record(address, |c| c.data_noop = c.data_noop.saturating_add(1));
+    record(address, site, |c| c.data_noop = c.data_noop.saturating_add(1));
 }
 
 /// Writes `data` into `account`, observing whether the write is a no-op.
@@ -128,7 +170,8 @@ pub fn write_data_observed(
     data: &[u8],
 ) -> Result<(), InstructionError> {
     if compare_before_write() && account.get_data() == data {
-        record_noop_data_write(account.get_key());
+        let site = current_write_site(account.transaction_context);
+        record_noop_data_write(account.get_key(), site);
         if suppress_noop_data_writes() {
             return Ok(());
         }
@@ -247,7 +290,7 @@ mod tests {
             data,
             data_noop,
             data_len,
-            owner: 0,
+            ..Default::default()
         }
     }
 
@@ -292,6 +335,21 @@ mod tests {
         );
         assert!(!UnmodifiedCause::LamportsRoundTrip.is_suppressible());
         assert!(UnmodifiedCause::NoopDataWrite.is_suppressible());
+    }
+
+    #[test]
+    fn test_note_site_keeps_first_and_last() {
+        let site = |trace_index| WriteSite {
+            trace_index,
+            stack_height: 1,
+            program: Pubkey::new_from_array([7; 32]),
+        };
+        let mut c = FieldChanges::default();
+        c.note_site(Some(site(0)));
+        c.note_site(Some(site(3)));
+        c.note_site(None); // instrumentation off for this write, must not clobber
+        assert_eq!(c.first_write.map(|s| s.trace_index), Some(0));
+        assert_eq!(c.last_write.map(|s| s.trace_index), Some(3));
     }
 
     #[test]

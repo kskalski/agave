@@ -7,6 +7,7 @@ use {
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
+    log::info,
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
     solana_transaction_context::debug_unmodified,
@@ -328,14 +329,34 @@ fn debug_log_unmodified_account(
         debug_unmodified::count(cause);
         cause.as_str()
     };
-    eprintln!(
+    // Where in the transaction the writes came from. For a round trip the first and last sites
+    // differ, naming the instruction that changed the account and the one that changed it back.
+    // The program here is whoever was executing, which is not necessarily the account's owner.
+    let (first_ix, first_depth, first_program) = site_fields(changes.first_write);
+    let (last_ix, last_depth, last_program) = site_fields(changes.last_write);
+
+    info!(
         "unmodified account written in lt_hash update: cause={cause} slot={slot} \
          address={address} lamports={lamports} owner={owner} data_len={data_len} \
          executable={executable} rent_epoch={rent_epoch} num_occurrences={num_occurrences} \
          batch_len={batch_len} changes_lamports={} changes_data={} changes_data_noop={} \
-         changes_data_len={} changes_owner={}",
+         changes_data_len={} changes_owner={} write_ix={first_ix} write_depth={first_depth} \
+         write_program={first_program} write_ix_last={last_ix} write_depth_last={last_depth} \
+         write_program_last={last_program}",
         changes.lamports, changes.data, changes.data_noop, changes.data_len, changes.owner,
     );
+}
+
+/// Renders a write site for logging, using `-` for the fields of a site we never captured.
+fn site_fields(site: Option<debug_unmodified::WriteSite>) -> (String, String, String) {
+    match site {
+        Some(site) => (
+            site.trace_index.to_string(),
+            site.stack_height.to_string(),
+            site.program.to_string(),
+        ),
+        None => ("-".to_string(), "-".to_string(), "-".to_string()),
+    }
 }
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
