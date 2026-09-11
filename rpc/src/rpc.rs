@@ -4711,7 +4711,7 @@ pub mod tests {
         solana_svm_log_collector::ic_logger_msg,
         solana_system_interface::{instruction as system_instruction, program as system_program},
         solana_system_transaction as system_transaction,
-        solana_sysvar::slot_hashes::SlotHashes,
+        solana_slot_hashes::SlotHashes,
         solana_time_utils::slot_duration_from_slots_per_year,
         solana_transaction::{Transaction, versioned::TransactionVersion},
         solana_transaction_error::TransactionError,

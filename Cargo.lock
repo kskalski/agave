@@ -9810,6 +9810,7 @@ dependencies = [
  "solana-sha256-hasher",
  "solana-signature",
  "solana-signer",
+ "solana-slot-hashes",
  "solana-slot-history",
  "solana-stake-interface",
  "solana-storage-bigtable",

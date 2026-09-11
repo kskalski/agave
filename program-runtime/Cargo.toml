@@ -45,7 +45,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 solana-account = { workspace = true }
 solana-account-info = { workspace = true }
-solana-clock = { workspace = true }
+solana-clock = { workspace = true, features = ["serde", "sysvar"] }
 solana-epoch-rewards = { workspace = true }
 solana-epoch-schedule = { workspace = true }
 solana-fee-structure = { workspace = true }
@@ -61,9 +61,9 @@ solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
 solana-sbpf = { workspace = true, features = ["jit"] }
 solana-sdk-ids = { workspace = true }
-solana-slot-hashes = { workspace = true, features = ["wincode"] }
+solana-slot-hashes = { workspace = true, features = ["serde", "sysvar", "wincode"] }
 solana-stable-layout = { workspace = true }
-solana-stake-history = { workspace = true }
+solana-stake-history = { workspace = true, features = ["serde", "sysvar"] }
 solana-svm-callback = { workspace = true }
 solana-svm-feature-set = { workspace = true }
 solana-svm-log-collector = { workspace = true }
