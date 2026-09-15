@@ -1,7 +1,7 @@
 #[cfg(not(feature = "shuttle-test"))]
 use {bincode::serialize, solana_hash::HASH_BYTES, solana_sha256_hasher::hash};
 use {
-    criterion::{Criterion, criterion_group, criterion_main},
+    criterion::{BatchSize, Criterion, criterion_group, criterion_main},
     rand::{Rng, SeedableRng, rngs::SmallRng},
     solana_accounts_db::ancestors::Ancestors,
     solana_hash::Hash,
@@ -9,6 +9,11 @@ use {
     solana_signature::{SIGNATURE_BYTES, Signature},
     std::time::Duration,
 };
+
+// Transactions per slot in the fixtures below. bench_status_cache_add_roots
+// rebuilds its whole fixture once per iteration, so this sets that cost:
+// 300 slots x 1_000 inserts takes about 65ms.
+const NUM_TXS_PER_SLOT: usize = 1_000;
 
 #[cfg(not(feature = "shuttle-test"))]
 fn bench_status_cache_serialize(c: &mut Criterion) {
@@ -29,7 +34,6 @@ fn bench_status_cache_serialize(c: &mut Criterion) {
     }
     assert!(status_cache.roots().contains(&0));
     c.bench_function("bench_status_cache_serialize", |b| {
-        // Return the value so criterion black-boxes it for us.
         b.iter(|| serialize(&status_cache.root_slot_deltas()).unwrap())
     });
 }
@@ -37,12 +41,18 @@ fn bench_status_cache_serialize(c: &mut Criterion) {
 #[cfg(not(feature = "shuttle-test"))]
 fn bench_status_cache_serialize_max(c: &mut Criterion) {
     // Fill up the status cache to better match what intense runtime usage would
-    // look like.
+    // look like, then root every filled slot: `root_slot_deltas()` walks
+    // `roots()`, so an unrooted slot is never serialized.
     let mut status_cache = BankStatusCache::default();
     let max_root_entries = status_cache.max_root_entries() as u64;
-    fill_status_cache(&mut status_cache, max_root_entries, 100_000);
+    fill_status_cache(&mut status_cache, max_root_entries, NUM_TXS_PER_SLOT);
+    status_cache.add_roots(0..max_root_entries);
 
-    assert!(status_cache.roots().contains(&0));
+    assert_eq!(status_cache.roots().len(), max_root_entries as usize);
+    assert_eq!(
+        status_cache.root_slot_deltas().len(),
+        max_root_entries as usize
+    );
     c.bench_function("bench_status_cache_serialize_max", |b| {
         b.iter(|| serialize(&status_cache.root_slot_deltas()).unwrap())
     });
@@ -63,6 +73,12 @@ fn bench_status_cache_root_slot_deltas(c: &mut Criterion) {
     c.bench_function("bench_status_cache_root_slot_deltas", |b| {
         b.iter(|| status_cache.root_slot_deltas())
     });
+}
+
+fn random_signature(rng: &mut SmallRng) -> Signature {
+    let mut sigbytes = [0u8; SIGNATURE_BYTES];
+    rng.fill(&mut sigbytes);
+    Signature::from(sigbytes)
 }
 
 fn fill_status_cache(status_cache: &mut BankStatusCache, max_root_entries: u64, num_txs: usize) {
@@ -103,28 +119,53 @@ fn bench_status_cache_check_and_insert(c: &mut Criterion) {
     let slot = max_root_entries + 1;
     let ancestors = Ancestors::from((slot - 32..slot).collect::<Vec<u64>>());
 
-    // Pre-generate unique tx_hashes so we don't spend benchmark time generating
-    // them.
+    // Generate the batch per iteration, outside the measurement: one signature
+    // in ten is already in the cache, the rest are new. In `check_status_cache`
+    // a hit means AlreadyProcessed, so duplicates are the minority - but a hit
+    // costs several times more than a miss plus insert, so a tenth of them
+    // still puts a meaningful share of the measurement on the hit path.
+    //
+    // Every lookup probes the map for this one blockhash, which the fixture
+    // fills with 100_000 entries, and the nine new signatures in ten land in
+    // that same map. A full run nearly doubles it, so lookups slow down as the
+    // run goes on and the reported ns/iter tracks the iteration count criterion
+    // picks: it sits near 0.79ms in four runs of five and near 0.45ms in the
+    // rest. Only regressions larger than that are visible here.
     let batch_size = 1_000;
-    let mut tx_hashes = Vec::with_capacity(batch_size);
+    let duplicate_every = 10;
     let mut rng = SmallRng::seed_from_u64(0);
-    for _ in 0..batch_size {
-        let mut sigbytes = [0u8; SIGNATURE_BYTES];
-        rng.fill(&mut sigbytes);
-        tx_hashes.push(Signature::from(sigbytes));
+    let duplicates: Vec<Signature> = (0..batch_size)
+        .map(|_| random_signature(&mut rng))
+        .collect();
+    for sig in &duplicates {
+        status_cache.insert(&blockhash, *sig, slot, Ok(()));
     }
 
     c.bench_function("bench_status_cache_check_and_insert", |b| {
-        b.iter(|| {
-            for tx_hash in &tx_hashes {
-                if status_cache
-                    .get_status(*tx_hash, &blockhash, &ancestors)
-                    .is_none()
-                {
-                    status_cache.insert(&blockhash, *tx_hash, slot, Ok(()));
+        b.iter_batched_ref(
+            || {
+                (0..batch_size)
+                    .map(|i| {
+                        if i % duplicate_every == 0 {
+                            duplicates[rng.random_range(0..duplicates.len())]
+                        } else {
+                            random_signature(&mut rng)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |batch| {
+                for tx_hash in batch.iter() {
+                    if status_cache
+                        .get_status(*tx_hash, &blockhash, &ancestors)
+                        .is_none()
+                    {
+                        status_cache.insert(&blockhash, *tx_hash, slot, Ok(()));
+                    }
                 }
-            }
-        })
+            },
+            BatchSize::SmallInput,
+        )
     });
 }
 
@@ -132,18 +173,31 @@ fn bench_status_cache_check_and_insert(c: &mut Criterion) {
 // `max_root_entries`.
 #[allow(clippy::arithmetic_side_effects)]
 fn bench_status_cache_add_roots(c: &mut Criterion) {
-    // Fill up the status cache to better match what intense runtime usage would
-    // look like.
-    let mut status_cache = BankStatusCache::default();
-    let max_root_entries = status_cache.max_root_entries() as u64;
-    fill_status_cache(&mut status_cache, max_root_entries, 100_000);
+    let max_root_entries = BankStatusCache::default().max_root_entries() as u64;
     let start_slot = max_root_entries + 1;
+
+    // Rebuild the fixture per iteration: `add_root` only does real work while
+    // the cache is at capacity, and the first call purges the roots and their
+    // deltas. Sharing one cache would leave every later iteration re-adding
+    // roots that are already present.
     c.bench_function("bench_status_cache_add_roots", |b| {
-        b.iter(|| {
-            for root in start_slot..start_slot + max_root_entries {
-                status_cache.add_root(root);
-            }
-        })
+        b.iter_batched_ref(
+            || {
+                let mut status_cache = BankStatusCache::default();
+                fill_status_cache(&mut status_cache, max_root_entries, NUM_TXS_PER_SLOT);
+                status_cache.add_roots(0..max_root_entries);
+                status_cache
+            },
+            |status_cache| {
+                // The cache is at capacity, so each of these evicts a root
+                // and drops its slot delta - the work add_root does in a
+                // validator.
+                for root in start_slot..start_slot + max_root_entries {
+                    status_cache.add_root(root);
+                }
+            },
+            BatchSize::PerIteration,
+        )
     });
 }
 
@@ -159,14 +213,15 @@ fn bench_status_cache(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    // Cut total run time by trimming criterion's defaults: 3s of warm-up plus
-    // 5s of measurement per bench dominates what this file costs to run.
+    // Cut total run time by trimming criterion's defaults; timings settle early
+    // here. Keep the values fixed: check_and_insert's result depends on them.
     config = Criterion::default()
-        // 3s default
+        // 3s default; the medians are flat from 100ms
         .warm_up_time(Duration::from_millis(150))
-        // 5s default
+        // 5s default; the medians are flat from 0.5s
         .measurement_time(Duration::from_millis(750))
-        // 100 default, 10 is criterion's minimum
+        // 100 default, 10 is criterion's minimum. Only matters for add_roots,
+        // which rebuilds a 65ms fixture per iteration.
         .sample_size(10)
         .without_plots();
     targets = bench_status_cache
