@@ -143,6 +143,10 @@ impl Staging {
         }
     }
 
+    fn len(&self) -> usize {
+        self.count
+    }
+
     fn is_empty(&self) -> bool {
         self.count == 0
     }
@@ -210,6 +214,10 @@ pub struct Accumulator {
     /// streamed into `serial_hasher` rather than staged for the SIMD batch;
     /// carries that state across the message's remaining parts until it is committed.
     cur_spilled: bool,
+    /// Messages hashed so far by the SIMD kernel.
+    num_batched: u64,
+    /// Messages hashed so far by the `blake3` fallback.
+    num_serial: u64,
 }
 
 impl core::fmt::Debug for Accumulator {
@@ -249,7 +257,21 @@ impl Accumulator {
             batch_mix_in_fn,
             serial_hasher: blake3::Hasher::new(),
             cur_spilled: false,
+            num_batched: 0,
+            num_serial: 0,
         }
+    }
+
+    /// Messages hashed by the SIMD kernel, and messages hashed by the `blake3`
+    /// fallback. A message falls back when it overflows one chunk, or when it sits
+    /// in a batch that never filled.
+    pub fn hashed_counts(&self) -> (u64, u64) {
+        (self.num_batched, self.num_serial)
+    }
+
+    /// Messages staged for a batch that has not flushed yet.
+    pub fn num_staged(&self) -> usize {
+        self.staging.len()
     }
 
     /// Group-add the lattice hash of one whole `msg` into the running value. To
@@ -288,6 +310,7 @@ impl Accumulator {
         if self.cur_spilled {
             self.acc.mix_in(&LtHash::with(&self.serial_hasher));
             self.cur_spilled = false;
+            self.num_serial += 1;
             return;
         }
         if self.staging.finish_current() {
@@ -335,7 +358,9 @@ impl Accumulator {
             // detected, and `filter` guarantees a full batch
             // (`batch.len() == num_available_lanes == L::N`).
             unsafe { simd(batch, &mut self.acc) };
+            self.num_batched += batch.len() as u64;
         } else {
+            self.num_serial += batch.len() as u64;
             for (lane, &len) in batch.lanes.iter().zip(batch.lengths) {
                 let bytes: &[u8] = bytemuck::cast_slice(lane.as_slice());
                 // Reset before each message: the shared hasher may be dirty from a

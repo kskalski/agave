@@ -215,7 +215,7 @@ impl Bank {
     pub fn finish_accounts_lt_hash_updates(&self) {
         let timer = Instant::now();
         self.accounts_lt_hash_async_progress.set_is_at_end_of_slot();
-        let num_jobs_total = {
+        let stats = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
             Arc::clone(&self.accounts_lt_hash_async_progress).finish(&mut accounts_lt_hash.0)
         };
@@ -227,8 +227,14 @@ impl Bank {
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
-            ("num_jobs", num_jobs_total, i64),
+            ("num_jobs", stats.num_jobs, i64),
             ("finish_us", finish_time.as_micros(), i64),
+            ("spin_us", stats.spin_us, i64),
+            ("drain_us", stats.drain_us, i64),
+            ("mix_us", stats.mix_us, i64),
+            ("num_staged", stats.num_staged, i64),
+            ("num_batched", stats.num_batched, i64),
+            ("num_serial", stats.num_serial, i64),
             (
                 "seen_accounts_freelist_num_containers",
                 seen_accounts_freelist_stats.num_containers,
@@ -271,6 +277,8 @@ struct ThreadAcc {
     minus: Accumulator,
     /// `Σ curr − Σ prev`, once `drain()` has hashed whatever was still staged.
     delta: LtHash,
+    /// Messages the drain had to hash, since no batch of theirs ever filled.
+    num_staged: u64,
 }
 
 impl ThreadAcc {
@@ -279,11 +287,13 @@ impl ThreadAcc {
             plus: Accumulator::new(),
             minus: Accumulator::new(),
             delta: LtHash::identity(),
+            num_staged: 0,
         }
     }
 
     /// Hashes the staged remainder and folds it into `delta`.
     fn drain(&mut self) {
+        self.num_staged = (self.plus.num_staged() + self.minus.num_staged()) as u64;
         self.delta.mix_in(&self.plus.take_lt_hash());
         self.delta.mix_out(&self.minus.take_lt_hash());
     }
@@ -307,6 +317,21 @@ impl ThreadAcc {
             AccountsDb::add_account_to_lt_hash(&mut self.plus, &curr_account, &address);
         }
     }
+}
+
+/// Breakdown of one bank's `finish()`, for the `bank-accounts_lt_hash` datapoint.
+#[derive(Debug, Default)]
+struct FinishStats {
+    num_jobs: u64,
+    /// Waiting for the hasher threads to catch up.
+    spin_us: u64,
+    /// Hashing whatever never filled a batch.
+    drain_us: u64,
+    /// Folding the per-worker deltas into the bank hash.
+    mix_us: u64,
+    num_staged: u64,
+    num_batched: u64,
+    num_serial: u64,
 }
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
@@ -375,22 +400,40 @@ impl AccountsLtHashAsyncProgress {
     ///
     /// Note: Since an LtHash is large, `lt_hash` is passed as an in-out parameter.
     /// This it to avoid Rust compiler bug that fails to perform return value optimization.
-    fn finish(self: Arc<Self>, lt_hash: &mut LtHash) -> u64 {
+    fn finish(self: Arc<Self>, lt_hash: &mut LtHash) -> FinishStats {
+        let timer = Instant::now();
         while self.num_jobs_pending.load(Ordering::Relaxed) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
             hint::spin_loop();
         }
+        let spin_us = timer.elapsed().as_micros() as u64;
 
         // Only now that no job can stage anything more is it safe to drain.
+        let timer = Instant::now();
         Self::spawn_drains(&self);
         while self.num_drains_pending.load(Ordering::Relaxed) > 0 {
             hint::spin_loop();
         }
+        let drain_us = timer.elapsed().as_micros() as u64;
 
+        let timer = Instant::now();
+        let mut stats = FinishStats {
+            num_jobs: self.num_jobs_total.load(Ordering::Relaxed),
+            spin_us,
+            drain_us,
+            ..FinishStats::default()
+        };
         for thread_accumulator in self.accumulators.iter() {
-            lt_hash.mix_in(&thread_accumulator.lock().unwrap().take_delta());
+            let mut thread_accumulator = thread_accumulator.lock().unwrap();
+            let (plus_batched, plus_serial) = thread_accumulator.plus.hashed_counts();
+            let (minus_batched, minus_serial) = thread_accumulator.minus.hashed_counts();
+            stats.num_batched += plus_batched + minus_batched;
+            stats.num_serial += plus_serial + minus_serial;
+            stats.num_staged += thread_accumulator.num_staged;
+            lt_hash.mix_in(&thread_accumulator.take_delta());
         }
-        self.num_jobs_total.load(Ordering::Relaxed)
+        stats.mix_us = timer.elapsed().as_micros() as u64;
+        stats
     }
 
     /// Parallelizes the hashing of whatever did not fill a batch, one job per worker.
