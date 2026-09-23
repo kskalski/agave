@@ -86,7 +86,6 @@ impl Bank {
                 let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
                 manager.queue.push(QueuedAccountsLtHashUpdate {
                     async_progress,
-                    num_updates: 1,
                     inner: AccountsLtHashUpdate {
                         address: *address,
                         prev_account,
@@ -180,7 +179,6 @@ impl Bank {
                     prev_account,
                     curr_account,
                 },
-                1,
             );
         };
 
@@ -306,12 +304,7 @@ impl AccountsLtHashAsyncProgress {
     }
 
     /// Enqueues `update` into `thread_pool` for asynchronous processing.
-    fn spawn(
-        self: Arc<Self>,
-        thread_pool: &'static ThreadPool,
-        update: AccountsLtHashUpdate,
-        num_updates: usize,
-    ) {
+    fn spawn(self: Arc<Self>, thread_pool: &'static ThreadPool, update: AccountsLtHashUpdate) {
         self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
         thread_pool.spawn({
             move || {
@@ -328,8 +321,7 @@ impl AccountsLtHashAsyncProgress {
                 // Decrementing the number of pending jobs MUST happen *after*
                 // accumulating the result.  This ensures `finish()` cannot
                 // observe zero pending jobs until all workers are done.
-                self.num_jobs_pending
-                    .fetch_sub(num_updates, Ordering::Relaxed);
+                self.num_jobs_pending.fetch_sub(1, Ordering::Relaxed);
             }
         });
     }
@@ -487,10 +479,9 @@ impl AccountsLtHashManager {
                         for (_, queued_update) in deduplicated_updates.drain() {
                             let QueuedAccountsLtHashUpdate {
                                 async_progress,
-                                num_updates,
                                 inner: account_update,
                             } = queued_update;
-                            async_progress.spawn(thread_pool, account_update, num_updates);
+                            async_progress.spawn(thread_pool, account_update);
                         }
                     }
                 }
@@ -525,9 +516,12 @@ impl AccountsLtHashManager {
                 entry.insert(queued_update);
             }
             Entry::Occupied(mut entry) => {
-                let value = entry.get_mut();
-                value.num_updates += queued_update.num_updates;
-                value.inner.curr_account = queued_update.inner.curr_account;
+                // The duplicate never becomes a job, so drop its pending count.
+                queued_update
+                    .async_progress
+                    .num_jobs_pending
+                    .fetch_sub(1, Ordering::Relaxed);
+                entry.get_mut().inner.curr_account = queued_update.inner.curr_account;
             }
         }
     }
@@ -543,9 +537,6 @@ type UpdateKey = (usize, Pubkey);
 struct QueuedAccountsLtHashUpdate {
     /// The async progress instance this account update should apply to.
     async_progress: Arc<AccountsLtHashAsyncProgress>,
-    /// The number of total updates this instance represents.
-    /// When updates are deduplicated, this count is incremented.
-    num_updates: usize,
     // The actual account update.
     inner: AccountsLtHashUpdate,
 }
@@ -1238,11 +1229,19 @@ mod tests {
         let async_progress2 = Arc::new(AccountsLtHashAsyncProgress::new());
         let mut deduplicated_updates = ahash::HashMap::default();
 
+        // Count the updates as enqueueing does, so dedup has a count to
+        // settle.
+        async_progress1
+            .num_jobs_pending
+            .fetch_add(2, Ordering::Relaxed);
+        async_progress2
+            .num_jobs_pending
+            .fetch_add(1, Ordering::Relaxed);
+
         AccountsLtHashManager::deduplicate_update(
             &mut deduplicated_updates,
             QueuedAccountsLtHashUpdate {
                 async_progress: Arc::clone(&async_progress1),
-                num_updates: 1,
                 inner: AccountsLtHashUpdate {
                     address,
                     prev_account: Some(AccountSharedData::new(11, 0, &Pubkey::default())),
@@ -1255,7 +1254,6 @@ mod tests {
             &mut deduplicated_updates,
             QueuedAccountsLtHashUpdate {
                 async_progress: Arc::clone(&async_progress1),
-                num_updates: 1,
                 inner: AccountsLtHashUpdate {
                     address,
                     prev_account: Some(AccountSharedData::new(12, 0, &Pubkey::default())),
@@ -1269,7 +1267,6 @@ mod tests {
             &mut deduplicated_updates,
             QueuedAccountsLtHashUpdate {
                 async_progress: Arc::clone(&async_progress2),
-                num_updates: 1,
                 inner: AccountsLtHashUpdate {
                     address,
                     prev_account: Some(AccountSharedData::new(21, 0, &Pubkey::default())),
@@ -1281,9 +1278,20 @@ mod tests {
         assert_eq!(deduplicated_updates.len(), 2);
         let key = (Arc::as_ptr(&async_progress1) as usize, address);
         let update = deduplicated_updates.get(&key).unwrap();
-        assert_eq!(update.num_updates, 2);
         assert_eq!(update.inner.prev_account.as_ref().unwrap().lamports(), 11);
         assert_eq!(update.inner.curr_account.as_ref().unwrap().lamports(), 13);
+
+        // Dedup leaves one pending update per bank.
+        assert_eq!(
+            async_progress1.num_jobs_pending.load(Ordering::Relaxed),
+            1,
+            "dedup settled the dropped duplicate",
+        );
+        assert_eq!(
+            async_progress2.num_jobs_pending.load(Ordering::Relaxed),
+            1,
+            "dedup never crosses banks",
+        );
     }
 
     /// Ensure freelist respects max size.
