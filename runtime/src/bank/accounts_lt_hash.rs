@@ -1,3 +1,5 @@
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::{field_qualifiers, qualifiers};
 use {
     super::Bank,
     crossbeam_queue::SegQueue,
@@ -286,6 +288,7 @@ impl AccountsLtHashAsyncProgress {
     /// Returns without waiting for the hashing. The manager dedups updates across
     /// calls and spawns them once per dedup interval, or on `finish()`, which forces
     /// a queue flush.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn enqueue_for_dedup(
         self: &Arc<Self>,
         updates: impl IntoIterator<Item = AccountsLtHashUpdate>,
@@ -316,6 +319,7 @@ impl AccountsLtHashAsyncProgress {
     ///
     /// Call this only before the first `enqueue_for_dedup()` or after the last, so the
     /// two paths never interleave.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn spawn_deduped(self: &Arc<Self>, updates: impl IntoIterator<Item = AccountsLtHashUpdate>) {
         let thread_pool = accounts_hasher_thread_pool();
         for update in updates {
@@ -325,12 +329,19 @@ impl AccountsLtHashAsyncProgress {
         }
     }
 
+    /// Number of queued or in flight updates.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn num_pending(&self) -> usize {
+        self.num_jobs_pending.load(Ordering::Relaxed)
+    }
+
     /// Waits for all pending jobs to complete, then mixes the results into `lt_hash`.
     ///
     /// Returns the number of asynchronous jobs completed.
     ///
     /// Note: Since an LtHash is large, `lt_hash` is passed as an in-out parameter.
     /// This it to avoid Rust compiler bug that fails to perform return value optimization.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn finish(&self, lt_hash: &mut LtHash) -> u64 {
         // Signal end of slot, so the manager wakes up and spawns queued updates
         // without waiting out its dedup interval.
@@ -549,6 +560,11 @@ struct QueuedAccountsLtHashUpdate {
 }
 
 /// A single accounts lt hash update to process.
+#[cfg_attr(
+    feature = "dev-context-only-utils",
+    qualifiers(pub),
+    field_qualifiers(address(pub), prev_account(pub), curr_account(pub))
+)]
 #[derive(Clone, Debug)]
 struct AccountsLtHashUpdate {
     address: Pubkey,
