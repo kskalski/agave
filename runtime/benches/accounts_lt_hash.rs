@@ -172,7 +172,7 @@ fn bench_freeze_pending(c: &mut Criterion) {
                     // go quiet, so the timed region sees only the pending updates and
                     // `finish()`.
                     progress.enqueue_for_dedup(prefill.iter().cloned());
-                    progress.wait_for_pending_jobs();
+                    progress.wait_for_pending_updates();
                     (progress, pending_updates.to_vec())
                 },
                 |(progress, updates)| enqueue_and_finish(&progress, updates),
