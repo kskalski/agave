@@ -1,3 +1,5 @@
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::{field_qualifiers, qualifiers};
 use {
     super::Bank,
     crossbeam_queue::SegQueue,
@@ -290,6 +292,7 @@ impl AccountsLtHashAsyncProgress {
     /// Returns without waiting for the hashing. The manager dedups updates across
     /// calls and spawns them once per dedup interval, or on `finish()`, which forces
     /// a queue flush. `updates` must hold at most `max_updates_count` updates.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn enqueue_for_dedup(
         self: &Arc<Self>,
         max_updates_count: usize,
@@ -324,6 +327,7 @@ impl AccountsLtHashAsyncProgress {
     /// Adds `count` to the pending jobs count.
     ///
     /// Call this once before a series of `spawn_deduped()` calls, with the sum of their updates.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn add_deduped_count(&self, count: usize) {
         self.num_jobs_pending.fetch_add(count, Ordering::Relaxed);
     }
@@ -336,10 +340,20 @@ impl AccountsLtHashAsyncProgress {
     ///
     /// Call this only before the first `enqueue_for_dedup()` or after the last, so the
     /// two paths never interleave. Count `updates` with `add_deduped_count()` first.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn spawn_deduped(self: &Arc<Self>, updates: impl IntoIterator<Item = AccountsLtHashUpdate>) {
         let thread_pool = accounts_hasher_thread_pool();
         for update in updates {
             Arc::clone(self).spawn(thread_pool, update);
+        }
+    }
+
+    /// Spins until no queued or in flight updates remain.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+    fn wait_for_pending_jobs(&self) {
+        while self.num_jobs_pending.load(Ordering::Relaxed) > 0 {
+            // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
+            hint::spin_loop();
         }
     }
 
@@ -349,14 +363,12 @@ impl AccountsLtHashAsyncProgress {
     ///
     /// Note: Since an LtHash is large, `lt_hash` is passed as an in-out parameter.
     /// This it to avoid Rust compiler bug that fails to perform return value optimization.
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn finish(&self, lt_hash: &mut LtHash) -> u64 {
         // Signal end of slot, so the manager wakes up and spawns queued updates
         // without waiting out its dedup interval.
         self.set_is_at_end_of_slot();
-        while self.num_jobs_pending.load(Ordering::Relaxed) > 0 {
-            // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
-            hint::spin_loop();
-        }
+        self.wait_for_pending_jobs();
 
         for thread_accumulator in self.accumulators.iter() {
             lt_hash.mix_in(&thread_accumulator.lock().unwrap());
@@ -593,7 +605,12 @@ struct QueuedAccountsLtHashUpdate {
 }
 
 /// A single accounts lt hash update to process.
-#[cfg_attr(test, derive(Clone))]
+#[cfg_attr(
+    feature = "dev-context-only-utils",
+    qualifiers(pub),
+    field_qualifiers(address(pub), prev_account(pub), curr_account(pub))
+)]
+#[cfg_attr(any(test, feature = "dev-context-only-utils"), derive(Clone))]
 #[derive(Debug)]
 struct AccountsLtHashUpdate {
     address: Pubkey,
