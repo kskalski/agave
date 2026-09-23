@@ -225,5 +225,9 @@ harness = false
 name = "epoch_turnover"
 harness = false
 
+[[bench]]
+name = "accounts_lt_hash"
+harness = false
+
 [lints]
 workspace = true
