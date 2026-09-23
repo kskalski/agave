@@ -180,6 +180,7 @@ impl Bank {
         let finish_time = timer.elapsed();
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
+        let manager = accounts_lt_hash_manager();
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
@@ -202,9 +203,27 @@ impl Bank {
             ),
             (
                 "num_banks_waiting",
-                accounts_lt_hash_manager()
-                    .num_banks_waiting
-                    .load(Ordering::Relaxed),
+                manager.num_banks_waiting.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_updates_popped",
+                manager.stats.num_updates_popped.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_updates_submitted",
+                manager.stats.num_updates_submitted.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_flushes",
+                manager.stats.num_flushes.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "total_spawn_us",
+                manager.stats.total_spawn_us.load(Ordering::Relaxed),
                 i64
             ),
         );
@@ -412,6 +431,19 @@ fn accounts_lt_hash_manager() -> &'static AccountsLtHashManager {
     &MANAGER
 }
 
+/// Manager's deduplication and dispatch statistics. Cumulative.
+#[derive(Debug, Default)]
+struct ManagerStats {
+    /// Updates taken off the queue, before dedup.
+    num_updates_popped: AtomicU64,
+    /// Updates handed to the pool, after dedup.
+    num_updates_submitted: AtomicU64,
+    /// Dispatch rounds. Mean flush size is `num_updates_submitted / num_flushes`.
+    num_flushes: AtomicU64,
+    /// Time spent spawning jobs, summed over every flush.
+    total_spawn_us: AtomicU64,
+}
+
 /// Manages account updates.
 ///
 /// Replay/etc threads push account updates into a queue owned by the manager.
@@ -426,6 +458,7 @@ struct AccountsLtHashManager {
     /// A count used to signal when banks are waiting on updates.
     /// When non-zero, updates are spawned immediately; the manager does not wait to dedup.
     num_banks_waiting: Arc<AtomicUsize>,
+    stats: Arc<ManagerStats>,
 }
 
 impl AccountsLtHashManager {
@@ -438,6 +471,7 @@ impl AccountsLtHashManager {
     fn new() -> Self {
         let queue = Arc::new(SegQueue::<QueuedAccountsLtHashUpdate>::new());
         let num_banks_waiting = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(ManagerStats::default());
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
         thread::Builder::new()
@@ -445,6 +479,7 @@ impl AccountsLtHashManager {
             .spawn({
                 let queue = Arc::clone(&queue);
                 let num_banks_waiting = Arc::clone(&num_banks_waiting);
+                let stats = Arc::clone(&stats);
                 move || {
                     let thread_pool = accounts_hasher_thread_pool();
                     let mut deduplicated_updates = ahash::HashMap::default();
@@ -458,13 +493,18 @@ impl AccountsLtHashManager {
                             // This ensures we don't loop infinitely, popping off
                             // the queue and never processing the updates.
                             let mut queue_was_empty = false;
+                            let mut num_popped = 0;
                             for _ in 0..Self::MAX_UPDATES_TO_POP {
                                 let Some(queued_update) = queue.pop() else {
                                     queue_was_empty = true;
                                     break;
                                 };
                                 Self::deduplicate_update(&mut deduplicated_updates, queued_update);
+                                num_popped += 1;
                             }
+                            stats
+                                .num_updates_popped
+                                .fetch_add(num_popped, Ordering::Relaxed);
 
                             // If there are banks actively waiting (i.e. freezing), and updates
                             // to process, then break immediately and spawn the updates we have.
@@ -494,6 +534,8 @@ impl AccountsLtHashManager {
                         }
 
                         // spawn updates into thread pool for processing
+                        let num_submitted = deduplicated_updates.len() as u64;
+                        let spawn_timer = Instant::now();
                         for (_, queued_update) in deduplicated_updates.drain() {
                             let QueuedAccountsLtHashUpdate {
                                 async_progress,
@@ -501,6 +543,13 @@ impl AccountsLtHashManager {
                             } = queued_update;
                             async_progress.spawn(thread_pool, account_update);
                         }
+                        stats
+                            .total_spawn_us
+                            .fetch_add(spawn_timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        stats
+                            .num_updates_submitted
+                            .fetch_add(num_submitted, Ordering::Relaxed);
+                        stats.num_flushes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
@@ -509,6 +558,7 @@ impl AccountsLtHashManager {
             queue,
             unparker,
             num_banks_waiting,
+            stats,
         }
     }
 
