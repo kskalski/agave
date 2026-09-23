@@ -9,8 +9,9 @@ use {
     },
     rayon::{
         ThreadPool, ThreadPoolBuilder,
-        iter::{IntoParallelIterator, ParallelIterator},
+        iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
     },
+    smallvec::SmallVec,
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
@@ -132,24 +133,37 @@ impl Bank {
         self.accounts_lt_hash_async_progress
             .add_deduped_count(accounts.len());
 
-        // A closure that does the loading and spawning, so code is shared
-        // whether using the thread_pool_for_loading_accounts or not.
-        let load_then_spawn = |index| {
-            let address = accounts.pubkey(index);
-            let prev_account = self
-                .rc
-                .accounts
-                .load_with_fixed_root_do_not_populate_read_cache(&self.ancestors, address)
-                .map(|(account, _slot)| account);
-            let curr_account = accounts.account(index, |account| {
-                (account.lamports() != 0).then(|| account.take_account())
-            });
-            self.accounts_lt_hash_async_progress
-                .spawn_deduped([AccountsLtHashUpdate {
+        // Loading previous versions costs more than hashing them, so spread it over
+        // every loading thread rather than over the hashers' chunk count.
+        let chunk_len = match thread_pool_for_loading_accounts {
+            Some(thread_pool) => accounts
+                .len()
+                .div_ceil(thread_pool.current_num_threads())
+                .max(1),
+            None => chunk_len(accounts.len()),
+        };
+
+        // A closure that does the loading and spawning for one chunk, so code is
+        // shared whether using the thread_pool_for_loading_accounts or not.
+        let load_then_spawn = |start: usize| {
+            let end = (start + chunk_len).min(accounts.len());
+            let updates = (start..end).map(|index| {
+                let address = accounts.pubkey(index);
+                let prev_account = self
+                    .rc
+                    .accounts
+                    .load_with_fixed_root_do_not_populate_read_cache(&self.ancestors, address)
+                    .map(|(account, _slot)| account);
+                let curr_account = accounts.account(index, |account| {
+                    (account.lamports() != 0).then(|| account.take_account())
+                });
+                AccountsLtHashUpdate {
                     address: *address,
                     prev_account,
                     curr_account,
-                }]);
+                }
+            });
+            self.accounts_lt_hash_async_progress.spawn_deduped(updates);
         };
 
         if let Some(thread_pool_for_loading_accounts) = thread_pool_for_loading_accounts {
@@ -158,10 +172,13 @@ impl Bank {
             thread_pool_for_loading_accounts.install(|| {
                 (0..accounts.len())
                     .into_par_iter()
+                    .step_by(chunk_len)
                     .for_each(load_then_spawn);
             });
         } else {
-            (0..accounts.len()).for_each(load_then_spawn);
+            (0..accounts.len())
+                .step_by(chunk_len)
+                .for_each(load_then_spawn);
         }
     }
 
@@ -244,7 +261,8 @@ pub struct AccountsLtHashAsyncProgress {
     //  │0      │6 <-- unaligned │2054     │2176   │2182            │4230     │4352
     //
     accumulators: [Mutex<CachePadded<LtHash>>; NUM_ACCOUNTS_HASHER_THREADS],
-    num_jobs_pending: AtomicUsize,
+    num_updates_pending: AtomicUsize,
+    /// Jobs spawned into the hasher pool, one per chunk of updates.
     num_jobs_total: AtomicU64,
     /// Flag to indicate if the bank has reached the end of the slot.
     /// When true, this causes the manager to send account updates to
@@ -258,33 +276,10 @@ impl AccountsLtHashAsyncProgress {
     pub fn new() -> Self {
         Self {
             accumulators: array::from_fn(|_| Mutex::new(CachePadded::new(LtHash::identity()))),
-            num_jobs_pending: AtomicUsize::new(0),
+            num_updates_pending: AtomicUsize::new(0),
             num_jobs_total: AtomicU64::new(0),
             is_at_end_of_slot: AtomicBool::new(false),
         }
-    }
-
-    /// Enqueues `update` into `thread_pool` for asynchronous processing.
-    fn spawn(self: Arc<Self>, thread_pool: &'static ThreadPool, update: AccountsLtHashUpdate) {
-        self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
-        thread_pool.spawn({
-            move || {
-                // SAFETY: We always call from the same/correct Rayon thread pool.
-                let worker_index = thread_pool.current_thread_index().unwrap();
-
-                // SAFETY: There are num_threads accumulators, and each
-                // thread's index shall always be in range 0..num_threads.
-                debug_assert!(worker_index < self.accumulators.len());
-                let accumulator = unsafe { self.accumulators.get_unchecked(worker_index) };
-
-                Self::process(&mut accumulator.lock().unwrap(), update);
-
-                // Decrementing the number of pending jobs MUST happen *after*
-                // accumulating the result.  This ensures `finish()` cannot
-                // observe zero pending jobs until all workers are done.
-                self.num_jobs_pending.fetch_sub(1, Ordering::Relaxed);
-            }
-        });
     }
 
     /// Queues `updates` for asynchronous hashing.
@@ -301,7 +296,7 @@ impl AccountsLtHashAsyncProgress {
         // Count the upper bound before queueing, so a worker cannot drive the pending
         // count below zero. Updating the counter per call rather than per account
         // minimizes contention among the threads sharing the counter.
-        self.num_jobs_pending
+        self.num_updates_pending
             .fetch_add(max_updates_count, Ordering::Relaxed);
         let manager = accounts_lt_hash_manager();
         let mut num_enqueued = 0;
@@ -314,7 +309,7 @@ impl AccountsLtHashAsyncProgress {
         }
         let num_skipped = max_updates_count - num_enqueued;
         if num_skipped > 0 {
-            self.num_jobs_pending
+            self.num_updates_pending
                 .fetch_sub(num_skipped, Ordering::Relaxed);
         }
 
@@ -324,12 +319,12 @@ impl AccountsLtHashAsyncProgress {
         }
     }
 
-    /// Adds `count` to the pending jobs count.
+    /// Adds `count` to the pending updates count.
     ///
     /// Call this once before a series of `spawn_deduped()` calls, with the sum of their updates.
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn add_deduped_count(&self, count: usize) {
-        self.num_jobs_pending.fetch_add(count, Ordering::Relaxed);
+        self.num_updates_pending.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Spawns `updates` for asynchronous hashing.
@@ -338,26 +333,62 @@ impl AccountsLtHashAsyncProgress {
     /// manager neither dedups nor delays them. `updates` must thus hold each account
     /// at most once. Updates already in the queue stay there.
     ///
+    /// The updates share one job.
+    ///
     /// Call this only before the first `enqueue_for_dedup()` or after the last, so the
     /// two paths never interleave. Count `updates` with `add_deduped_count()` first.
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn spawn_deduped(self: &Arc<Self>, updates: impl IntoIterator<Item = AccountsLtHashUpdate>) {
-        let thread_pool = accounts_hasher_thread_pool();
-        for update in updates {
-            Arc::clone(self).spawn(thread_pool, update);
+        let chunk: Vec<_> = updates.into_iter().collect();
+        if !chunk.is_empty() {
+            Arc::clone(self).spawn_chunk(accounts_hasher_thread_pool(), chunk);
         }
     }
 
     /// Spins until no queued or in flight updates remain.
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    fn wait_for_pending_jobs(&self) {
-        while self.num_jobs_pending.load(Ordering::Relaxed) > 0 {
+    fn wait_for_pending_updates(&self) {
+        while self.num_updates_pending.load(Ordering::Relaxed) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
             hint::spin_loop();
         }
     }
 
-    /// Waits for all pending jobs to complete, then mixes the results into `lt_hash`.
+    /// Enqueues `updates` into `thread_pool` as one job.
+    fn spawn_chunk(
+        self: Arc<Self>,
+        thread_pool: &'static ThreadPool,
+        updates: Vec<AccountsLtHashUpdate>,
+    ) {
+        let num_updates = updates.len();
+        self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
+        thread_pool.spawn({
+            move || {
+                // SAFETY: We always call from the same/correct Rayon thread pool.
+                let worker_index = thread_pool.current_thread_index().unwrap();
+
+                // SAFETY: There are num_threads accumulators, and each
+                // thread's index shall always be in range 0..num_threads.
+                debug_assert!(worker_index < self.accumulators.len());
+                let accumulator = unsafe { self.accumulators.get_unchecked(worker_index) };
+
+                {
+                    let mut accumulator = accumulator.lock().unwrap();
+                    for update in updates {
+                        Self::process(&mut accumulator, update);
+                    }
+                }
+
+                // Decrementing the number of pending updates MUST happen *after*
+                // accumulating the result.  This ensures `finish()` cannot
+                // observe zero pending updates until all workers are done.
+                self.num_updates_pending
+                    .fetch_sub(num_updates, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Waits for all pending updates to complete, then mixes the results into `lt_hash`.
     ///
     /// Returns the number of asynchronous jobs completed.
     ///
@@ -368,7 +399,7 @@ impl AccountsLtHashAsyncProgress {
         // Signal end of slot, so the manager wakes up and spawns queued updates
         // without waiting out its dedup interval.
         self.set_is_at_end_of_slot();
-        self.wait_for_pending_jobs();
+        self.wait_for_pending_updates();
 
         for thread_accumulator in self.accumulators.iter() {
             lt_hash.mix_in(&thread_accumulator.lock().unwrap());
@@ -421,6 +452,18 @@ impl AccountsLtHashAsyncProgress {
                 .fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Derives the chunk size from the number of updates to spawn.
+///
+/// Spread the updates to all workers to keep them busy.
+fn chunk_len(num_updates: usize) -> usize {
+    /// Extra chunks per worker, so work-stealing can rebalance a chunk full of
+    /// large accounts.
+    const CHUNKS_PER_THREAD: usize = 2;
+    num_updates
+        .div_ceil(NUM_ACCOUNTS_HASHER_THREADS * CHUNKS_PER_THREAD)
+        .max(1)
 }
 
 /// Returns the global accounts lt hash manager.
@@ -513,13 +556,7 @@ impl AccountsLtHashManager {
                         }
 
                         // spawn updates into thread pool for processing
-                        for (_, queued_update) in deduplicated_updates.drain() {
-                            let QueuedAccountsLtHashUpdate {
-                                async_progress,
-                                inner: account_update,
-                            } = queued_update;
-                            async_progress.spawn(thread_pool, account_update);
-                        }
+                        Self::spawn_chunked(thread_pool, &mut deduplicated_updates);
                     }
                 }
             })
@@ -529,6 +566,24 @@ impl AccountsLtHashManager {
             unparker,
             num_banks_waiting,
         }
+    }
+
+    /// Drains `updates` and spawns them into `thread_pool` as chunked jobs.
+    ///
+    /// Returns once the jobs are queued, not once they finish.
+    fn spawn_chunked(
+        thread_pool: &'static ThreadPool,
+        updates: &mut ahash::HashMap<UpdateKey, QueuedAccountsLtHashUpdate>,
+    ) {
+        let mut chunk_builders = ChunkBuilders::new(chunk_len(updates.len()));
+        for (_, queued_update) in updates.drain() {
+            let QueuedAccountsLtHashUpdate {
+                async_progress,
+                inner: account_update,
+            } = queued_update;
+            chunk_builders.push(thread_pool, async_progress, account_update);
+        }
+        chunk_builders.spawn_remaining(thread_pool);
     }
 
     /// Deduplicates account updates.
@@ -556,7 +611,7 @@ impl AccountsLtHashManager {
                 // The duplicate never becomes a job, so drop its pending count.
                 queued_update
                     .async_progress
-                    .num_jobs_pending
+                    .num_updates_pending
                     .fetch_sub(1, Ordering::Relaxed);
                 entry.get_mut().inner.curr_account = queued_update.inner.curr_account;
             }
@@ -590,6 +645,71 @@ struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
     curr_account: Option<AccountSharedData>,
+}
+
+/// Assembles one bank's chunk of updates on the manager thread.
+struct ChunkBuilder {
+    async_progress: Arc<AccountsLtHashAsyncProgress>,
+    updates: Vec<AccountsLtHashUpdate>,
+}
+
+impl ChunkBuilder {
+    fn is_for(&self, async_progress: &Arc<AccountsLtHashAsyncProgress>) -> bool {
+        Arc::ptr_eq(&self.async_progress, async_progress)
+    }
+
+    fn spawn(self, thread_pool: &'static ThreadPool) {
+        self.async_progress.spawn_chunk(thread_pool, self.updates);
+    }
+}
+
+/// Assembles a flush's updates into per-bank chunks and spawns each chunk once it
+/// holds `chunk_len` updates.
+struct ChunkBuilders {
+    chunk_len: usize,
+    // Replay usually works one fork at a time, so two inline builders avoid
+    // allocating.
+    builders: SmallVec<[ChunkBuilder; 2]>,
+}
+
+impl ChunkBuilders {
+    fn new(chunk_len: usize) -> Self {
+        Self {
+            chunk_len,
+            builders: SmallVec::new(),
+        }
+    }
+
+    /// Adds `update` to its bank's chunk and spawns the chunk once full.
+    fn push(
+        &mut self,
+        thread_pool: &'static ThreadPool,
+        async_progress: Arc<AccountsLtHashAsyncProgress>,
+        update: AccountsLtHashUpdate,
+    ) {
+        let index = self
+            .builders
+            .iter()
+            .position(|builder| builder.is_for(&async_progress))
+            .unwrap_or_else(|| {
+                self.builders.push(ChunkBuilder {
+                    async_progress,
+                    updates: Vec::with_capacity(self.chunk_len),
+                });
+                self.builders.len() - 1
+            });
+        let builder = &mut self.builders[index];
+        builder.updates.push(update);
+        if builder.updates.len() >= self.chunk_len {
+            self.builders.swap_remove(index).spawn(thread_pool);
+        }
+    }
+
+    fn spawn_remaining(self, thread_pool: &'static ThreadPool) {
+        for builder in self.builders {
+            builder.spawn(thread_pool);
+        }
+    }
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
@@ -1272,10 +1392,10 @@ mod tests {
         let mut deduplicated_updates = ahash::HashMap::default();
 
         async_progress1
-            .num_jobs_pending
+            .num_updates_pending
             .fetch_add(2, Ordering::Relaxed);
         async_progress2
-            .num_jobs_pending
+            .num_updates_pending
             .fetch_add(1, Ordering::Relaxed);
 
         AccountsLtHashManager::deduplicate_update(
@@ -1321,8 +1441,14 @@ mod tests {
         assert_eq!(update.inner.prev_account.as_ref().unwrap().lamports(), 11);
         assert_eq!(update.inner.curr_account.as_ref().unwrap().lamports(), 13);
 
-        assert_eq!(async_progress1.num_jobs_pending.load(Ordering::Relaxed), 1);
-        assert_eq!(async_progress2.num_jobs_pending.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            async_progress1.num_updates_pending.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            async_progress2.num_updates_pending.load(Ordering::Relaxed),
+            1
+        );
     }
 
     /// A transaction writes the leader's accounts, then freeze deposits fees into
