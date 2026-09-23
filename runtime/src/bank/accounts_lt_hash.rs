@@ -511,7 +511,7 @@ impl AccountsLtHashManager {
     /// update's 'previous' version, and use `queued_update`'s 'current' version.
     /// If no, insert `queued_update` into `deduplicated_updates`.
     fn deduplicate_update(
-        deduplicated_updates: &mut ahash::HashMap<(usize, Pubkey), QueuedAccountsLtHashUpdate>,
+        deduplicated_updates: &mut ahash::HashMap<UpdateKey, QueuedAccountsLtHashUpdate>,
         queued_update: QueuedAccountsLtHashUpdate,
     ) {
         // Include the AsyncProgress instance in the hashmap key as a proxy for the Bank.
@@ -532,6 +532,12 @@ impl AccountsLtHashManager {
         }
     }
 }
+
+/// Keys a queued update: its progress instance and the account address.
+///
+/// The instance is keyed by pointer. The entry's lifetime keeps that pointer
+/// valid.
+type UpdateKey = (usize, Pubkey);
 
 /// An account update, queued to the manager.
 struct QueuedAccountsLtHashUpdate {
