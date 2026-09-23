@@ -237,6 +237,9 @@ use {
     solana_svm::program_loader::load_program_with_pubkey,
 };
 
+#[cfg(feature = "dev-context-only-utils")]
+pub mod accounts_lt_hash;
+#[cfg(not(feature = "dev-context-only-utils"))]
 mod accounts_lt_hash;
 mod address_lookup_table;
 pub mod bank_hash_details;
