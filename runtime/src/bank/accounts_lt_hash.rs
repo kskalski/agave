@@ -313,6 +313,9 @@ impl AccountsLtHashAsyncProgress {
     /// Returns without waiting for the hashing. The updates skip the queue, so the
     /// manager neither dedups nor delays them. `updates` must thus hold each account
     /// at most once. Updates already in the queue stay there.
+    ///
+    /// Call this only before the first `enqueue_for_dedup()` or after the last, so the
+    /// two paths never interleave.
     fn spawn_deduped(self: &Arc<Self>, updates: impl IntoIterator<Item = AccountsLtHashUpdate>) {
         let thread_pool = accounts_hasher_thread_pool();
         for update in updates {
