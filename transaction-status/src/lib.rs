@@ -1,6 +1,10 @@
 #![cfg(feature = "agave-unstable-api")]
 #![allow(clippy::arithmetic_side_effects)]
 
+#[cfg_attr(feature = "stable-abi", macro_use)]
+#[cfg(feature = "stable-abi")]
+extern crate solana_frozen_abi_macro;
+
 pub use {
     crate::extract_memos::extract_and_fmt_memos,
     solana_reward_info::RewardType,

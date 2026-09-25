@@ -4,11 +4,26 @@ use {
     },
     base64::{Engine, prelude::BASE64_STANDARD},
     bincode::deserialize,
+    serde::Deserialize,
     serde_json::json,
-    solana_loader_v2_interface::LoaderInstruction,
     solana_loader_v3_interface::instruction::UpgradeableLoaderInstruction,
     solana_message::{AccountKeys, compiled_instruction::CompiledInstruction},
 };
+
+/// Mirrors `solana_loader_v2_interface::LoaderInstruction` wire layout.
+#[cfg_attr(
+    feature = "stable-abi",
+    derive(StableAbi, StableAbiSample, PartialEq, serde::Serialize),
+    frozen_abi(
+        abi_digest = "C8z9CxbjNT9UwGVkCkubvUsZH7ZUJPNkNn9TmRp6ZsPC",
+        test_roundtrip = "eq_and_wire"
+    )
+)]
+#[derive(Debug, Deserialize)]
+enum LoaderInstruction {
+    Write { offset: u32, bytes: Vec<u8> },
+    Finalize,
+}
 
 pub fn parse_bpf_loader(
     instruction: &CompiledInstruction,

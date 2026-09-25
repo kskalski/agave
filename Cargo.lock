@@ -11417,6 +11417,8 @@ dependencies = [
  "solana-address-lookup-table-interface",
  "solana-clock",
  "solana-entry",
+ "solana-frozen-abi",
+ "solana-frozen-abi-macro",
  "solana-hash",
  "solana-instruction 4.0.0",
  "solana-loader-v2-interface",
