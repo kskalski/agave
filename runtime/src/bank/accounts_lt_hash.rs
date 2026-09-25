@@ -546,7 +546,7 @@ struct QueuedAccountsLtHashUpdate {
 }
 
 /// A single accounts lt hash update to process.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
@@ -717,6 +717,7 @@ mod tests {
         },
         solana_cluster_type::ClusterType,
         solana_fee_calculator::FeeRateGovernor,
+        solana_fee_structure::FeeStructure,
         solana_genesis_config::{self, GenesisConfig},
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -1296,6 +1297,87 @@ mod tests {
             1,
             "dedup never crosses banks",
         );
+    }
+
+    /// A transaction writes the leader's accounts, then freeze deposits fees into
+    /// them. The same accounts thus take the queued and the spawned path.
+    #[test_case(Features::None; "no features")]
+    #[test_case(Features::All; "all features")]
+    fn test_accounts_lt_hash_with_fees_into_written_accounts(features: Features) {
+        let (genesis_config, mint_keypair) = genesis_config_with(features);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.set_fee_structure(&FeeStructure {
+            lamports_per_signature: 5000,
+            ..FeeStructure::default()
+        });
+        let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
+        let leader = *bank.leader();
+        let slot = bank.slot() + 1;
+        let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, leader, slot);
+
+        for address in [leader.id, leader.vote_address] {
+            bank.register_unique_recent_blockhash_for_test();
+            bank.transfer(LAMPORTS_PER_SOL, &mint_keypair, &address)
+                .unwrap();
+        }
+        let leader_balance =
+            |bank: &Bank| bank.get_balance(&leader.id) + bank.get_balance(&leader.vote_address);
+        let balance_before_freeze = leader_balance(&bank);
+        bank.freeze();
+        assert!(
+            leader_balance(&bank) > balance_before_freeze,
+            "freeze must deposit fees into the leader's accounts",
+        );
+
+        let calculated_accounts_lt_hash = bank
+            .rc
+            .accounts
+            .accounts_db
+            .calculate_accounts_lt_hash_at_startup_from_index(&bank.ancestors);
+        assert_eq!(
+            *bank.accounts_lt_hash.lock().unwrap(),
+            calculated_accounts_lt_hash,
+        );
+    }
+
+    #[test]
+    fn test_pipeline_matches_serial_hash() {
+        let owner = Pubkey::default();
+        let mut accounts: Vec<_> = (0..64).map(|_| (Pubkey::new_unique(), None)).collect();
+        let async_progress = Arc::new(AccountsLtHashAsyncProgress::new());
+        let mut expected_lt_hash = LtHash::identity();
+        // Rewrite every account once per round, in a bank's phases: spawn at setup,
+        // queue for transactions, spawn at freeze.
+        for (round, spawn) in (1..).zip([true, false, false, true]) {
+            let updates: Vec<_> = accounts
+                .iter_mut()
+                .enumerate()
+                .map(|(index, (address, last_version))| {
+                    // Spread sizes from 0.5KiB to 128KiB, since dispatch may treat large
+                    // accounts apart.
+                    let data_len = 512 << (index % 9);
+                    let curr = AccountSharedData::new(round, data_len, &owner);
+                    AccountsLtHashUpdate {
+                        address: *address,
+                        prev_account: last_version.replace(curr.clone()),
+                        curr_account: Some(curr),
+                    }
+                })
+                .collect();
+            // Hash the same updates serially, for reference.
+            for update in &updates {
+                AccountsLtHashAsyncProgress::process(&mut expected_lt_hash, update.clone());
+            }
+            if spawn {
+                async_progress.spawn_deduped(updates);
+            } else {
+                async_progress.enqueue_for_dedup(updates);
+            }
+        }
+
+        let mut lt_hash = LtHash::identity();
+        async_progress.finish(&mut lt_hash);
+        assert_eq!(lt_hash, expected_lt_hash);
     }
 
     /// Ensure freelist respects max size.
