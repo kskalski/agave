@@ -1,3 +1,5 @@
+#[cfg(feature = "stable-abi")]
+use solana_frozen_abi_macro::{StableAbi, StableAbiSample, frozen_abi};
 use {
     crate::{client_ids::ClientId, compute_commit},
     rand::{Rng, rng},
@@ -6,6 +8,14 @@ use {
     solana_serde_varint as serde_varint,
     std::{convert::TryInto, fmt},
 };
+#[cfg_attr(
+    feature = "stable-abi",
+    derive(StableAbi, StableAbiSample),
+    frozen_abi(
+        abi_digest = "BdtrN3DqVeqF7gVyCXhGczKtYrtW1naeVBHfaPP8ji59",
+        test_roundtrip = "eq_and_wire"
+    )
+)]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Version {
     #[serde(with = "serde_varint")]
