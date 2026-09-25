@@ -499,7 +499,7 @@ fn synthesize_vote_account(pva: &ProtoPrevVoteAccount) -> (Pubkey, u64, VoteAcco
         }),
     };
 
-    let serialized = bincode::serialize(&versioned).unwrap();
+    let serialized = wincode::serialize(&versioned).unwrap();
     let mut account = AccountSharedData::new(1, serialized.len(), &solana_sdk_ids::vote::id());
     account.set_data_from_slice(&serialized);
 
@@ -874,7 +874,7 @@ mod tests {
                 sysvar::stake_history::id(),
                 Account {
                     lamports: 1,
-                    data: bincode::serialize(&StakeHistory::default()).unwrap(),
+                    data: wincode::serialize(&StakeHistory::default()).unwrap(),
                     owner: sysvar::id(),
                     executable: false,
                     rent_epoch: u64::MAX,

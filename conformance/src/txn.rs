@@ -603,12 +603,15 @@ mod tests {
         account(lamports, vec![], Pubkey::default(), false)
     }
 
-    fn sysvar_account<T: serde::Serialize>(id: Pubkey, state: &T) -> (Pubkey, AccountSharedData) {
+    fn sysvar_account<T: wincode::Serialize<Src = T>>(
+        id: Pubkey,
+        state: &T,
+    ) -> (Pubkey, AccountSharedData) {
         (
             id,
             account(
                 1,
-                bincode::serialize(state).unwrap(),
+                wincode::serialize(state).unwrap(),
                 native_loader::id(),
                 false,
             ),
@@ -681,7 +684,7 @@ mod tests {
         };
         let program = account(
             25,
-            bincode::serialize(&state).unwrap(),
+            wincode::serialize(&state).unwrap(),
             bpf_loader_upgradeable::id(),
             true,
         );
@@ -690,7 +693,7 @@ mod tests {
             slot: 0,
             upgrade_authority_address: None,
         };
-        let mut header = bincode::serialize(&state).unwrap();
+        let mut header = wincode::serialize(&state).unwrap();
         let mut complement = vec![
             0;
             UpgradeableLoaderState::size_of_programdata_metadata()
