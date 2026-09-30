@@ -9,7 +9,7 @@ use {
         ThreadPool, ThreadPoolBuilder,
         iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
     },
-    smallvec::SmallVec,
+    smallvec::{SmallVec, smallvec},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
@@ -327,16 +327,33 @@ impl AccountsLtHashAsyncProgress {
     /// manager neither dedups nor delays them. `updates` must thus hold each account
     /// at most once. Updates already in the queue stay there.
     ///
-    /// The updates share one job.
+    /// The updates share one job, apart from large accounts.
     ///
     /// Call this only before the first `enqueue_for_dedup()` or after the last, so the
     /// two paths never interleave. Count `updates` with `add_deduped_count()` first.
     fn spawn_deduped(self: &Arc<Self>, updates: impl IntoIterator<Item = AccountsLtHashUpdate>) {
-        let chunk: Chunk = updates.into_iter().collect();
+        let thread_pool = accounts_hasher_thread_pool();
+        let updates = updates.into_iter();
+        let mut chunk = Chunk::with_capacity(updates.size_hint().0);
+        let mut num_updates = 0;
+        for mut update in updates {
+            num_updates += 1;
+            // Split large accounts here rather than on the worker, since this function runs
+            // on freeze's latency-critical path. This saves a thread hop before the prev
+            // version starts being hashed.
+            if update.should_split() {
+                // The prev version becomes a pending update of its own.
+                self.num_updates_pending.fetch_add(1, Ordering::Relaxed);
+                Arc::clone(self).spawn_chunk(thread_pool, smallvec![update.take_prev()]);
+                Arc::clone(self).spawn_chunk(thread_pool, smallvec![update]);
+            } else {
+                chunk.push(update);
+            }
+        }
+        self.num_updates_total
+            .fetch_add(num_updates, Ordering::Relaxed);
         if !chunk.is_empty() {
-            self.num_updates_total
-                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            Arc::clone(self).spawn_chunk(accounts_hasher_thread_pool(), chunk);
+            Arc::clone(self).spawn_chunk(thread_pool, chunk);
         }
     }
 
@@ -374,7 +391,17 @@ impl AccountsLtHashAsyncProgress {
 
                 {
                     let mut accumulator = accumulator.lock().unwrap();
-                    for update in updates {
+                    for mut update in updates {
+                        // Hand a large account's prev version to another worker, so the two
+                        // versions hash in parallel instead of in one long job that finish()
+                        // may wait on. Deciding here is cheap, since hashing reads the data
+                        // anyway, while the manager's read of each data length misses cache.
+                        if update.should_split() {
+                            // The prev version becomes a pending update of its own.
+                            self.num_updates_pending.fetch_add(1, Ordering::Relaxed);
+                            Arc::clone(&self)
+                                .spawn_chunk(thread_pool, smallvec![update.take_prev()]);
+                        }
                         Self::process(&mut accumulator, update);
                     }
                 }
@@ -468,9 +495,12 @@ fn chunk_len(num_updates: usize) -> usize {
 
 /// One job's updates.
 ///
-/// Holds a single update inline, so the one-update jobs of small flushes skip a
-/// heap allocation.
+/// Holds a single update inline, so split-off prev versions and the one-update jobs
+/// of small flushes skip a heap allocation.
 type Chunk = SmallVec<[AccountsLtHashUpdate; 1]>;
+
+/// Accounts at least this large take longer to hash than an extra spawn.
+const SPLIT_ACCOUNT_DATA_LEN: usize = 16 * 1024;
 
 /// Returns the global accounts lt hash manager.
 ///
@@ -659,6 +689,26 @@ struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
     curr_account: Option<AccountSharedData>,
+}
+
+impl AccountsLtHashUpdate {
+    fn should_split(&self) -> bool {
+        match (&self.prev_account, &self.curr_account) {
+            (Some(prev), Some(curr)) => {
+                prev.data().len().max(curr.data().len()) >= SPLIT_ACCOUNT_DATA_LEN
+            }
+            _ => false,
+        }
+    }
+
+    /// Moves the prev version into an update of its own and leaves the curr version.
+    fn take_prev(&mut self) -> Self {
+        Self {
+            address: self.address,
+            prev_account: self.prev_account.take(),
+            curr_account: None,
+        }
+    }
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
@@ -1394,6 +1444,31 @@ mod tests {
             async_progress2.num_updates_pending.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn test_split_large_account_update() {
+        let owner = Pubkey::default();
+        let update = |prev_len, curr_len| AccountsLtHashUpdate {
+            address: Pubkey::new_unique(),
+            prev_account: Some(AccountSharedData::new(1, prev_len, &owner)),
+            curr_account: Some(AccountSharedData::new(2, curr_len, &owner)),
+        };
+        assert!(!update(0, SPLIT_ACCOUNT_DATA_LEN - 1).should_split());
+        assert!(update(0, SPLIT_ACCOUNT_DATA_LEN).should_split());
+        assert!(update(SPLIT_ACCOUNT_DATA_LEN, 0).should_split());
+
+        let mut curr_half = update(SPLIT_ACCOUNT_DATA_LEN, SPLIT_ACCOUNT_DATA_LEN + 1);
+        let mut expected_lt_hash = LtHash::identity();
+        AccountsLtHashAsyncProgress::process(&mut expected_lt_hash, curr_half.clone());
+        let prev_half = curr_half.take_prev();
+        assert!(prev_half.curr_account.is_none() && !prev_half.should_split());
+        assert!(curr_half.prev_account.is_none() && !curr_half.should_split());
+
+        let mut lt_hash = LtHash::identity();
+        AccountsLtHashAsyncProgress::process(&mut lt_hash, prev_half);
+        AccountsLtHashAsyncProgress::process(&mut lt_hash, curr_half);
+        assert_eq!(lt_hash, expected_lt_hash);
     }
 
     /// A transaction writes the leader's accounts, then freeze deposits fees into
