@@ -316,11 +316,16 @@ impl AccountsLtHashAsyncProgress {
     ///
     /// Call this only before the first `enqueue_for_dedup()` or after the last, so the
     /// two paths never interleave.
-    fn spawn_deduped(self: &Arc<Self>, updates: impl IntoIterator<Item = AccountsLtHashUpdate>) {
+    fn spawn_deduped(
+        self: &Arc<Self>,
+        updates: impl IntoIterator<Item = AccountsLtHashUpdate, IntoIter: ExactSizeIterator>,
+    ) {
         let thread_pool = accounts_hasher_thread_pool();
+        let updates = updates.into_iter();
+        // Count first, so a worker cannot drive the pending count below zero.
+        self.num_jobs_pending
+            .fetch_add(updates.len(), Ordering::Relaxed);
         for update in updates {
-            // Count first, so a worker cannot drive the pending count below zero.
-            self.num_jobs_pending.fetch_add(1, Ordering::Relaxed);
             Arc::clone(self).spawn(thread_pool, update);
         }
     }
@@ -549,7 +554,8 @@ struct QueuedAccountsLtHashUpdate {
 }
 
 /// A single accounts lt hash update to process.
-#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug)]
 struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
@@ -1237,8 +1243,6 @@ mod tests {
         let async_progress2 = Arc::new(AccountsLtHashAsyncProgress::new());
         let mut deduplicated_updates = ahash::HashMap::default();
 
-        // Count the updates as enqueueing does, so dedup has a count to
-        // settle.
         async_progress1
             .num_jobs_pending
             .fetch_add(2, Ordering::Relaxed);
@@ -1289,17 +1293,8 @@ mod tests {
         assert_eq!(update.inner.prev_account.as_ref().unwrap().lamports(), 11);
         assert_eq!(update.inner.curr_account.as_ref().unwrap().lamports(), 13);
 
-        // Dedup leaves one pending update per bank.
-        assert_eq!(
-            async_progress1.num_jobs_pending.load(Ordering::Relaxed),
-            1,
-            "dedup settled the dropped duplicate",
-        );
-        assert_eq!(
-            async_progress2.num_jobs_pending.load(Ordering::Relaxed),
-            1,
-            "dedup never crosses banks",
-        );
+        assert_eq!(async_progress1.num_jobs_pending.load(Ordering::Relaxed), 1);
+        assert_eq!(async_progress2.num_jobs_pending.load(Ordering::Relaxed), 1);
     }
 
     /// A transaction writes the leader's accounts, then freeze deposits fees into
