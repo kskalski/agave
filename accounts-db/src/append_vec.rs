@@ -119,7 +119,9 @@ struct AccountOffsets {
     offset_to_end_of_data: FileOffset,
 }
 
-const APPEND_BUFFER_CAPACITY: usize = 512 * 1024;
+/// Appends land in page cache, so the buffer only amortizes write syscalls. Gains flatten out
+/// above 64KiB, so the capacity stays small to avoid oversized allocations.
+const APPEND_BUFFER_CAPACITY: usize = 256 * 1024;
 
 type AccountsAppender = AppendVecAccountWriter<BufWriter<File>>;
 
@@ -236,6 +238,7 @@ impl AppendVec {
         // so that we don't have to resize it later, which may be expensive.
         let file_size = u64::try_from(size).unwrap();
         data.set_len(file_size).unwrap();
+
         let appender_file = OpenOptions::new().write(true).open(&file).unwrap();
         let appender = AppendVecAccountWriter::new(BufWriter::with_capacity(
             size.min(APPEND_BUFFER_CAPACITY),
