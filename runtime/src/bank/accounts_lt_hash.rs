@@ -1487,8 +1487,6 @@ mod tests {
         assert_eq!(num_jobs, 2, "the large account splits into two jobs");
     }
 
-    /// A transaction writes the leader's accounts, then freeze deposits fees into
-    /// them. The same accounts thus take the queued and the spawned path.
     #[test_case(Features::None; "no features")]
     #[test_case(Features::All; "all features")]
     fn test_accounts_lt_hash_with_fees_into_written_accounts(features: Features) {
@@ -1503,6 +1501,7 @@ mod tests {
         let slot = bank.slot() + 1;
         let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, leader, slot);
 
+        // Transfers queue updates for the leader's accounts.
         for address in [leader.id, leader.vote_address] {
             bank.register_unique_recent_blockhash_for_test();
             bank.transfer(LAMPORTS_PER_SOL, &mint_keypair, &address)
@@ -1511,6 +1510,7 @@ mod tests {
         let leader_balance =
             |bank: &Bank| bank.get_balance(&leader.id) + bank.get_balance(&leader.vote_address);
         let balance_before_freeze = leader_balance(&bank);
+        // Freeze spawns its fee deposits into the same accounts.
         bank.freeze();
         assert!(
             leader_balance(&bank) > balance_before_freeze,
