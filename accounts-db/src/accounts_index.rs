@@ -745,9 +745,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         let start_bin = rng().random_range(0..self.bins());
         let start =
             items.partition_point(|(pubkey, _)| bin_calc.bin_from_pubkey(pubkey) < start_bin);
-        items.rotate_left(start);
+        let (before_start, from_start) = items.split_at(start);
         let storage = self.storage.storage.as_ref();
-        for (pubkey, account_info) in items.drain(..) {
+        for &(pubkey, account_info) in from_start.iter().chain(before_start) {
             let r_account_maps = self.account_maps[bin_calc.bin_from_pubkey(&pubkey)].as_ref();
             let new_entry = PreAllocatedAccountMapEntry::new(slot, account_info, storage, false);
             match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
@@ -768,6 +768,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 }
             }
         }
+        items.clear();
         info
     }
 
