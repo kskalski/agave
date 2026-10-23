@@ -19,6 +19,10 @@ use {
     },
 };
 
+mod results;
+
+pub use results::{ResultReceiver, ResultRecvError};
+
 const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Builds the job handler of each worker. A worker consumes jobs `J` and generates outputs `O`
@@ -26,7 +30,9 @@ const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 ///
 /// Implemented for closures `Fn(worker_id) -> impl FnMut(job) -> output`.
 ///
-/// [`WorkerPoolBuilder::spawn`] only takes handlers without an output, `O = ()`.
+/// [`WorkerPoolBuilder::spawn`] only takes handlers without an output, `O = ()`. Outputs reach
+/// the caller only through [`WorkerPoolBuilder::spawn_with_results`], which sends each of them to a
+/// [`ResultReceiver`].
 pub trait MakeJobHandler<J, O = ()> {
     type Handler: FnMut(J) -> O + Send + 'static;
 
