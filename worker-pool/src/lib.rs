@@ -11,6 +11,7 @@
 
 use {
     agave_wake_channel::{Sender, bounded},
+    log::error,
     std::{
         io,
         num::NonZeroUsize,
@@ -48,6 +49,9 @@ where
 
 /// Pool of worker threads draining one job queue. A worker exits once the [`PoolSender`] of the
 /// pool is dropped and the queue is drained.
+///
+/// Dropping the pool joins the workers and logs a worker panic, so its owner must drop the
+/// [`PoolSender`] first. A drop during a panic detaches the workers instead.
 pub struct WorkerPool {
     worker_handles: Vec<JoinHandle<()>>,
 }
@@ -63,11 +67,20 @@ impl WorkerPool {
         }
     }
 
+    /// Returns the current number of workers.
+    pub fn num_workers(&self) -> usize {
+        self.worker_handles.len()
+    }
+
     /// Waits for all workers to exit, which blocks until the [`PoolSender`] is dropped.
     ///
     /// Returns the panic payload of the first worker that panicked.
     #[must_use = "join returns an error if a worker thread panicked"]
     pub fn join(mut self) -> thread::Result<()> {
+        self.join_workers()
+    }
+
+    fn join_workers(&mut self) -> thread::Result<()> {
         let mut result = Ok(());
         for worker_handle in self.worker_handles.drain(..) {
             let worker_result = worker_handle.join();
@@ -76,6 +89,16 @@ impl WorkerPool {
             }
         }
         result
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        if !thread::panicking()
+            && let Err(err) = self.join_workers()
+        {
+            error!("worker thread failed: {err:?}");
+        }
     }
 }
 
@@ -173,6 +196,7 @@ mod tests {
             .job_queue_capacity(NonZeroUsize::new(8).unwrap())
             .spawn(report_job_handler(result_sender))
             .unwrap();
+        assert_eq!(pool.num_workers(), NUM_WORKERS.get());
         for index in 0..NUM_JOBS {
             sender.send(index);
         }
@@ -198,5 +222,44 @@ mod tests {
         drop(sender);
         let payload = pool.join().unwrap_err();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"worker job panicked"));
+    }
+
+    #[test]
+    fn test_worker_pool_drop_finishes_queued_jobs() {
+        const NUM_JOBS: usize = 10;
+        let (result_sender, result_receiver) = mpsc::channel();
+        let (sender, pool) = WorkerPool::builder("solTestPool", NonZeroUsize::MIN)
+            .job_queue_capacity(NonZeroUsize::new(NUM_JOBS).unwrap())
+            .spawn(report_job_handler(result_sender))
+            .unwrap();
+        for index in 0..NUM_JOBS {
+            sender.send(index);
+        }
+        drop(sender);
+        drop(pool);
+        assert_eq!(result_receiver.try_iter().count(), NUM_JOBS);
+    }
+
+    #[test]
+    fn test_worker_pool_drop_survives_worker_panic() {
+        let (sender, pool) = WorkerPool::builder("solTestPool", NonZeroUsize::MIN)
+            .spawn(|_| panic_job)
+            .unwrap();
+        sender.send(());
+        drop(sender);
+        drop(pool);
+    }
+
+    #[test]
+    fn test_worker_pool_drop_during_panic_detaches_workers() {
+        let (sender, pool) = WorkerPool::builder("solTestPool", NonZeroUsize::MIN)
+            .spawn(|_| |()| {})
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _pool = pool;
+            panic!("owner panicked");
+        }));
+        assert!(result.is_err());
+        drop(sender);
     }
 }

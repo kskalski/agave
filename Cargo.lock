@@ -667,6 +667,7 @@ name = "agave-worker-pool"
 version = "4.5.0-alpha.2"
 dependencies = [
  "agave-wake-channel",
+ "log",
 ]
 
 [[package]]

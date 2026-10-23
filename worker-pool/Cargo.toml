@@ -20,6 +20,7 @@ agave-unstable-api = []
 
 [dependencies]
 agave-wake-channel = { workspace = true }
+log = { workspace = true }
 
 [lints]
 workspace = true
