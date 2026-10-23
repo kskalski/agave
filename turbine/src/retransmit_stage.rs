@@ -9,7 +9,7 @@ use {
     },
     agave_votor::event::VotorEvent,
     agave_votor_messages::migration::MigrationStatus,
-    agave_worker_pool::{WorkerPool, WorkerPoolConfig},
+    agave_worker_pool::{ResultRecvError, ResultWorkerPool, WorkerPoolConfig},
     crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError},
     itertools::Itertools,
     lru::LruCache,
@@ -123,13 +123,12 @@ struct RetransmitNotifiers {
 }
 
 struct RetransmitContext {
-    thread_pool: WorkerPool<RetransmitJob>,
+    thread_pool: ResultWorkerPool<RetransmitJob, JobStats>,
+    is_xdp: bool,
     bank_forks: Arc<RwLock<BankForks>>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     cluster_info: Arc<ClusterInfo>,
     retransmit_receiver: Receiver<Vec<shred::Payload>>,
-    retransmit_sockets: Arc<Vec<UdpSocket>>,
-    xdp_sender: Option<XdpSender>,
     cluster_nodes_cache: ClusterNodesCache<RetransmitStage>,
     shred_deduper: Arc<ShredDeduper>,
     max_slots: Arc<MaxSlots>,
@@ -246,13 +245,16 @@ struct RetransmitJob {
 }
 
 struct JobContext {
+    root_bank: Arc<Bank>,
+    slot_leader_cache: SlotLeaderCache,
+}
+
+struct RetransmitWorker {
+    worker_index: usize,
     retransmit_sockets: Arc<Vec<UdpSocket>>,
     xdp_sender: Option<XdpSender>,
     cluster_info: Arc<ClusterInfo>,
     shred_deduper: Arc<ShredDeduper>,
-    root_bank: Arc<Bank>,
-    slot_leader_cache: Arc<SlotLeaderCache>,
-    result_sender: Sender<JobStats>,
 }
 
 #[derive(Default)]
@@ -282,22 +284,22 @@ impl JobStats {
     }
 }
 
-impl RetransmitJob {
-    fn run(self, worker_index: usize) {
-        let RetransmitJob { context, mut batch } = self;
+impl RetransmitWorker {
+    fn run(&self, job: RetransmitJob) -> JobStats {
+        let RetransmitJob { context, mut batch } = job;
         let mut stats = JobStats::default();
-        let socket_addr_space = context.cluster_info.socket_addr_space();
+        let socket_addr_space = self.cluster_info.socket_addr_space();
         let socket = RetransmitSocket::new(
-            worker_index,
-            &context.retransmit_sockets,
-            context.xdp_sender.as_ref(),
-            &context.cluster_info,
+            self.worker_index,
+            &self.retransmit_sockets,
+            self.xdp_sender.as_ref(),
+            &self.cluster_info,
         );
         for shred in batch.drain(..) {
             let shred_stats = retransmit_shred(
                 shred,
                 &context.root_bank,
-                &context.shred_deduper,
+                &self.shred_deduper,
                 &context.slot_leader_cache,
                 socket_addr_space,
                 &socket,
@@ -307,9 +309,7 @@ impl RetransmitJob {
                 stats.record_slot_stats(shred_stats);
             }
         }
-        // If receiver has been dropped, retransmission has already completed and only these per-job
-        // stats are lost. The worker has no recovery to perform.
-        let _ = context.result_sender.send(stats);
+        stats
     }
 }
 
@@ -378,8 +378,6 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
     let leader_schedule_cache = context.leader_schedule_cache.as_ref();
     let cluster_info = &context.cluster_info;
     let retransmit_receiver = &context.retransmit_receiver;
-    let retransmit_sockets = context.retransmit_sockets.clone();
-    let xdp_sender = context.xdp_sender.clone();
     let cluster_nodes_cache = &context.cluster_nodes_cache;
     let shred_deduper = &context.shred_deduper;
     let max_slots = context.max_slots.as_ref();
@@ -408,7 +406,7 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
             shred_buf.push(retransmit_receiver.recv().map_err(|_| ())?);
         }
     };
-    let num_workers = retransmit_sockets.len();
+    let num_workers = thread_pool.num_workers();
 
     let mut timer_start = Measure::start("retransmit");
     let mut num_shreds = shred_buf[0].len();
@@ -464,7 +462,6 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
             Some((slot, (slot_leader.id, cluster_nodes)))
         })
         .collect();
-    let slot_leader_cache = Arc::new(slot_leader_cache);
 
     if num_shreds == 1 {
         stats.num_small_batches += 1;
@@ -473,35 +470,26 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
     let chunk_size = num_shreds
         .div_ceil(num_workers)
         .max(MIN_SHREDS_PER_RETRANSMIT_JOB);
-    let num_jobs = num_shreds.div_ceil(chunk_size);
-    let (result_sender, result_receiver) = crossbeam_channel::bounded(num_jobs);
-
-    let is_xdp = xdp_sender.is_some();
     let job_context = Arc::new(JobContext {
-        retransmit_sockets,
-        xdp_sender,
-        cluster_info: cluster_info.clone(),
-
         root_bank: root_bank.clone(),
-        shred_deduper: shred_deduper.clone(),
         slot_leader_cache,
-        result_sender,
     });
 
+    let mut num_jobs = 0;
     for chunk in &shred_buf.drain(..).flatten().chunks(chunk_size) {
-        let batch = chunk.collect();
-        let job = RetransmitJob {
+        thread_pool.send(RetransmitJob {
             context: job_context.clone(),
-            batch,
-        };
-        thread_pool.send(job);
+            batch: chunk.collect(),
+        });
+        num_jobs += 1;
     }
 
-    // Load-bearing: result_receiver.iter() ends only once every result_sender clone (held via
-    // JobContext) is dropped. Without this, the loop below never terminates.
-    drop(job_context);
-
-    for job_stats in result_receiver.iter() {
+    for _ in 0..num_jobs {
+        let job_stats = match thread_pool.recv() {
+            Ok(job_stats) => job_stats,
+            Err(ResultRecvError::WorkerPanicked) => panic!("retransmit worker panicked"),
+            Err(ResultRecvError::Disconnected) => panic!("all retransmit workers died"),
+        };
         stats.accumulate_job_counters(&job_stats);
         stats.insert_slot_stats(
             job_stats.slot_stats,
@@ -519,7 +507,7 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
         &working_bank,
         cluster_info.as_ref(),
         cluster_nodes_cache,
-        is_xdp,
+        context.is_xdp,
     );
     Ok(())
 }
@@ -646,20 +634,28 @@ impl RetransmitStage {
         // Match workers to retransmit sockets to preserve socket affinity.
         let num_workers = NonZeroUsize::new(retransmit_sockets.len())
             .expect("retransmit needs at least one socket");
+        let is_xdp = xdp_sender.is_some();
+        let make_job_handler = |worker_index| {
+            let worker = RetransmitWorker {
+                worker_index,
+                retransmit_sockets: retransmit_sockets.clone(),
+                xdp_sender: xdp_sender.clone(),
+                cluster_info: cluster_info.clone(),
+                shred_deduper: shred_deduper.clone(),
+            };
+            move |job| worker.run(job)
+        };
         let config = WorkerPoolConfig::new("solRetransmit", num_workers);
-        let thread_pool = WorkerPool::spawn(config, |worker_id| {
-            move |job: RetransmitJob| job.run(worker_id)
-        })
-        .expect("failed to spawn retransmit workers");
+        let thread_pool = ResultWorkerPool::spawn(config, num_workers, make_job_handler)
+            .expect("failed to spawn retransmit workers");
 
         let retransmit_context = RetransmitContext {
             thread_pool,
+            is_xdp,
             bank_forks,
             leader_schedule_cache,
             cluster_info,
             retransmit_receiver,
-            retransmit_sockets,
-            xdp_sender,
             cluster_nodes_cache,
             shred_deduper,
             max_slots,
