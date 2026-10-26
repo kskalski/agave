@@ -1,7 +1,7 @@
 use {
     crate::{
         AllocOptions, HUGE_PAGE_SIZE, HugePages, Remainder,
-        mmap::{map, map_reserved, unmap},
+        mmap::{map, map_reserved, populate, unmap},
     },
     allocator_api2::alloc::{AllocError, Allocator, Global, Layout},
     std::ptr::NonNull,
@@ -57,6 +57,14 @@ impl PageAllocator {
         }
     }
 
+    fn maybe_populate(&self, allocation: NonNull<[u8]>) -> NonNull<[u8]> {
+        if self.options.populate {
+            // SAFETY: the allocation is fresh, so nothing else accesses it yet.
+            unsafe { populate(allocation.cast(), allocation.len()) };
+        }
+        allocation
+    }
+
     fn allocate_transparent(
         layout: Layout,
         remainder: Remainder,
@@ -74,13 +82,14 @@ impl PageAllocator {
         layout: Layout,
         global: impl FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        match self.huge_page_allocation(layout) {
+        let allocation = match self.huge_page_allocation(layout) {
             Some(HugePageAllocation::Transparent(remainder, allocated)) => {
                 Self::allocate_transparent(allocated, remainder)
             }
             Some(HugePageAllocation::Reserved(allocated)) => Self::allocate_reserved(allocated),
             None => global(layout),
-        }
+        }?;
+        Ok(self.maybe_populate(allocation))
     }
 }
 
@@ -120,7 +129,7 @@ unsafe impl Allocator for PageAllocator {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, allocator_api2::vec::Vec};
+    use {super::*, crate::AlignedBuffer, allocator_api2::vec::Vec};
 
     #[test]
     fn test_round_trip_through_growth() {
@@ -136,6 +145,12 @@ mod tests {
                 AllocOptions::new().huge_pages(HugePages::Transparent(Remainder::RoundUp)),
             ),
             PageAllocator::new(AllocOptions::new().huge_pages(HugePages::AttemptReserved)),
+            PageAllocator::new(AllocOptions::new().populate(true)),
+            PageAllocator::new(
+                AllocOptions::new()
+                    .huge_pages(HugePages::Transparent(Remainder::AtEnd))
+                    .populate(true),
+            ),
         ] {
             let mut vec = Vec::with_capacity_in(HUGE_PAGE_SIZE / 16, alloc);
             vec.extend(0..(HUGE_PAGE_SIZE / 2) as u64);
@@ -174,6 +189,33 @@ mod tests {
                 bytes.fill(1);
                 alloc.deallocate(ptr.cast(), layout);
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_populate_makes_pages_resident() {
+        let page = crate::page_size();
+        for (huge_pages, size) in [
+            (HugePages::Off, 3 * page + 100),
+            (
+                HugePages::Transparent(Remainder::AtStart),
+                2 * HUGE_PAGE_SIZE + page,
+            ),
+        ] {
+            let options = AllocOptions::new().huge_pages(huge_pages).populate(true);
+            let layout = Layout::from_size_align(size, 1).unwrap();
+            let buf = AlignedBuffer::new_with_options(layout, options).unwrap();
+            let start = buf.as_ptr().addr();
+            let page_start = start & !(page - 1);
+            let len = (start + size).next_multiple_of(page) - page_start;
+            let mut residency = vec![0u8; len / page];
+            // SAFETY: the pages hold the buffer, and `residency` has one byte per page.
+            let result =
+                unsafe { libc::mincore(page_start as *mut _, len, residency.as_mut_ptr().cast()) };
+            assert_eq!(result, 0);
+            assert!(residency.iter().all(|&r| r & 1 == 1));
+            assert!(buf.iter().all(|&b| b == 0));
         }
     }
 }

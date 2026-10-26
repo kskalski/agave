@@ -55,17 +55,28 @@ pub enum Remainder {
 #[derive(Clone, Copy, Debug)]
 pub struct AllocOptions {
     pub(crate) huge_pages: HugePages,
+    pub(crate) populate: bool,
 }
 
 impl AllocOptions {
     pub const fn new() -> Self {
         Self {
             huge_pages: HugePages::Transparent(Remainder::AtEnd),
+            populate: false,
         }
     }
 
     pub const fn huge_pages(mut self, huge_pages: HugePages) -> Self {
         self.huge_pages = huge_pages;
+        self
+    }
+
+    /// Faults allocations in before returning them, on Linux.
+    ///
+    /// The page faults and the kernel's zeroing then happen in the allocating thread, instead of in
+    /// the threads that first write the memory.
+    pub const fn populate(mut self, populate: bool) -> Self {
+        self.populate = populate;
         self
     }
 }

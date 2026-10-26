@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{map, map_reserved, unmap};
+pub(crate) use linux::{map, map_reserved, populate, unmap};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -8,6 +8,7 @@ mod linux {
         std::{
             alloc::Layout,
             io,
+            num::NonZeroUsize,
             ptr::{self, NonNull},
             sync::Once,
         },
@@ -70,6 +71,40 @@ mod linux {
         // SAFETY: the kernel aligns the mapping to a huge page, so the head is shorter than the
         // extra `align` and the range stays inside the fresh mapping.
         unsafe { trim(map, map_len, head_len, len) }
+    }
+
+    /// Pre-faults the pages under the `len` bytes at `ptr`, so first writes to them don't fault.
+    ///
+    /// # Safety
+    ///
+    /// The range must be allocated and writable, and nothing may read or write it concurrently.
+    pub(crate) unsafe fn populate(ptr: NonNull<u8>, len: usize) {
+        let page = page_size();
+        let start = ptr.addr().get();
+        // The advice needs a page aligned start, and the whole pages around the range are mapped.
+        let page_start = start & !page.strict_sub(1);
+        let page_len = start
+            .strict_add(len)
+            .next_multiple_of(page)
+            .strict_sub(page_start);
+        let page_ptr = ptr.with_addr(NonZeroUsize::new(page_start).unwrap());
+        // SAFETY: the pages hold the writable range, and populating them leaves contents intact.
+        let advised = unsafe {
+            libc::madvise(
+                page_ptr.as_ptr().cast(),
+                page_len,
+                libc::MADV_POPULATE_WRITE,
+            )
+        };
+        if advised != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                panic!(
+                    "madvise(MADV_POPULATE_WRITE) failed: {error}; it needs Linux 5.14 or later"
+                );
+            }
+            log::warn!("populating {len} bytes failed, so they fault in on first access: {error}");
+        }
     }
 
     /// # Safety
@@ -230,6 +265,9 @@ pub(crate) fn map(
 pub(crate) fn map_reserved(_layout: std::alloc::Layout) -> std::io::Result<std::ptr::NonNull<u8>> {
     unreachable!("only Linux maps allocations directly")
 }
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) unsafe fn populate(_ptr: std::ptr::NonNull<u8>, _len: usize) {}
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) unsafe fn unmap(_ptr: std::ptr::NonNull<u8>, _layout: std::alloc::Layout) {
