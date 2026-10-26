@@ -4,6 +4,7 @@ use {
         bucket_map_holder::BucketMapHolder, in_mem_accounts_index::InMemAccountsIndex,
     },
     crate::{accounts_index, waitable_condvar::WaitableCondvar},
+    rayon::prelude::*,
     std::{
         fmt::Debug,
         num::NonZeroUsize,
@@ -116,7 +117,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndexStorage<
         let storage = Arc::new(BucketMapHolder::new(bins, config, num_flush_threads.get()));
 
         let num_initial_accounts = config.num_initial_accounts;
+        // Parallel, since each pre-sized table faults in its control bytes as it initializes them.
         let in_mem: Box<_> = (0..bins)
+            .into_par_iter()
             .map(|bin| Arc::new(InMemAccountsIndex::new(&storage, bin, num_initial_accounts)))
             .collect();
 

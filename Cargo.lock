@@ -7120,6 +7120,7 @@ version = "4.5.0-alpha.2"
 dependencies = [
  "agave-fs",
  "agave-logger",
+ "agave-memory",
  "agave-reserved-account-keys",
  "ahash 0.8.12",
  "assert_matches",
@@ -7127,6 +7128,7 @@ dependencies = [
  "bv",
  "criterion",
  "dashmap",
+ "hashbrown 0.16.1",
  "itertools 0.15.0",
  "log",
  "memoffset",
