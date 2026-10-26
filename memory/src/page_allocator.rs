@@ -1,7 +1,7 @@
 use {
     crate::{
         AllocOptions, HUGE_PAGE_SIZE, HugePages, Remainder,
-        mmap::{map, unmap},
+        mmap::{map, map_reserved, unmap},
     },
     allocator_api2::alloc::{AllocError, Allocator, Global, Layout},
     std::ptr::NonNull,
@@ -22,11 +22,39 @@ impl PageAllocator {
         Self { options }
     }
 
-    fn transparent_remainder(&self, layout: Layout) -> Option<Remainder> {
-        let HugePages::Transparent(remainder) = self.options.huge_pages else {
+    fn huge_page_allocation(&self, layout: Layout) -> Option<HugePageAllocation> {
+        if !cfg!(target_os = "linux") || layout.size() == 0 {
             return None;
-        };
-        (cfg!(target_os = "linux") && layout.size() >= HUGE_PAGE_SIZE).then_some(remainder)
+        }
+        let fits_huge_page = layout.size() >= HUGE_PAGE_SIZE;
+        match self.options.huge_pages {
+            HugePages::Off => None,
+            HugePages::Transparent(Remainder::RoundUp) => Some(HugePageAllocation::Transparent(
+                Remainder::RoundUp,
+                round_up_to_huge_pages(layout)?,
+            )),
+            HugePages::Transparent(remainder) => {
+                fits_huge_page.then_some(HugePageAllocation::Transparent(remainder, layout))
+            }
+            // The fallback rounds too, so `deallocate` unmaps the same length without knowing
+            // which path `allocate` took.
+            HugePages::AttemptReserved => Some(HugePageAllocation::Reserved(
+                round_up_to_huge_pages(layout)?,
+            )),
+        }
+    }
+
+    fn allocate_reserved(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        match map_reserved(layout) {
+            Ok(ptr) => Ok(NonNull::slice_from_raw_parts(ptr, layout.size())),
+            Err(error) => {
+                log::debug!(
+                    "reserved huge pages unavailable for {} bytes: {error}",
+                    layout.size()
+                );
+                Self::allocate_transparent(layout, Remainder::RoundUp)
+            }
+        }
     }
 
     fn allocate_transparent(
@@ -46,11 +74,24 @@ impl PageAllocator {
         layout: Layout,
         global: impl FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        match self.transparent_remainder(layout) {
-            Some(remainder) => Self::allocate_transparent(layout, remainder),
+        match self.huge_page_allocation(layout) {
+            Some(HugePageAllocation::Transparent(remainder, allocated)) => {
+                Self::allocate_transparent(allocated, remainder)
+            }
+            Some(HugePageAllocation::Reserved(allocated)) => Self::allocate_reserved(allocated),
             None => global(layout),
         }
     }
+}
+
+fn round_up_to_huge_pages(layout: Layout) -> Option<Layout> {
+    let size = layout.size().checked_next_multiple_of(HUGE_PAGE_SIZE)?;
+    Layout::from_size_align(size, layout.align()).ok()
+}
+
+enum HugePageAllocation {
+    Transparent(Remainder, Layout),
+    Reserved(Layout),
 }
 
 unsafe impl Allocator for PageAllocator {
@@ -66,8 +107,11 @@ unsafe impl Allocator for PageAllocator {
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: `allocate` chose the same path for this layout.
         unsafe {
-            match self.transparent_remainder(layout) {
-                Some(_) => unmap(ptr, layout),
+            match self.huge_page_allocation(layout) {
+                Some(
+                    HugePageAllocation::Transparent(_, allocated)
+                    | HugePageAllocation::Reserved(allocated),
+                ) => unmap(ptr, allocated),
                 None => Global.deallocate(ptr, layout),
             }
         }
@@ -88,6 +132,10 @@ mod tests {
             PageAllocator::new(
                 AllocOptions::new().huge_pages(HugePages::Transparent(Remainder::AtStart)),
             ),
+            PageAllocator::new(
+                AllocOptions::new().huge_pages(HugePages::Transparent(Remainder::RoundUp)),
+            ),
+            PageAllocator::new(AllocOptions::new().huge_pages(HugePages::AttemptReserved)),
         ] {
             let mut vec = Vec::with_capacity_in(HUGE_PAGE_SIZE / 16, alloc);
             vec.extend(0..(HUGE_PAGE_SIZE / 2) as u64);
@@ -102,6 +150,11 @@ mod tests {
         for (huge_pages, len) in [
             (HugePages::Transparent(Remainder::AtEnd), layout.size()),
             (HugePages::Transparent(Remainder::AtStart), layout.size()),
+            (
+                HugePages::Transparent(Remainder::RoundUp),
+                2 * HUGE_PAGE_SIZE,
+            ),
+            (HugePages::AttemptReserved, 2 * HUGE_PAGE_SIZE),
         ] {
             let alloc = PageAllocator::new(AllocOptions::new().huge_pages(huge_pages));
             let ptr = alloc.allocate_zeroed(layout).unwrap();

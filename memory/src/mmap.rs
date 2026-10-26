@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{map, unmap};
+pub(crate) use linux::{map, map_reserved, unmap};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -23,23 +23,11 @@ mod linux {
         let map_len = len
             .checked_add(huge_page_align)
             .ok_or(io::ErrorKind::OutOfMemory)?;
-        // SAFETY: an anonymous private mapping has no preconditions.
-        let map = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                /* fd */ -1,
-                /* offset */ 0,
-            )
-        };
-        if ptr::eq(map, libc::MAP_FAILED) {
-            return Err(io::Error::last_os_error());
-        }
-        let map = NonNull::new(map.cast::<u8>()).ok_or(io::ErrorKind::OutOfMemory)?;
+        let map = map_anonymous(map_len, 0)?;
         let head_len = match remainder {
-            Remainder::AtEnd => map.align_offset(huge_page_align),
+            // A rounded up `len` spans whole huge pages, so its start on a huge page boundary puts
+            // its end on one too.
+            Remainder::AtEnd | Remainder::RoundUp => map.align_offset(huge_page_align),
             // `len` is a multiple of `align`, which divides `huge_page_align`, so an end on a huge
             // page boundary keeps the start aligned.
             Remainder::AtStart => map.as_ptr().wrapping_add(len).align_offset(huge_page_align),
@@ -65,10 +53,29 @@ mod linux {
         Ok(start)
     }
 
+    /// Maps zeroed memory for `layout` from the reserved huge page pool.
+    ///
+    /// Requires a `layout` size in whole huge pages, and fails when the pool lacks free pages.
+    pub(crate) fn map_reserved(layout: Layout) -> io::Result<NonNull<u8>> {
+        let (len, align) = mapped_len_and_align(layout);
+        debug_assert!(len.is_multiple_of(HUGE_PAGE_SIZE));
+        // The kernel starts these mappings at a huge page boundary, so only larger alignments
+        // need over-mapping.
+        let map_len = len
+            .checked_add(align.saturating_sub(HUGE_PAGE_SIZE))
+            .ok_or(io::ErrorKind::OutOfMemory)?;
+        // An explicit size keeps 2 MiB pages on hosts with another default huge page size.
+        let map = map_anonymous(map_len, libc::MAP_HUGETLB | libc::MAP_HUGE_2MB)?;
+        let head_len = map.align_offset(align);
+        // SAFETY: the kernel aligns the mapping to a huge page, so the head is shorter than the
+        // extra `align` and the range stays inside the fresh mapping.
+        unsafe { trim(map, map_len, head_len, len) }
+    }
+
     /// # Safety
     ///
-    /// `ptr` must come from a [`map`] call with the same `layout`, and nothing may use the memory
-    /// afterwards.
+    /// `ptr` must come from a [`map`] or [`map_reserved`] call with the same `layout`, and nothing
+    /// may use the memory afterwards.
     pub(crate) unsafe fn unmap(ptr: NonNull<u8>, layout: Layout) {
         let (len, _) = mapped_len_and_align(layout);
         // SAFETY: the caller passes a live mapping of `len` bytes.
@@ -78,6 +85,24 @@ mod linux {
     fn mapped_len_and_align(layout: Layout) -> (usize, usize) {
         let align = layout.align().max(page_size());
         (layout.size().next_multiple_of(align), align)
+    }
+
+    fn map_anonymous(len: usize, flags: libc::c_int) -> io::Result<NonNull<u8>> {
+        // SAFETY: an anonymous private mapping has no preconditions.
+        let map = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags,
+                /* fd */ -1,
+                /* offset */ 0,
+            )
+        };
+        if ptr::eq(map, libc::MAP_FAILED) {
+            return Err(io::Error::last_os_error());
+        }
+        NonNull::new(map.cast::<u8>()).ok_or(io::ErrorKind::OutOfMemory.into())
     }
 
     /// Returns a pointer `head_len` bytes into the `map_len` bytes mapped at `map`, after unmapping
@@ -158,8 +183,8 @@ mod linux {
                 let (len, _) = mapped_len_and_align(layout);
                 let start = ptr.addr().get();
                 let boundary = match remainder {
-                    Remainder::AtEnd => start,
                     Remainder::AtStart => start + len,
+                    _ => start,
                 };
                 assert!(boundary.is_multiple_of(HUGE_PAGE_SIZE));
                 assert!(start.is_multiple_of(align.max(page_size())));
@@ -171,6 +196,25 @@ mod linux {
                 unsafe { unmap(ptr, layout) };
             }
         }
+
+        #[test]
+        fn test_map_reserved_aligns_whole_huge_pages() {
+            for align in [1, 2 * HUGE_PAGE_SIZE] {
+                let layout = Layout::from_size_align(4 * HUGE_PAGE_SIZE, align).unwrap();
+                // Hosts without a reserved pool only exercise the failure.
+                let Ok(ptr) = map_reserved(layout) else {
+                    continue;
+                };
+                assert!(ptr.addr().get().is_multiple_of(align.max(HUGE_PAGE_SIZE)));
+                // SAFETY: the mapping holds the layout's bytes and nothing else references it.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), layout.size()) };
+                assert!(bytes.iter().all(|&b| b == 0));
+                bytes.fill(1);
+                // SAFETY: `ptr` comes from `map_reserved` with `layout`, and `bytes` is no longer
+                // used.
+                unsafe { unmap(ptr, layout) };
+            }
+        }
     }
 }
 
@@ -179,6 +223,11 @@ pub(crate) fn map(
     _layout: std::alloc::Layout,
     _remainder: crate::Remainder,
 ) -> std::io::Result<std::ptr::NonNull<u8>> {
+    unreachable!("only Linux maps allocations directly")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn map_reserved(_layout: std::alloc::Layout) -> std::io::Result<std::ptr::NonNull<u8>> {
     unreachable!("only Linux maps allocations directly")
 }
 

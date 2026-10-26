@@ -20,6 +20,12 @@ pub enum HugePages {
     /// Backs the allocation with transparent huge pages, placing the part short of a whole huge
     /// page based on [`Remainder`].
     Transparent(Remainder),
+    /// Attempts huge pages from the reserved pool (`vm.nr_hugepages`), and falls back to
+    /// transparent huge pages when the pool lacks free pages.
+    ///
+    /// Rounds the allocation up to whole huge pages, on the fallback too. Suits allocations sized
+    /// in whole huge pages, or ones that the host reserves a pool for to avoid compaction stalls.
+    AttemptReserved,
 }
 
 /// Placement of the part of an allocation short of a whole huge page.
@@ -34,6 +40,11 @@ pub enum Remainder {
     /// Suits allocations whose hot data sits in a small tail after a bulk sized in whole huge
     /// pages, since the regular pages then fall in the less used bulk.
     AtStart,
+    /// Rounds the allocation up to whole huge pages.
+    ///
+    /// Suits allocations that need huge pages throughout and can spare up to one huge page of
+    /// memory each.
+    RoundUp,
 }
 
 /// Backing that [`PageAllocator`](crate::PageAllocator) and [`AlignedBuffer`](crate::AlignedBuffer)
