@@ -34,6 +34,10 @@ const NUM_ACCOUNTS_HASHER_THREADS: usize = 4;
 // Maximum size, in bytes, for the seen-accounts freelist.
 const MAX_BYTES_SEEN_ACCOUNTS_FREELIST: usize = 10_000_000;
 
+/// Caps the off-chain path's chunks to shorten the hashers' idle wait for the first
+/// loaded updates of a burst close to the freeze.
+const MAX_OFF_CHAIN_CHUNK_LEN: usize = 8;
+
 impl Bank {
     /// Enqueues the accounts lt hash updates for `accounts` to the accounts hasher threads.
     ///
@@ -134,12 +138,10 @@ impl Bank {
         // Give all threads of the loading pool a share of the accounts, so they load the
         // previous versions in parallel. The current versions come with `accounts`.
         let chunk_len = match thread_pool_for_loading_accounts {
-            Some(thread_pool) => accounts
-                .len()
-                .div_ceil(thread_pool.current_num_threads())
-                .max(1),
+            Some(thread_pool) => accounts.len().div_ceil(thread_pool.current_num_threads()),
             None => chunk_len(accounts.len()),
-        };
+        }
+        .clamp(1, MAX_OFF_CHAIN_CHUNK_LEN);
 
         // A closure that does the loading and spawning for one chunk, so code is
         // shared whether using the thread_pool_for_loading_accounts or not.
