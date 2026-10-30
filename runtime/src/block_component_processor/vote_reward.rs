@@ -410,14 +410,21 @@ fn update_accounts(
         }
     }
 
-    Ok(updated_accounts
+    let (accounts, prev_accounts) = updated_accounts
         .into_values()
         .filter_map(|vote_state| Some((vote_state.serialize()?, vote_state.prev_account)))
-        .unzip())
+        .unzip();
+    Ok(UpdatedAccounts {
+        accounts,
+        prev_accounts,
+    })
 }
 
-/// Updated vote accounts, and the version of each that the bank held before.
-type UpdatedAccounts = (Vec<(Pubkey, AccountSharedData)>, Vec<AccountSharedData>);
+struct UpdatedAccounts {
+    accounts: Vec<(Pubkey, AccountSharedData)>,
+    /// The bank's version of each account before the update, in the order of `accounts`.
+    prev_accounts: Vec<AccountSharedData>,
+}
 
 /// Calculates voting rewards based on the `reward_cert` and updates fields in the vote account
 /// based on the calculated rewards and the `final_cert_input`.
@@ -447,7 +454,10 @@ pub(super) fn calc_vote_rewards_update_vote_states(
     });
     let vote_accounts = bank.vote_accounts();
 
-    let (updated_accounts, prev_accounts) = match (&reward_state, &final_cert_state) {
+    let UpdatedAccounts {
+        accounts,
+        prev_accounts,
+    } = match (&reward_state, &final_cert_state) {
         (None, None) => return Ok(0),
         (Some(state), None) => update_accounts(
             &reward_state,
@@ -474,11 +484,8 @@ pub(super) fn calc_vote_rewards_update_vote_states(
 
     // The stakes cache holds the same vote accounts as accounts-db, so the store skips
     // loading them.
-    bank.store_accounts_with_prev_versions(
-        (bank.slot(), updated_accounts.as_slice()),
-        prev_accounts,
-    );
-    Ok(updated_accounts.len())
+    bank.store_accounts_with_prev_versions((bank.slot(), accounts.as_slice()), prev_accounts);
+    Ok(accounts.len())
 }
 
 /// Computes the voting reward in Lamports.
