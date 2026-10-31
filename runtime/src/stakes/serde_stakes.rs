@@ -1,7 +1,5 @@
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
-#[cfg(feature = "stable-abi")]
-use solana_frozen_abi_macro::{StableAbi, StableAbiSample};
 #[cfg(any(test, feature = "stable-abi"))]
 use wincode::SchemaWrite;
 #[cfg(not(feature = "stable-abi"))]
@@ -16,6 +14,11 @@ use {
     solana_vote::vote_account::VoteAccounts,
     std::{collections::HashMap, sync::Arc},
     wincode::SchemaRead,
+};
+#[cfg(feature = "stable-abi")]
+use {
+    solana_frozen_abi::stable_abi::StableAbi as _,
+    solana_frozen_abi_macro::{StableAbi, StableAbiSample},
 };
 
 /// Wrapper struct with custom serialization to support serializing
@@ -106,7 +109,6 @@ pub(crate) struct DeserializableDelegationStakes {
 fn stable_abi_sample_vote_accounts(
     rng: &mut (impl solana_frozen_abi::rand::RngCore + ?Sized),
 ) -> Vec<(Pubkey, (u64, AccountSharedData))> {
-    use solana_frozen_abi::stable_abi::StableAbi as _;
     let vote_accounts = VoteAccounts::random(rng);
     vote_accounts
         .as_ref()
