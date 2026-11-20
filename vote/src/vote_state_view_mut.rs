@@ -1,7 +1,10 @@
 use {
     crate::vote_state_view::{VoteStateViewError, frame_v4::VoteStateFrameV4},
     core::fmt::Debug,
-    solana_vote_interface::state::VoteStateV4,
+    solana_vote_interface::state::{
+        VoteStateV4,
+        vote_state_v5::{VOTE_STATE_V5_DISCRIMINANT, VoteStateV5},
+    },
 };
 
 /// A view into a serialized VoteState.
@@ -12,6 +15,7 @@ use {
 #[derive(Debug)]
 pub struct VoteStateViewMut<'account> {
     data: &'account mut [u8],
+    is_v5: bool,
 }
 
 const VOTE_STATE_V4_DISCRIMINANT: u32 = 3;
@@ -36,11 +40,37 @@ impl<'account> VoteStateViewMut<'account> {
         if version != VOTE_STATE_V4_DISCRIMINANT {
             return Err(VoteStateViewError::UnsupportedVersion);
         }
-        Ok(Self { data })
+        Ok(Self { data, is_v5: false })
+    }
+
+    /// Strict constructor that only works with `VoteStateV5`
+    pub fn new_v5(data: &'account mut [u8]) -> Result<Self, VoteStateViewError> {
+        VoteStateV5::from_account_data_mut(data)
+            .map_err(|_| VoteStateViewError::InvalidVoteStateV5)?;
+        Ok(Self { data, is_v5: true })
+    }
+
+    /// Constructor for the latest versions, `VoteStateV4` and `VoteStateV5`
+    pub fn new(data: &'account mut [u8]) -> Result<Self, VoteStateViewError> {
+        match data.get(..4).map(|tag| u32::from_le_bytes(tag.try_into().unwrap())) {
+            Some(VOTE_STATE_V5_DISCRIMINANT) => Self::new_v5(data),
+            _ => Self::new_v4(data),
+        }
+    }
+
+    fn v5_mut(&mut self) -> &mut VoteStateV5 {
+        debug_assert!(self.is_v5);
+        VoteStateV5::from_validated_account_data_mut(self.data).expect("validated in new_v5")
     }
 
     /// Increment pending delegator rewards, used during block reward deposit
     pub fn increment_pending_delegator_rewards_checked(&mut self, lamports: u64) -> Option<()> {
+        if self.is_v5 {
+            let state = self.v5_mut();
+            state.pending_delegator_rewards =
+                state.pending_delegator_rewards.checked_add(lamports)?;
+            return Some(());
+        }
         // Size is checked at creation, so this is safe
         let current_pending_delegator_rewards = u64::from_le_bytes(
             self.data[PENDING_DELEGATOR_REWARDS_START_OFFSET..PENDING_DELEGATOR_REWARDS_END_OFFSET]
@@ -57,6 +87,9 @@ impl<'account> VoteStateViewMut<'account> {
     /// Reset pending delegator rewards, used during vote account sweep at epoch
     /// rollover
     pub fn reset_pending_delegator_rewards(&mut self) -> u64 {
+        if self.is_v5 {
+            return std::mem::take(&mut self.v5_mut().pending_delegator_rewards);
+        }
         // Size is checked at creation, so this is safe
         let pending_delegator_rewards = u64::from_le_bytes(
             self.data[PENDING_DELEGATOR_REWARDS_START_OFFSET..PENDING_DELEGATOR_REWARDS_END_OFFSET]
@@ -173,5 +206,35 @@ mod tests {
             panic!("Not vote state v4");
         };
         assert_eq!(v4.pending_delegator_rewards, 0);
+    }
+
+    #[test]
+    fn v5_increment_and_reset_pending_delegator_rewards() {
+        use solana_vote_interface::state::vote_state_v5::{Location, VOTE_STATE_V5_SIZE};
+        let mut state = VoteStateV5::from_vote_state_v4(
+            VoteStateV4 {
+                bls_pubkey_compressed: Some([1; 48]),
+                pending_delegator_rewards: 7,
+                ..Default::default()
+            },
+            Location::try_new(4051542, 618526, 4870645).unwrap(),
+            3,
+        )
+        .unwrap();
+        state.pending_delegator_rewards = 7;
+        let mut bytes = vec![0; VOTE_STATE_V5_SIZE];
+        state.write_account_data(&mut bytes).unwrap();
+
+        let mut view = VoteStateViewMut::new(&mut bytes).unwrap();
+        assert!(view.is_v5);
+        assert_eq!(view.increment_pending_delegator_rewards_checked(5), Some(()));
+        assert_eq!(view.increment_pending_delegator_rewards_checked(u64::MAX), None);
+        assert_eq!(view.reset_pending_delegator_rewards(), 12);
+        assert_eq!(view.reset_pending_delegator_rewards(), 0);
+        // the account is still a valid v5 account
+        assert!(VoteStateV5::from_account_data_ref(&bytes).is_ok());
+        // size must be exact
+        bytes.push(0);
+        assert!(VoteStateViewMut::new(&mut bytes).is_err());
     }
 }
